@@ -1,3 +1,4 @@
 dataset/
 .claude
 plan_claude.md
+*.npz
