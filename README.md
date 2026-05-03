@@ -104,6 +104,19 @@ Flags:
 - `--speed 2.0` — 2× real-time
 - press **`R`** inside the viewer → uncheck **Skybox** for a flat background
 
+### FK + plot + error metrics
+
+```bash
+cd /home/kewalk/memory_project
+python eval/plot_eef.py --demo demo1
+```
+
+Loads `eval/results_<demo>.npz` (and `eval/sim_<demo>.npz` if it exists), runs YAM FK, prints per-joint MAE/RMSE/max and EEF mean/max in mm, saves three figures under `eval/figs/`:
+
+- `<demo>_eef.png` — xyz time-series + 3D EEF trajectory (state / gt / pred / sim)
+- `<demo>_gripper.png` — gripper joint angle over time
+- `<demo>_error.png` — per-joint absolute error + EEF position error per step
+
 ### Serve the trained policy (deferred — for real-robot use)
 
 ```bash
