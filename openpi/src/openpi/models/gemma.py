@@ -227,6 +227,8 @@ class Attention(nn.Module):
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
+        self.sow("intermediates", "attn_probs", probs, reduce_fn=lambda a, b: b)
+
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -364,7 +366,7 @@ class Module(nn.Module):
         )
         self.layers = nn.scan(
             block_cls,
-            variable_axes={"params": 0},
+            variable_axes={"params": 0, "intermediates": 0},
             split_rngs={"params": True, "dropout": True},
             in_axes=(
                 0,
