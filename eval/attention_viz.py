@@ -111,6 +111,10 @@ def main():
                              "attend to (often gripper/arm-dominant). 'prompt' shows what "
                              "the language tokens attend to (PaliGemma's language→image "
                              "grounding — should localize on the cup).")
+    parser.add_argument("--prompt", default=None,
+                        help="Override the language prompt (default: extractor's built-in "
+                             "'pick up the cup with yellow object inside'). Useful for "
+                             "comparing how different referring expressions shift attention.")
     parser.add_argument("--time", type=float, default=0.0,
                         help="Denoise time t in [0,1]; 0 = clean (data manifold).")
     parser.add_argument("--fps", type=int, default=30)
@@ -134,10 +138,15 @@ def main():
     print(f"[load] {T} frames")
 
     print("[init] AttentionExtractor")
-    extractor = AttentionExtractor()
+    extractor = AttentionExtractor(prompt=args.prompt) if args.prompt else AttentionExtractor()
+    print(f"[prompt] {extractor._prompt!r}")
 
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = FIG_DIR / f"attention_{args.demo}_q-{args.queries}.mp4"
+    suffix = f"_q-{args.queries}"
+    if args.prompt:
+        slug = "".join(c if c.isalnum() else "-" for c in args.prompt.lower()).strip("-")[:40]
+        suffix += f"_p-{slug}"
+    out_path = FIG_DIR / f"attention_{args.demo}{suffix}.mp4"
 
     # Try to load saved predictions to use as action_seed (cleaner attention).
     results_path = EVAL_DIR / f"results_{args.demo}.npz"
