@@ -117,6 +117,29 @@ Loads `eval/results_<demo>.npz` (and `eval/sim_<demo>.npz` if it exists), runs Y
 - `<demo>_gripper.png` — gripper joint angle over time
 - `<demo>_error.png` — per-joint absolute error + EEF position error per step
 
+### Attention visualization video
+
+```bash
+cd /home/kewalk/memory_project
+
+# Recommended: language→image grounding (cup + object localize)
+python eval/attention_viz.py --demo demo1 --queries prompt --layers 8,9,10,11
+
+# Action-query attention (arm/gripper-dominant; useful for "what drives execution")
+python eval/attention_viz.py --demo demo1 --queries actions --layers 14,15,16,17
+
+# Smoke test on a slice
+python eval/attention_viz.py --demo demo1 --queries prompt --layers 8,9,10,11 --max-steps 20
+```
+
+Captures attention from prompt tokens (or action tokens) onto image patches at every frame, overlays heatmaps on the 3 cameras, encodes to `eval/figs/attention_<demo>_q-<queries>.mp4`. Requires the gemma.py `self.sow` edit to be in place.
+
+Flags:
+- `--queries {prompt,actions}` — which token group to slice queries from. **`prompt` + middle layers (8–11)** is where PaliGemma's language→image grounding lives; **`actions` + late layers (14–17)** shows what the action heads attend to (gripper/arm). Default `actions`.
+- `--layers 8,9,10,11` — comma-separated layer indices to average (all 18 transformer layers available).
+- `--infer-every K` — run inference every K frames; reuse the heatmap in between (default 10, ~10× speedup).
+- `--max-steps N` — quick smoke on the first N frames.
+
 ### Serve the trained policy (deferred — for real-robot use)
 
 ```bash
