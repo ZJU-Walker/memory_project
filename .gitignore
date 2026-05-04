@@ -2,3 +2,5 @@ dataset/
 .claude
 plan_claude.md
 *.npz
+eval/figs
+__pycache__
