@@ -4,3 +4,4 @@ plan_claude.md
 *.npz
 eval/figs
 __pycache__
+eval/runs
