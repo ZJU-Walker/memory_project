@@ -397,6 +397,49 @@ class LeRobotYamCupDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotYamLongTaskDataConfig(DataConfigFactory):
+    """Data config for the YAM long-horizon plate-memory dataset (kewalk/long_task_1_mem).
+
+    Dataset features: top_image, left_image, memory_image, state(7,), actions(7,),
+    has_memory(1,), task. The memory_image is the observe-stage keyframe broadcast
+    over the query frames (zeros elsewhere); has_memory is 1.0 only on those frames.
+    YamLongTaskInputs routes memory_image -> right_wrist_0_rgb with mask=has_memory.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/top_image": "top_image",
+                        "observation/left_image": "left_image",
+                        "observation/memory_image": "memory_image",
+                        "observation/state": "state",
+                        "observation/has_memory": "has_memory",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamLongTaskInputs(model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -830,6 +873,39 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         batch_size=16, # TODO Change batch size here
+        num_train_steps=30_000,
+    ),
+    #
+    # Memory-conditioned pi0.5 LoRA on the LONG_TASK_1 plate-memory dataset.
+    # top_image + left_image carry the current view; memory_image (observe-stage
+    # keyframe on query frames, zeros elsewhere) is routed into right_wrist_0_rgb
+    # with a per-frame mask. Demos 1-35 train; 36-37 are held out for retrieval-
+    # method comparisons.
+    #
+    TrainConfig(
+        name="pi05_long_task_mem_lora",
+        project_name="memory_project",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotYamLongTaskDataConfig(
+            repo_id="kewalk/long_task_1_mem",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
         num_train_steps=30_000,
     ),
     #

@@ -78,6 +78,46 @@ class YamInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class YamLongTaskInputs(transforms.DataTransformFn):
+    """LONG_TASK_1 plate-memory variant: top + left as the current view; the
+    memory_image (oracle observe-stage keyframe on query stages, zeros otherwise)
+    is fed into the right_wrist_0_rgb slot, with image_mask = has_memory so the
+    slot's contribution is zeroed inside Pi0.embed_prefix on non-query frames.
+    """
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        top = _parse_image(data["observation/top_image"])
+        left = _parse_image(data["observation/left_image"])
+        mem = _parse_image(data["observation/memory_image"])
+        has_mem_arr = np.asarray(data["observation/has_memory"]).reshape(-1)
+        has_mem = bool(has_mem_arr[0] > 0.5)
+
+        inputs = {
+            "state": data["observation/state"],
+            "image": {
+                "base_0_rgb": top,
+                "left_wrist_0_rgb": left,
+                "right_wrist_0_rgb": mem,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.bool_(has_mem),
+            },
+        }
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class YamOutputs(transforms.DataTransformFn):
     """Trims the model's padded action vector back to the YAM 7-DoF action space."""
 
