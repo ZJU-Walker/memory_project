@@ -25,12 +25,12 @@ Tested on Ubuntu 22.04 with CUDA 12.x and a single NVIDIA GPU (≥ 24 GB VRAM fo
 
 ### 1. Clone
 
+`openpi/` and `i2rt/` are vendored as subdirectories of this repo, so a single clone gives you everything:
+
 ```bash
 cd /home/kewalk
 git clone <this repo> memory_project
 cd memory_project
-git clone https://github.com/Physical-Intelligence/openpi.git
-git clone https://github.com/i2rt-robotics/i2rt.git
 ```
 
 ### 2. Install `uv`
@@ -48,7 +48,7 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-This creates `openpi/.venv/` with JAX + Flax + LeRobot + transformers and downloads pretrained π₀.₅ weights on first use into `~/.cache/openpi/`.
+Creates `openpi/.venv/` with JAX + Flax + LeRobot + transformers. Pretrained π₀.₅ weights download on first use into `~/.cache/openpi/`.
 
 ### 4. Install i2rt into the same venv (sim playback, FK, real-robot driver)
 
@@ -61,7 +61,7 @@ uv pip install -e .
 
 ### 5. Extra deps used by `eval/` scripts
 
-These are pulled in transitively by openpi/i2rt, but if any are missing:
+Usually pulled in transitively. If any are missing:
 
 ```bash
 uv pip install imageio[pyav] scipy matplotlib tqdm einops mujoco
@@ -70,7 +70,7 @@ uv pip install imageio[pyav] scipy matplotlib tqdm einops mujoco
 ### 6. (Real-robot only) CAN bus
 
 ```bash
-sudo ip link set can0 up type can bitrate 1000000   # one-shot
+sudo ip link set can0 up type can bitrate 1000000             # one-shot
 sudo sh /home/kewalk/memory_project/i2rt/devices/install_devices.sh   # auto-up on boot
 ```
 
