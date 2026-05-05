@@ -17,6 +17,74 @@ memory_project/
 └── plan_claude.md           # living plan & status tracker
 ```
 
+## Install
+
+The project depends on two upstream repos cloned as siblings of this one — **openpi** (training/inference) and **i2rt** (YAM driver, URDF, MuJoCo sim). Each ships its own venv; this project reuses the openpi venv for everything.
+
+Tested on Ubuntu 22.04 with CUDA 12.x and a single NVIDIA GPU (≥ 24 GB VRAM for training, any modern GPU for inference). Python 3.11.
+
+### 1. Clone
+
+```bash
+cd /home/kewalk
+git clone <this repo> memory_project
+cd memory_project
+git clone https://github.com/Physical-Intelligence/openpi.git
+git clone https://github.com/i2rt-robotics/i2rt.git
+```
+
+### 2. Install `uv`
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+```
+
+### 3. Set up the openpi venv (training, eval, attention viz, serve)
+
+```bash
+cd /home/kewalk/memory_project/openpi
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+```
+
+This creates `openpi/.venv/` with JAX + Flax + LeRobot + transformers and downloads pretrained π₀.₅ weights on first use into `~/.cache/openpi/`.
+
+### 4. Install i2rt into the same venv (sim playback, FK, real-robot driver)
+
+```bash
+source /home/kewalk/memory_project/openpi/.venv/bin/activate
+cd /home/kewalk/memory_project/i2rt
+sudo apt install -y build-essential python3-dev linux-headers-$(uname -r)
+uv pip install -e .
+```
+
+### 5. Extra deps used by `eval/` scripts
+
+These are pulled in transitively by openpi/i2rt, but if any are missing:
+
+```bash
+uv pip install imageio[pyav] scipy matplotlib tqdm einops mujoco
+```
+
+### 6. (Real-robot only) CAN bus
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000   # one-shot
+sudo sh /home/kewalk/memory_project/i2rt/devices/install_devices.sh   # auto-up on boot
+```
+
+### 7. Verify
+
+```bash
+source /home/kewalk/memory_project/openpi/.venv/bin/activate
+python -c "import jax; print('jax devices:', jax.devices())"
+python -c "from openpi.training.config import get_config; print(get_config('pi05_yam_cup_lora').name)"
+python -c "from i2rt.robots.get_robot import get_yam_robot; print('i2rt OK')"
+```
+
+You should see a `gpu(id=0)` device and no import errors.
+
 ## Setup
 
 Activate the openpi venv before running anything:
