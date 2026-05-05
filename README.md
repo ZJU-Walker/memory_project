@@ -208,6 +208,58 @@ Flags:
 - `--infer-every K` — run inference every K frames; reuse the heatmap in between (default 10, ~10× speedup).
 - `--max-steps N` — quick smoke on the first N frames.
 
+### Long-horizon plate-memory task (LONG_TASK_1)
+
+Memory-conditioned variant. Each demo is one long episode with `observe → mix → delay → query1..4 → return_home` segments. Top + left cameras carry the current view; the live right wrist camera is dropped. The right-image slot is repurposed as a **memory channel**: zeros (mask off) on non-query frames, the observe-stage keyframe (mask on) on query frames. Training uses oracle memory; retrieval methods are compared at eval time. Demos 1-35 train, 36-37 are held out.
+
+#### Convert raw long-task data → LeRobot dataset
+
+Smoke test on a single demo first:
+
+```bash
+cd /home/kewalk/memory_project/openpi
+python examples/yam/convert_long_task_to_lerobot.py \
+    --data-dir /home/kewalk/memory_project/dataset/LONG_TASK_1 \
+    --limit 1
+```
+
+Full conversion of demos 1-35 (held-out 36-37 stay raw):
+
+```bash
+cd /home/kewalk/memory_project/openpi
+python examples/yam/convert_long_task_to_lerobot.py \
+    --data-dir /home/kewalk/memory_project/dataset/LONG_TASK_1
+```
+
+#### Compute normalization stats
+
+```bash
+cd /home/kewalk/memory_project/openpi
+uv run scripts/compute_norm_stats.py --config-name pi05_long_task_mem_lora
+```
+
+#### Train (LoRA fine-tune of π₀.₅, memory-conditioned)
+
+Smoke run (200 steps):
+
+```bash
+cd /home/kewalk/memory_project/openpi
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+    uv run scripts/train.py pi05_long_task_mem_lora \
+    --exp-name=long_smoke --num-train-steps=200 --overwrite
+```
+
+Full run (~12–24 h on a 4090):
+
+```bash
+cd /home/kewalk/memory_project/openpi
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+    uv run scripts/train.py pi05_long_task_mem_lora \
+    --exp-name=long_v1 --overwrite
+```
+
+Checkpoints land in `openpi/checkpoints/pi05_long_task_mem_lora/<exp-name>/`.
+
 ### Serve the trained policy (deferred — for real-robot use)
 
 ```bash
