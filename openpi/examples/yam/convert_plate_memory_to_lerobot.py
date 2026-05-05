@@ -31,6 +31,7 @@ Usage:
     uv run examples/yam/convert_plate_memory_to_lerobot.py --limit 35
 """
 
+import gc
 import json
 import shutil
 from pathlib import Path
@@ -45,16 +46,28 @@ DEFAULT_DATA_DIR = "/iris/u/kewalk/memory_project/dataset/LONG_TASK_1"
 FPS = 30
 H, W = 480, 640  # native camera resolution
 
-
-def _read_video_frames(path: Path) -> np.ndarray:
-    """Decode an MP4 to (T, H, W, 3) uint8."""
-    frames = iio.imread(str(path), plugin="pyav")  # (T, H, W, 3)
-    if frames.ndim != 4 or frames.shape[-1] != 3:
-        raise ValueError(f"Unexpected frame shape {frames.shape} for {path}")
-    return frames.astype(np.uint8)
+# Drain the image-writer queue every FLUSH_EVERY frames to keep queue depth (and
+# therefore RSS) bounded. At 480x640x3 uint8, 3 cams x 256 frames ≈ 700 MB peak.
+FLUSH_EVERY = 256
 
 
-def _load_demo(demo_dir: Path):
+def _video_frame_count(path: Path) -> int:
+    """Frame count from the container header (no full decode)."""
+    props = iio.improps(str(path), plugin="pyav")
+    if props.shape and props.shape[0] > 0:
+        return int(props.shape[0])
+    # Fallback: stream-decode if the header didn't expose frame count.
+    n = 0
+    for _ in iio.imiter(str(path), plugin="pyav"):
+        n += 1
+    return n
+
+
+def _load_demo_meta(demo_dir: Path):
+    """Load only state / action / instructions / per-camera frame counts.
+
+    Videos are streamed frame-by-frame at write time to bound peak memory.
+    """
     meta = json.loads((demo_dir / "metadata.json").read_text())
     n_steps = int(meta["num_steps"])
 
@@ -62,12 +75,11 @@ def _load_demo(demo_dir: Path):
     action = np.load(demo_dir / "left_control.npy").astype(np.float32)         # (T, 7)
     instructions = np.load(demo_dir / "instruction.npy", allow_pickle=False)    # (T,) <U??
 
-    top = _read_video_frames(demo_dir / "top_camera_rgb.mp4")
-    left = _read_video_frames(demo_dir / "left_camera_rgb.mp4")
-    right = _read_video_frames(demo_dir / "right_camera_rgb.mp4")
+    n_top = _video_frame_count(demo_dir / "top_camera_rgb.mp4")
+    n_left = _video_frame_count(demo_dir / "left_camera_rgb.mp4")
+    n_right = _video_frame_count(demo_dir / "right_camera_rgb.mp4")
 
-    # Trim to the shortest length so all streams align (videos can be off-by-one).
-    T = min(n_steps, len(state), len(action), len(instructions), len(top), len(left), len(right))
+    T = min(n_steps, len(state), len(action), len(instructions), n_top, n_left, n_right)
     if T < n_steps:
         print(f"  [warn] {demo_dir.name}: trimming to T={T} (metadata said {n_steps})")
     return {
@@ -75,9 +87,6 @@ def _load_demo(demo_dir: Path):
         "state": state[:T],
         "action": action[:T],
         "instructions": instructions[:T],
-        "top": top[:T],
-        "left": left[:T],
-        "right": right[:T],
     }
 
 
@@ -105,8 +114,12 @@ def main(
             "state": {"dtype": "float32", "shape": (7,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        # Threads-only writer (in-process queue). Subprocess mode used an unbounded
+        # multiprocessing.JoinableQueue that filled faster than disk could drain
+        # it -> RSS reached 40+ GB by demo 15. We also throttle below by calling
+        # _wait_image_writer() every FLUSH_EVERY frames so the queue stays bounded.
+        image_writer_threads=4,
+        image_writer_processes=0,
     )
 
     demo_dirs = sorted(
@@ -124,19 +137,45 @@ def main(
             continue
 
         print(f"[{i+1}/{len(demo_dirs)}] {demo.name}")
-        d = _load_demo(demo)
-        for t in range(d["T"]):
+        d = _load_demo_meta(demo)
+        T = d["T"]
+
+        # Stream the three camera videos frame-by-frame so we never hold a full
+        # decoded video in memory at once (~2.6 GB / video).
+        top_iter = iio.imiter(str(demo / "top_camera_rgb.mp4"), plugin="pyav")
+        left_iter = iio.imiter(str(demo / "left_camera_rgb.mp4"), plugin="pyav")
+        right_iter = iio.imiter(str(demo / "right_camera_rgb.mp4"), plugin="pyav")
+
+        for t in range(T):
+            top_frame = next(top_iter)
+            left_frame = next(left_iter)
+            right_frame = next(right_iter)
             dataset.add_frame(
                 {
-                    "top_image": d["top"][t],
-                    "left_image": d["left"][t],
-                    "right_image": d["right"][t],
+                    "top_image": np.asarray(top_frame, dtype=np.uint8),
+                    "left_image": np.asarray(left_frame, dtype=np.uint8),
+                    "right_image": np.asarray(right_frame, dtype=np.uint8),
                     "state": d["state"][t],
                     "actions": d["action"][t],
                     "task": str(d["instructions"][t]),
                 }
             )
+            # Periodic drain so the writer queue can't grow without bound.
+            if (t + 1) % FLUSH_EVERY == 0:
+                dataset.image_writer.wait_until_done()
+
+        # Drop iterators (and any pyav decoder state they hold) before save_episode.
+        del top_iter, left_iter, right_iter
         dataset.save_episode()
+
+        # LeRobot's save_episode does `concatenate_datasets([hf_dataset, ep_dataset])`,
+        # which keeps every embedded image (~150 KB/frame x 3 cams) in RAM forever.
+        # Across 35 demos this hits ~80 GB RSS. The on-disk parquet shard is already
+        # written by save_episode -> reset the in-memory copy to an empty dataset so
+        # peak RAM stays per-episode bounded.
+        dataset.hf_dataset = dataset.create_hf_dataset()
+        del d
+        gc.collect()
 
     print(f"Done. Dataset written to {output_path}")
 
