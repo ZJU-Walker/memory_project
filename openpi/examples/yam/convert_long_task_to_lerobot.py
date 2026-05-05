@@ -20,6 +20,11 @@ Memory channel:
     The training-time YamLongTaskInputs transform routes memory_image into
     pi0.5's right_wrist_0_rgb slot with the per-frame mask = has_memory.
 
+Memory note:
+    Frames are streamed via iio.imiter() so peak RAM stays at ~1 frame per video
+    instead of ~3 GB per video. The keyframe is read separately with index=
+    random access. image_writer_processes=2 keeps writer-queue memory bounded.
+
 Train split:
     Default range is demos 1..35. demo36 / demo37 are held out for retrieval-method
     comparisons.
@@ -30,10 +35,12 @@ Usage:
         --data-dir /home/kewalk/memory_project/dataset/LONG_TASK_1
 """
 
+import gc
 import json
 import shutil
 from pathlib import Path
 
+import datasets as hf_datasets
 import imageio.v3 as iio
 import numpy as np
 import tyro
@@ -45,41 +52,25 @@ H, W = 480, 640
 QUERY_STAGES = {3, 4, 5, 6}  # query1..query4
 
 
-def _read_video_frames(path: Path) -> np.ndarray:
-    frames = iio.imread(str(path), plugin="pyav")
-    if frames.ndim != 4 or frames.shape[-1] != 3:
-        raise ValueError(f"Unexpected frame shape {frames.shape} for {path}")
-    return frames.astype(np.uint8)
+def _read_keyframe(path: Path, index: int) -> np.ndarray:
+    """Decode a single frame at `index` without loading the whole video."""
+    frame = iio.imread(str(path), plugin="pyav", index=index)
+    return np.asarray(frame, dtype=np.uint8)
 
 
-def _load_demo(demo_dir: Path):
+def _frame_iterator(path: Path):
+    """Yield frames as (H, W, 3) uint8 arrays one at a time."""
+    for frame in iio.imiter(str(path), plugin="pyav"):
+        yield np.asarray(frame, dtype=np.uint8)
+
+
+def _load_meta(demo_dir: Path):
     meta = json.loads((demo_dir / "metadata.json").read_text())
-
     state = np.load(demo_dir / "left_joint_positions.npy").astype(np.float32)
     action = np.load(demo_dir / "left_control.npy").astype(np.float32)
     instruction = np.load(demo_dir / "instruction.npy", allow_pickle=True)
     stage_id = np.load(demo_dir / "stage_id.npy").astype(np.int32)
-
-    top = _read_video_frames(demo_dir / "top_camera_rgb.mp4")
-    left = _read_video_frames(demo_dir / "left_camera_rgb.mp4")
-
-    T = min(len(state), len(action), len(top), len(left), len(instruction), len(stage_id))
-
-    # Observe segment is the first segment; its end_step gives us the keyframe index.
-    observe_seg = next(s for s in meta["segments"] if s["name"] == "observe")
-    keyframe_idx = min(observe_seg["end_step"] - 1, T - 1)
-    keyframe = top[keyframe_idx]  # (H, W, 3) uint8
-
-    return {
-        "T": T,
-        "state": state[:T],
-        "action": action[:T],
-        "top": top[:T],
-        "left": left[:T],
-        "stage_id": stage_id[:T],
-        "instruction": instruction[:T],
-        "keyframe": keyframe,
-    }
+    return meta, state, action, instruction, stage_id
 
 
 def main(
@@ -90,6 +81,8 @@ def main(
     limit: int | None = None,
     start_demo: int = 1,
     end_demo: int = 35,
+    image_writer_processes: int = 2,
+    image_writer_threads: int = 4,
 ):
     data_dir = Path(data_dir)
     output_path = HF_LEROBOT_HOME / repo_id
@@ -109,8 +102,8 @@ def main(
             "actions":      {"dtype": "float32", "shape": (7,), "names": ["actions"]},
             "has_memory":   {"dtype": "float32", "shape": (1,), "names": ["has_memory"]},
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        image_writer_threads=image_writer_threads,
+        image_writer_processes=image_writer_processes,
     )
 
     demo_dirs = sorted(
@@ -131,12 +124,26 @@ def main(
             continue
 
         print(f"[{i+1}/{len(demo_dirs)}] {demo.name}")
-        d = _load_demo(demo)
+        meta, state, action, instruction, stage_id = _load_meta(demo)
+
+        # Observe segment first; its end_step-1 indexes the keyframe.
+        observe_seg = next(s for s in meta["segments"] if s["name"] == "observe")
+        T_meta = min(len(state), len(action), len(instruction), len(stage_id))
+        keyframe_idx = min(observe_seg["end_step"] - 1, T_meta - 1)
+        keyframe = _read_keyframe(demo / "top_camera_rgb.mp4", keyframe_idx)
+
+        # Stream frames from both videos in lockstep with state/action/etc.
+        top_iter = _frame_iterator(demo / "top_camera_rgb.mp4")
+        left_iter = _frame_iterator(demo / "left_camera_rgb.mp4")
+
         n_query_frames = 0
-        for t in range(d["T"]):
-            stage = int(d["stage_id"][t])
+        t = 0
+        for t, (top_frame, left_frame) in enumerate(zip(top_iter, left_iter)):
+            if t >= T_meta:
+                break
+            stage = int(stage_id[t])
             if stage in QUERY_STAGES:
-                memory_img = d["keyframe"]
+                memory_img = keyframe
                 has_mem = 1.0
                 n_query_frames += 1
             else:
@@ -144,17 +151,34 @@ def main(
                 has_mem = 0.0
             dataset.add_frame(
                 {
-                    "top_image": d["top"][t],
-                    "left_image": d["left"][t],
+                    "top_image": top_frame,
+                    "left_image": left_frame,
                     "memory_image": memory_img,
-                    "state": d["state"][t],
-                    "actions": d["action"][t],
+                    "state": state[t],
+                    "actions": action[t],
                     "has_memory": np.array([has_mem], dtype=np.float32),
-                    "task": str(d["instruction"][t]),
+                    "task": str(instruction[t]),
                 }
             )
+        T_written = t + 1 if t > 0 else 0
+        # Drop references and explicitly collect before save_episode flushes
+        # writers — avoids holding the previous demo's frames during flush.
+        del top_iter, left_iter, keyframe, meta, state, action, instruction, stage_id
+        gc.collect()
         dataset.save_episode()
-        print(f"    T={d['T']}  query_frames={n_query_frames}")
+
+        # LeRobot's _save_episode_table appends each episode's embedded images
+        # into self.hf_dataset via concatenate_datasets — accumulating all prior
+        # episodes in RAM and OOMing past demo ~18. The per-episode parquet is
+        # already on disk, so reset the in-memory accumulator to keep RAM
+        # bounded across many demos.
+        empty_features = dataset.hf_dataset.features
+        dataset.hf_dataset = hf_datasets.Dataset.from_dict(
+            {k: [] for k in empty_features},
+            features=empty_features,
+        )
+        gc.collect()
+        print(f"    T={T_written}  query_frames={n_query_frames}")
 
     print(f"Done. Dataset written to {output_path}")
 
