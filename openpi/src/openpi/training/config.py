@@ -810,7 +810,7 @@ _CONFIGS = [
         project_name="memory_project",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=10,
+            action_horizon=50,
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
@@ -823,7 +823,7 @@ _CONFIGS = [
         # Match the model variants exactly when computing the LoRA freeze filter.
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=10,
+            action_horizon=50,
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
