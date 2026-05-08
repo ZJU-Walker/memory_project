@@ -260,7 +260,84 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 
 Checkpoints land in `openpi/checkpoints/pi05_long_task_mem_lora/<exp-name>/`.
 
-### Serve the trained policy (deferred — for real-robot use)
+#### Offline eval — held-out demos (long task)
+
+Replays a held-out demo through the trained memory-conditioned policy. Builds the oracle memory image (last frame of the observe segment) on query stages; zeros otherwise. Saves predicted action chunks + ground-truth signals to `eval/results_long_<demo>[_nomem].npz` and prints per-stage MAE/RMSE/max.
+
+```bash
+cd /home/kewalk/memory_project
+
+# Smoke (50 frames, ~30 s)
+python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000 --max-steps 50
+
+# Full demo with oracle memory
+python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000
+python eval/offline_eval_long.py --demo demo37 --ckpt-step 9000
+
+# No-memory ablation (forces memory channel off everywhere)
+python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000 --no-memory
+python eval/offline_eval_long.py --demo demo37 --ckpt-step 9000 --no-memory
+```
+
+Flags:
+- `--demo demo36 | demo37` — held-out episodes
+- `--ckpt-step 9000` — checkpoint step to load (default 5000; latest available step recommended)
+- `--max-steps N` — quick smoke on the first N frames
+- `--no-memory` — force memory_image=zeros and has_memory=0 always (ablation)
+
+The interesting comparison is **oracle vs. no-memory** on the **query** stage rows — a meaningful gap means the policy is using the memory channel.
+
+#### Attention diagnostics — does the policy use the memory image?
+
+Both tools support `--per-stage-frames N` to **only run inference on the first N frames after each stage transition** (8 stages × N inferences total instead of ~3000+). Recommended for a quick read; `--per-stage-frames 3` typically finishes in ~30 sec.
+
+**A. Per-camera attention budget plot** — for each frame, computes the fraction of prompt-token attention that lands on each camera's patches. If `mem` rises during query stages, the policy is using the memory channel; if it stays flat, it's ignoring the right slot.
+
+```bash
+# Quick read (8 stages × 3 = 24 inferences, ~30 sec)
+python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000 --per-stage-frames 3
+
+# Full per-frame plot (~5-7 min)
+python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000
+
+# Mid-cost — every 5th frame (~1-2 min)
+python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000 --infer-every 5
+```
+
+Outputs `eval/results_long_<demo>_attn.npz` and `eval/figs/attention_budget_<demo>.png` (stacked time-series colored by stage). Prints per-stage mean fractions — that's the load-bearing summary.
+
+**B. Heatmap video on top / left / memory** — same idea as the CUP-task `attention_viz.py` but the right panel is the memory image. During *"originally on the orange plate"* queries the heatmap on the memory panel should localize on the orange plate.
+
+```bash
+# Slideshow (24 frames @ 2 fps → ~12-second video, ~30 sec to render)
+python eval/attention_viz_long.py --demo demo36 --queries prompt \
+    --layers 8,9,10,11 --per-stage-frames 3
+
+# Even shorter: 1 frame per stage
+python eval/attention_viz_long.py --demo demo36 --queries prompt \
+    --layers 8,9,10,11 --per-stage-frames 1
+
+# Full-length video (~10 min with --infer-every 10 default)
+python eval/attention_viz_long.py --demo demo36 --queries prompt --layers 8,9,10,11
+
+# Smoke on first 50 frames
+python eval/attention_viz_long.py --demo demo36 --queries prompt --max-steps 50
+```
+
+Outputs `eval/figs/attention_long_<demo>_q-prompt.mp4`. Slideshow mode plays at 2 fps by default; override with `--fps`.
+
+Flags:
+- `--per-stage-frames N` — only inference (and, for viz, only render) the first N frames after each stage transition. Fastest way to scan all 8 stages.
+- `--queries prompt|actions` — slice attention from prompt-token queries (language→image grounding) or action-token queries (what the action heads attend to).
+- `--layers 8,9,10,11` — comma-separated layer indices to average. 8-11 is the language→image band; 14-17 is action-execution.
+- `--infer-every K` — run inference every K frames; reuse heatmap in between (default 10 for viz, 1 for budget).
+- `--ckpt-step N` — checkpoint step to load (default 5000; latest available step recommended).
+
+### Serve the trained policy (real-robot use)
+
+WebSocket inference server on port 8000. Run on the workstation; the robot computer connects over Tailscale (`tailscale ip -4` on the workstation gives the host).
+
+**CUP task:**
 
 ```bash
 cd /home/kewalk/memory_project/openpi
@@ -268,3 +345,19 @@ uv run scripts/serve_policy.py policy:checkpoint \
     --policy.config=pi05_yam_cup_lora \
     --policy.dir=checkpoints/pi05_yam_cup_lora/cup_0429_v1/29999
 ```
+
+**Long task (memory-conditioned)** — point at the latest checkpoint step:
+
+```bash
+cd /home/kewalk/memory_project/openpi
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config=pi05_long_task_mem_lora \
+    --policy.dir=checkpoints/pi05_long_task_mem_lora/long_v1/9000
+```
+
+Confirm via the log lines:
+- `Restoring checkpoint from .../long_v1/9000/params`
+- `Loaded norm stats from .../pi05_long_task_mem_lora/...`
+- `server listening on 0.0.0.0:8000`
+
+Run inside `tmux new -s server` so it survives terminal disconnects. From the robot computer, sanity-check connectivity with `curl http://<workstation_tailscale_ip>:8000/healthz`.
