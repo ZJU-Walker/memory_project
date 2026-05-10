@@ -73,17 +73,28 @@ def build_chunk_schedule(pred_chunks: np.ndarray, stride: int) -> np.ndarray:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", default="demo1")
+    parser.add_argument("--results-path", default=None,
+                        help="Override the input npz path. Default: eval/results_<demo>.npz "
+                             "(use this to play back long-task results: "
+                             "--results-path eval/results_long_demo36.npz).")
     parser.add_argument("--no-viewer", action="store_true", help="Headless run")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Playback speed multiplier (1.0 = real-time)")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--chunk-stride", type=int, default=10,
-                        help="Re-infer every N steps; up to action_horizon (10). "
-                             "10 = execute full chunk; 1 = use pred_first every step.")
+                        help="Re-infer every N steps; up to action_horizon (10 or 50). "
+                             "stride=10 = execute first 10 steps of chunk before re-anchoring; "
+                             "stride=action_horizon = execute full chunk; "
+                             "stride=1 = use pred_first every step.")
     args = parser.parse_args()
 
-    in_path = EVAL_DIR / f"results_{args.demo}.npz"
-    out_path = EVAL_DIR / f"sim_{args.demo}.npz"
+    if args.results_path is not None:
+        in_path = pathlib.Path(args.results_path)
+        out_stem = "sim_" + in_path.stem.removeprefix("results_")
+        out_path = EVAL_DIR / f"{out_stem}.npz"
+    else:
+        in_path = EVAL_DIR / f"results_{args.demo}.npz"
+        out_path = EVAL_DIR / f"sim_{args.demo}.npz"
     print(f"[load] {in_path}")
     data = np.load(in_path)
     state = data["state"]            # (T, 7)
