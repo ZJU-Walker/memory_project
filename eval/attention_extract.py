@@ -98,24 +98,6 @@ class AttentionExtractor:
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
         return _model.Observation.from_dict(inputs)
 
-    def _build_obs_long(self, top, left, memory, has_mem, state, prompt) -> _model.Observation:
-        """LONG_TASK_1 obs format: memory_image + has_memory; right wrist dropped.
-
-        The matched data transform (YamLongTaskInputs) routes memory_image into
-        right_wrist_0_rgb with image_mask = has_memory.
-        """
-        raw = {
-            "observation/top_image": np.asarray(top, dtype=np.uint8),
-            "observation/left_image": np.asarray(left, dtype=np.uint8),
-            "observation/memory_image": np.asarray(memory, dtype=np.uint8),
-            "observation/state": np.asarray(state, dtype=np.float32),
-            "observation/has_memory": np.array([1.0 if has_mem else 0.0], dtype=np.float32),
-            "prompt": prompt if prompt is not None else self._prompt,
-        }
-        inputs = self._input_transform(jax.tree.map(lambda x: x, raw))
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
-        return _model.Observation.from_dict(inputs)
-
     def _compute_boundaries(self, obs: _model.Observation, action_horizon: int) -> TokenBoundaries:
         """Run embed_prefix once to discover the per-camera patch counts and prompt length."""
         prefix_tokens, prefix_mask, _ = self._model.embed_prefix(obs)  # (1, S, D)
@@ -213,65 +195,6 @@ class AttentionExtractor:
             "boundaries": self._boundaries,
             "prefix_len": int(prefix_tokens.shape[1]),
             "suffix_len": int(suffix_tokens.shape[1]),
-        }
-
-    def extract_long(
-        self,
-        top: np.ndarray,
-        left: np.ndarray,
-        memory: np.ndarray,
-        has_memory: bool,
-        state: np.ndarray,
-        prompt: str | None = None,
-        action_seed: np.ndarray | None = None,
-        time: float = 0.0,
-    ) -> dict[str, Any]:
-        """Long-task variant of extract().
-
-        memory + has_memory map onto the right_wrist_0_rgb slot via YamLongTaskInputs.
-        prompt overrides the extractor's default per-call (per-frame instructions).
-        Returns the same dict layout as extract(): boundaries.img_right is the memory channel.
-        """
-        obs = self._build_obs_long(top, left, memory, has_memory, state, prompt)
-        if self._boundaries is None:
-            self._boundaries = self._compute_boundaries(obs, self._action_horizon)
-
-        if action_seed is None:
-            action_seed = np.zeros((self._action_horizon, self._action_dim), dtype=np.float32)
-        action_seed = jnp.asarray(action_seed, dtype=jnp.float32)[None, ...]
-        x_t = (1.0 - time) * action_seed
-        time_arr = jnp.asarray([time], dtype=jnp.float32)
-
-        prefix_tokens, prefix_mask, prefix_ar_mask = self._model.embed_prefix(obs)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self._model.embed_suffix(
-            obs, x_t, time_arr
-        )
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = _pi0.make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-
-        out, updates = self._llm_linen_module.apply(
-            self._llm_variables,
-            [prefix_tokens, suffix_tokens],
-            mask=attn_mask,
-            positions=positions,
-            adarms_cond=[None, adarms_cond],
-            mutable=["intermediates"],
-        )
-        (prefix_out, suffix_out), _ = out
-        attn_probs = self._find_attn_probs(updates)
-        if attn_probs is None:
-            raise RuntimeError("attn_probs not found in updates tree")
-
-        v_t = self._action_out_proj(suffix_out[:, -self._action_horizon :])
-        return {
-            "v_t": np.asarray(v_t[0]),
-            "attn_probs": np.asarray(attn_probs),
-            "boundaries": self._boundaries,
-            "prefix_len": int(prefix_tokens.shape[1]),
-            "suffix_len": int(suffix_tokens.shape[1]),
-            "prefix_mask": np.asarray(prefix_mask[0]),
         }
 
     @staticmethod
