@@ -1,6 +1,6 @@
 # memory_project
 
-Workspace for fine-tuning Physical Intelligence's **π₀.₅ (pi-0.5)** on a YAM single-arm dataset.
+Workspace for fine-tuning Physical Intelligence's **π₀.₅ (pi-0.5)** on YAM single-arm datasets.
 
 See [`plan_claude.md`](./plan_claude.md) for the running execution plan and status.
 
@@ -8,12 +8,12 @@ See [`plan_claude.md`](./plan_claude.md) for the running execution plan and stat
 
 ```
 memory_project/
-├── dataset/CUP_TASK_0428/   # raw YAM teleop demos (40 episodes, 30 Hz, 3 cameras)
+├── dataset/CUP_TASK_0428/   # raw YAM teleop demos for the cup-grasping task (40 episodes, 30 Hz, 3 cameras)
+├── dataset/PLATE_TASK_1/    # raw YAM teleop demos for the plate-memory task (37 long episodes, 30 Hz)
 ├── openpi/                  # cloned openpi repo + venv (gitignored)
 ├── i2rt/                    # cloned i2rt repo (YAM URDF, FK, MuJoCo SimRobot)
 ├── eval/                    # offline-eval scripts + outputs (npz, figs)
 ├── test/                    # standalone validation scripts
-├── test.py                  # quick scratch / probe script
 └── plan_claude.md           # living plan & status tracker
 ```
 
@@ -79,7 +79,7 @@ sudo sh /home/kewalk/memory_project/i2rt/devices/install_devices.sh   # auto-up 
 ```bash
 source /home/kewalk/memory_project/openpi/.venv/bin/activate
 python -c "import jax; print('jax devices:', jax.devices())"
-python -c "from openpi.training.config import get_config; print(get_config('pi05_yam_cup_lora').name)"
+python -c "from openpi.training.config import get_config; print(get_config('pi05_yam_cup_lora').name, get_config('pi05_plate_task').name)"
 python -c "from i2rt.robots.get_robot import get_yam_robot; print('i2rt OK')"
 ```
 
@@ -93,9 +93,11 @@ Activate the openpi venv before running anything:
 source /home/kewalk/memory_project/openpi/.venv/bin/activate
 ```
 
-## Commands
+## Cup task
 
-### Convert raw YAM data → LeRobot dataset
+Single-arm pick-and-place. 40 teleop demos at 30 Hz with three cameras (top, left wrist, right wrist) and 7-DoF joint-position actions. All three image slots are populated; the prompt is a fixed string ("pick up the cup with yellow object inside").
+
+### Convert raw cup data → LeRobot dataset
 
 Smoke test on a single demo first:
 
@@ -113,7 +115,6 @@ cd /home/kewalk/memory_project/openpi
 python examples/yam/convert_cup_to_lerobot.py \
     --data-dir /home/kewalk/memory_project/dataset/CUP_TASK_0428
 ```
-
 
 ### Compute normalization stats
 
@@ -208,136 +209,9 @@ Flags:
 - `--infer-every K` — run inference every K frames; reuse the heatmap in between (default 10, ~10× speedup).
 - `--max-steps N` — quick smoke on the first N frames.
 
-### Long-horizon plate-memory task (LONG_TASK_1)
-
-Memory-conditioned variant. Each demo is one long episode with `observe → mix → delay → query1..4 → return_home` segments. Top + left cameras carry the current view; the live right wrist camera is dropped. The right-image slot is repurposed as a **memory channel**: zeros (mask off) on non-query frames, the observe-stage keyframe (mask on) on query frames. Training uses oracle memory; retrieval methods are compared at eval time. Demos 1-35 train, 36-37 are held out.
-
-#### Convert raw long-task data → LeRobot dataset
-
-Smoke test on a single demo first:
-
-```bash
-cd /home/kewalk/memory_project/openpi
-python examples/yam/convert_long_task_to_lerobot.py \
-    --data-dir /home/kewalk/memory_project/dataset/LONG_TASK_1 \
-    --limit 1
-```
-
-Full conversion of demos 1-35 (held-out 36-37 stay raw):
-
-```bash
-cd /home/kewalk/memory_project/openpi
-python examples/yam/convert_long_task_to_lerobot.py \
-    --data-dir /home/kewalk/memory_project/dataset/LONG_TASK_1
-```
-
-#### Compute normalization stats
-
-```bash
-cd /home/kewalk/memory_project/openpi
-uv run scripts/compute_norm_stats.py --config-name pi05_long_task_mem_lora
-```
-
-#### Train (LoRA fine-tune of π₀.₅, memory-conditioned)
-
-Smoke run (200 steps):
-
-```bash
-cd /home/kewalk/memory_project/openpi
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-    uv run scripts/train.py pi05_long_task_mem_lora \
-    --exp-name=long_smoke --num-train-steps=200 --overwrite
-```
-
-Full run (~12–24 h on a 4090):
-
-```bash
-cd /home/kewalk/memory_project/openpi
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-    uv run scripts/train.py pi05_long_task_mem_lora \
-    --exp-name=long_v1 --overwrite
-```
-
-Checkpoints land in `openpi/checkpoints/pi05_long_task_mem_lora/<exp-name>/`.
-
-#### Offline eval — held-out demos (long task)
-
-Replays a held-out demo through the trained memory-conditioned policy. Builds the oracle memory image (last frame of the observe segment) on query stages; zeros otherwise. Saves predicted action chunks + ground-truth signals to `eval/results_long_<demo>[_nomem].npz` and prints per-stage MAE/RMSE/max.
-
-```bash
-cd /home/kewalk/memory_project
-
-# Smoke (50 frames, ~30 s)
-python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000 --max-steps 50
-
-# Full demo with oracle memory
-python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000
-python eval/offline_eval_long.py --demo demo37 --ckpt-step 9000
-
-# No-memory ablation (forces memory channel off everywhere)
-python eval/offline_eval_long.py --demo demo36 --ckpt-step 9000 --no-memory
-python eval/offline_eval_long.py --demo demo37 --ckpt-step 9000 --no-memory
-```
-
-Flags:
-- `--demo demo36 | demo37` — held-out episodes
-- `--ckpt-step 9000` — checkpoint step to load (default 5000; latest available step recommended)
-- `--max-steps N` — quick smoke on the first N frames
-- `--no-memory` — force memory_image=zeros and has_memory=0 always (ablation)
-
-The interesting comparison is **oracle vs. no-memory** on the **query** stage rows — a meaningful gap means the policy is using the memory channel.
-
-#### Attention diagnostics — does the policy use the memory image?
-
-Both tools support `--per-stage-frames N` to **only run inference on the first N frames after each stage transition** (8 stages × N inferences total instead of ~3000+). Recommended for a quick read; `--per-stage-frames 3` typically finishes in ~30 sec.
-
-**A. Per-camera attention budget plot** — for each frame, computes the fraction of prompt-token attention that lands on each camera's patches. If `mem` rises during query stages, the policy is using the memory channel; if it stays flat, it's ignoring the right slot.
-
-```bash
-# Quick read (8 stages × 3 = 24 inferences, ~30 sec)
-python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000 --per-stage-frames 3
-
-# Full per-frame plot (~5-7 min)
-python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000
-
-# Mid-cost — every 5th frame (~1-2 min)
-python eval/attention_budget_long.py --demo demo36 --ckpt-step 9000 --infer-every 5
-```
-
-Outputs `eval/results_long_<demo>_attn.npz` and `eval/figs/attention_budget_<demo>.png` (stacked time-series colored by stage). Prints per-stage mean fractions — that's the load-bearing summary.
-
-**B. Heatmap video on top / left / memory** — same idea as the CUP-task `attention_viz.py` but the right panel is the memory image. During *"originally on the orange plate"* queries the heatmap on the memory panel should localize on the orange plate.
-
-```bash
-# Slideshow (24 frames @ 2 fps → ~12-second video, ~30 sec to render)
-python eval/attention_viz_long.py --demo demo36 --queries prompt \
-    --layers 8,9,10,11 --per-stage-frames 3
-
-# Even shorter: 1 frame per stage
-python eval/attention_viz_long.py --demo demo36 --queries prompt \
-    --layers 8,9,10,11 --per-stage-frames 1
-
-# Full-length video (~10 min with --infer-every 10 default)
-python eval/attention_viz_long.py --demo demo36 --queries prompt --layers 8,9,10,11
-
-# Smoke on first 50 frames
-python eval/attention_viz_long.py --demo demo36 --queries prompt --max-steps 50
-```
-
-Outputs `eval/figs/attention_long_<demo>_q-prompt.mp4`. Slideshow mode plays at 2 fps by default; override with `--fps`.
-
-Flags:
-- `--per-stage-frames N` — only inference (and, for viz, only render) the first N frames after each stage transition. Fastest way to scan all 8 stages.
-- `--queries prompt|actions` — slice attention from prompt-token queries (language→image grounding) or action-token queries (what the action heads attend to).
-- `--layers 8,9,10,11` — comma-separated layer indices to average. 8-11 is the language→image band; 14-17 is action-execution.
-- `--infer-every K` — run inference every K frames; reuse heatmap in between (default 10 for viz, 1 for budget).
-- `--ckpt-step N` — checkpoint step to load (default 5000; latest available step recommended).
-
 ### Serve the trained policy (real-robot use)
 
 WebSocket inference server on port 8000. Run on the workstation; the robot computer connects over Tailscale (`tailscale ip -4` on the workstation gives the host).
-
-**CUP task:**
 
 ```bash
 cd /home/kewalk/memory_project/openpi
@@ -346,18 +220,77 @@ uv run scripts/serve_policy.py policy:checkpoint \
     --policy.dir=checkpoints/pi05_yam_cup_lora/cup_0429_v1/29999
 ```
 
-**Long task (memory-conditioned)** — point at the latest checkpoint step:
+Run inside `tmux new -s server` so it survives terminal disconnects. From the robot computer, sanity-check connectivity with `curl http://<workstation_tailscale_ip>:8000/healthz`.
+
+## Plate task
+
+Long-horizon plate-memory task. Each demo is one long episode with `observe → mix → delay → query1..4 → return_home` segments. Top + left cameras carry the current view; `right_wrist_0_rgb` is zero-padded and masked off (single-arm YAM, no real right wrist). The per-frame instruction already names the resolved object (e.g. *"put banana on the light blue plate"*) — generated from each demo's `metadata.json` `episode_plan` at training time, and produced by an upstream VLM at inference (oracle / manual until a retriever is built). Demos 1-35 train, 36-37 held out.
+
+### Convert raw plate data → LeRobot dataset
+
+Smoke test on a single demo first:
+
+```bash
+cd /home/kewalk/memory_project/openpi
+uv run examples/yam/convert_plate_task_to_lerobot.py \
+    --data-dir /home/kewalk/memory_project/dataset/PLATE_TASK_1 \
+    --limit 1
+```
+
+Full conversion of demos 1-35:
+
+```bash
+cd /home/kewalk/memory_project/openpi
+uv run examples/yam/convert_plate_task_to_lerobot.py \
+    --data-dir /home/kewalk/memory_project/dataset/PLATE_TASK_1 \
+    --push_to_hub
+```
+
+Append `--push-to-hub` to also publish to `kewalk123/plate_task` on HF (required for Modal training; optional locally).
+
+### Compute normalization stats
+
+```bash
+cd /home/kewalk/memory_project/openpi
+uv run scripts/compute_norm_stats.py --config-name pi05_plate_task
+```
+
+### Train (LoRA fine-tune of π₀.₅)
+
+Smoke run (200 steps):
+
+```bash
+cd /home/kewalk/memory_project/openpi
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+    uv run scripts/train.py pi05_plate_task \
+    --exp-name=plate_smoke --num-train-steps=200 --overwrite
+```
+
+Full run (~12–24 h on a 4090):
+
+```bash
+cd /home/kewalk/memory_project/openpi
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+    uv run scripts/train.py pi05_plate_task \
+    --exp-name=plate_oracle_v2_0510 --overwrite
+```
+
+Checkpoints land in `openpi/checkpoints/pi05_plate_task/<exp-name>/`.
+
+### Serve the trained policy (real-robot use)
+
+WebSocket inference server on port 8000. Run on the workstation; the robot computer connects over Tailscale (`tailscale ip -4` on the workstation gives the host).
 
 ```bash
 cd /home/kewalk/memory_project/openpi
 uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_long_task_mem_lora \
-    --policy.dir=checkpoints/pi05_long_task_mem_lora/long_v1/9000
+    --policy.config=pi05_plate_task \
+    --policy.dir=checkpoints/pi05_plate_task/plate_oracle_v2_0510/<step>
 ```
 
 Confirm via the log lines:
-- `Restoring checkpoint from .../long_v1/9000/params`
-- `Loaded norm stats from .../pi05_long_task_mem_lora/...`
+- `Restoring checkpoint from .../plate_oracle_v2_0510/<step>/params`
+- `Loaded norm stats from .../pi05_plate_task/...`
 - `server listening on 0.0.0.0:8000`
 
 Run inside `tmux new -s server` so it survives terminal disconnects. From the robot computer, sanity-check connectivity with `curl http://<workstation_tailscale_ip>:8000/healthz`.
