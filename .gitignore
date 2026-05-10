@@ -5,3 +5,4 @@ plan_claude.md
 eval/figs
 __pycache__
 eval/real/runs
+test/
