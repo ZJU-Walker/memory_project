@@ -398,7 +398,7 @@ class LeRobotYamCupDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamLongTaskDataConfig(DataConfigFactory):
-    """Data config for the YAM long-horizon plate-memory dataset (kewalk/long_task_1_mem).
+    """Data config for the YAM long-horizon plate-memory dataset (kewalk123/long_task_1_mem).
 
     Dataset features: top_image, left_image, memory_image, state(7,), actions(7,),
     has_memory(1,), task. The memory_image is the observe-stage keyframe broadcast
@@ -893,7 +893,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotYamLongTaskDataConfig(
-            repo_id="kewalk/long_task_1_mem",
+            repo_id="kewalk123/long_task_1_mem",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

@@ -38,15 +38,28 @@ Usage:
 import gc
 import json
 import shutil
+from functools import partial
 from pathlib import Path
 
 import datasets as hf_datasets
 import imageio.v3 as iio
 import numpy as np
 import tyro
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
-REPO_NAME = "kewalk/long_task_1_mem"
+# Speed up video encoding: LeRobot's default vcodec is libsvtav1 (AV1), which is
+# very slow on CPU. Monkey-patch it to libx264 (~5x faster, plenty good quality
+# at CRF 23) BEFORE importing LeRobotDataset — the dataset module captures the
+# function reference at import time.
+from lerobot.common.datasets import video_utils as _lerobot_video_utils
+_lerobot_video_utils.encode_video_frames = partial(
+    _lerobot_video_utils.encode_video_frames, vcodec="h264", crf=23
+)
+
+from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+import lerobot.common.datasets.lerobot_dataset as _lerobot_dataset_module
+_lerobot_dataset_module.encode_video_frames = _lerobot_video_utils.encode_video_frames
+
+REPO_NAME = "kewalk123/long_task_1_mem"
 FPS = 30
 H, W = 480, 640
 QUERY_STAGES = {3, 4, 5, 6}  # query1..query4
@@ -81,8 +94,8 @@ def main(
     limit: int | None = None,
     start_demo: int = 1,
     end_demo: int = 35,
-    image_writer_processes: int = 2,
-    image_writer_threads: int = 4,
+    image_writer_processes: int = 5,
+    image_writer_threads: int = 10,
 ):
     data_dir = Path(data_dir)
     output_path = HF_LEROBOT_HOME / repo_id
@@ -95,9 +108,9 @@ def main(
         robot_type="yam",
         fps=FPS,
         features={
-            "top_image":    {"dtype": "image", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
-            "left_image":   {"dtype": "image", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
-            "memory_image": {"dtype": "image", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
+            "top_image":    {"dtype": "video", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
+            "left_image":   {"dtype": "video", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
+            "memory_image": {"dtype": "video", "shape": (H, W, 3), "names": ["height", "width", "channel"]},
             "state":        {"dtype": "float32", "shape": (7,), "names": ["state"]},
             "actions":      {"dtype": "float32", "shape": (7,), "names": ["actions"]},
             "has_memory":   {"dtype": "float32", "shape": (1,), "names": ["has_memory"]},
