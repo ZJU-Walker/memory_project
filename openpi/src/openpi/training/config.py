@@ -358,7 +358,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamCupDataConfig(DataConfigFactory):
-    """Data config for the YAM single-arm cup-grasping dataset (kewalk/cup_task_0428).
+    """Data config for the YAM single-arm cup-grasping dataset (kewalk123/cup_task_0428).
 
     Dataset features: top_image, left_image, right_image, state(7,), actions(7,), task.
     See `openpi.policies.yam_policy` for the matching input/output transforms.
@@ -397,13 +397,14 @@ class LeRobotYamCupDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotYamLongTaskDataConfig(DataConfigFactory):
-    """Data config for the YAM long-horizon plate-memory dataset (kewalk123/long_task_1_mem).
+class LeRobotYamPlateTaskDataConfig(DataConfigFactory):
+    """Data config for the YAM plate-memory dataset (kewalk123/plate_task).
 
-    Dataset features: top_image, left_image, memory_image, state(7,), actions(7,),
-    has_memory(1,), task. The memory_image is the observe-stage keyframe broadcast
-    over the query frames (zeros elsewhere); has_memory is 1.0 only on those frames.
-    YamLongTaskInputs routes memory_image -> right_wrist_0_rgb with mask=has_memory.
+    Dataset features: top_image, left_image, state(7,), actions(7,), task.
+    The per-frame `task` carries a resolved instruction (e.g. "put banana on
+    the light blue plate") so the policy does not need a memory image channel.
+    YamPlateTaskInputs feeds top -> base_0_rgb, left -> left_wrist_0_rgb, and
+    zero-pads / masks-off right_wrist_0_rgb (single-arm robot, no real right wrist).
     """
 
     @override
@@ -414,9 +415,7 @@ class LeRobotYamLongTaskDataConfig(DataConfigFactory):
                     {
                         "observation/top_image": "top_image",
                         "observation/left_image": "left_image",
-                        "observation/memory_image": "memory_image",
                         "observation/state": "state",
-                        "observation/has_memory": "has_memory",
                         "actions": "actions",
                         "prompt": "prompt",
                     }
@@ -425,7 +424,7 @@ class LeRobotYamLongTaskDataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamLongTaskInputs(model_type=model_config.model_type)],
+            inputs=[yam_policy.YamPlateTaskInputs(model_type=model_config.model_type)],
             outputs=[yam_policy.YamOutputs()],
         )
 
@@ -859,7 +858,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotYamCupDataConfig(
-            repo_id="kewalk/cup_task_0428",
+            repo_id="kewalk123/cup_task_0428",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -876,14 +875,13 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
-    # Memory-conditioned pi0.5 LoRA on the LONG_TASK_1 plate-memory dataset.
-    # top_image + left_image carry the current view; memory_image (observe-stage
-    # keyframe on query frames, zeros elsewhere) is routed into right_wrist_0_rgb
-    # with a per-frame mask. Demos 1-35 train; 36-37 are held out for retrieval-
-    # method comparisons.
+    # Plate task — no memory channel. The policy reads a resolved instruction
+    # (e.g. "put banana on the light blue plate") generated upstream by an oracle
+    # or VLM that maps observed-keyframe + relational query -> object-named prompt.
+    # Demos 1-35 train; 36-37 held out for offline eval.
     #
     TrainConfig(
-        name="pi05_long_task_mem_lora",
+        name="pi05_plate_task",
         project_name="memory_project",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -892,8 +890,8 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
-        data=LeRobotYamLongTaskDataConfig(
-            repo_id="kewalk123/long_task_1_mem",
+        data=LeRobotYamPlateTaskDataConfig(
+            repo_id="kewalk123/plate_task",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

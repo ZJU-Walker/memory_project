@@ -74,9 +74,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", default="demo1")
     parser.add_argument("--results-path", default=None,
-                        help="Override the input npz path. Default: eval/results_<demo>.npz "
-                             "(use this to play back long-task results: "
-                             "--results-path eval/results_long_demo36.npz).")
+                        help="Override the input npz path. Default: eval/results_<demo>.npz")
     parser.add_argument("--no-viewer", action="store_true", help="Headless run")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Playback speed multiplier (1.0 = real-time)")

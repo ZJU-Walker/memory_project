@@ -30,7 +30,7 @@ import numpy as np
 import tyro
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
-REPO_NAME = "kewalk/cup_task_0428"
+REPO_NAME = "kewalk123/cup_task_0428"
 TASK_PROMPT = "pick up the cup with yellow object inside"
 FPS = 30
 H, W = 480, 640  # native camera resolution
