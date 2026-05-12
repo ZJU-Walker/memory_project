@@ -300,18 +300,19 @@ Run inside `tmux new -s server` so it survives terminal disconnects. From the ro
 
 ### Realtime eval — robot computer
 
-Two clients in `eval/real/` drive the long-horizon plate-memory policy (`pi05_long_task_mem_lora`). Both run on the **robot computer**, connect to the policy server over WebSocket, read YAM joint state + 2 RealSense streams (top + left), and use the operator-driven 8-stage flow (press `n` to advance `observe → mix → delay → query1..4 → return_home`). They differ only in what fills `observation/memory_image` and `prompt` on the four query stages:
+Three clients in `eval/real/` drive the long-horizon plate-memory policy (`pi05_long_task_mem_lora`). All run on the **robot computer**, connect to the policy server over WebSocket, read YAM joint state + 2 RealSense streams (top + left), and use the operator-driven 8-stage flow (press `n` to advance `observe → mix → delay → query1..4 → return_home`). They differ only in what fills `observation/memory_image` and `prompt` on the four query stages 3-6:
 
 | Script | memory_image (stages 3-6) | prompt (stages 3-6) |
 |---|---|---|
 | `run_long_task.py` | Top-camera frame snapshot taken at the moment `n` advanced 0→1 (StageManager). | Deterministic relational instruction from `QueryPlan`. |
-| `run_long_task_retriever.py` | **Top-1 keyframe** from a live SigLIP bank built across all stages at `--memory-sample-hz` (default 1.0), picked on each query-stage entry. | **Gemini rewriter output** — `rewrite(top1_image, relational_instruction)` (e.g. "put red chili on the pink plate"). |
+| `run_long_task_fix_image.py` | Same observe-time snapshot as the baseline. | **Gemini rewriter output** — `rewrite(observe_keyframe, relational_instruction)`. Tests the rewriter in isolation. |
+| `run_long_task_retriever.py` | **Top-1 keyframe** from a live SigLIP bank built across all stages at `--memory-sample-hz` (default 1.0), picked on each query-stage entry. | **Gemini rewriter output** — `rewrite(top1_image, relational_instruction)`. Tests retriever + rewriter together. |
 
-Both share `eval/real/configs/yam_long_task_eval.yaml`, both use `QueryPlan(mode={fixed,random,manual})`, and both stop on `q` / Ctrl-C / `--max-steps` / `--max-time-s`.
+All three share `eval/real/configs/yam_long_task_eval.yaml`, use `QueryPlan(mode={fixed,random,manual})`, and stop on `q` / Ctrl-C / `--max-steps` / `--max-time-s`.
 
 #### Prereqs on the robot computer
 
-1. **openpi venv + i2rt + CAN bus** — install steps 3, 4, 6 from the [Install](#install) section above. `run_long_task_retriever.py` additionally loads PaliGemma SigLIP locally, so the robot box needs a CUDA GPU (≥ 8 GB free VRAM; tested on a 4090).
+1. **openpi venv + i2rt + CAN bus** — install steps 3, 4, 6 from the [Install](#install) section above. `run_long_task_retriever.py` additionally loads PaliGemma SigLIP locally, so the robot box needs a CUDA GPU (≥ 8 GB free VRAM; tested on a 4090). The fix-image variant has no extra GPU requirement beyond what the baseline needs.
 
 2. **Activate venv:**
    ```bash
@@ -337,7 +338,7 @@ Both share `eval/real/configs/yam_long_task_eval.yaml`, both use `QueryPlan(mode
        openpi/checkpoints/pi05_plate_task/
    ```
 
-5. **(retriever variant only) Gemini API key** for the rewriter:
+5. **(fix-image + retriever variants) Gemini API key** for the rewriter:
    ```bash
    export GEMINI_API_KEY="..."
    ```
@@ -358,6 +359,15 @@ Both share `eval/real/configs/yam_long_task_eval.yaml`, both use `QueryPlan(mode
 python -m eval.real.run_long_task --host <workstation_tailscale_ip> --dry-run
 python -m eval.real.run_long_task --host <workstation_tailscale_ip>
 ```
+
+#### Run — fix-image variant (rewriter only)
+
+```bash
+python -m eval.real.run_long_task_fix_image --host <workstation_tailscale_ip> --dry-run
+python -m eval.real.run_long_task_fix_image --host <workstation_tailscale_ip>
+```
+
+The `--dry-run` exercises the Gemini rewriter once with the live top frame so you can confirm the API key + connectivity before the arm moves. During the rollout, the rewriter is called once per query-stage entry (4× per episode) using the StageManager's observe-time keyframe.
 
 #### Run — retriever variant
 
@@ -381,21 +391,24 @@ The bank fills throughout the rollout (not just observe — matches the offline 
 
 #### Logs
 
-Each rollout writes to `eval/real/runs/<timestamp>_long[_retr]/`:
+Each rollout writes to `eval/real/runs/<timestamp>_long[_fix|_retr]/`:
 - `top_camera_rgb.mp4`, `left_camera_rgb.mp4`
 - `events.log` — every stage transition, `[bank]` / `[retrieval]` events, server `infer_ms`
 - `chunks/`, `frames/` — per-chunk JPGs + action arrays
 - `metadata.json` — CLI args, query plan, server metadata, stop reason, full stage timeline
 
-Useful flags (both scripts):
+Useful flags (all three scripts):
 - `--query-mode {fixed,random,manual}`, `--seed N`
 - `--max-steps 5400 --max-time-s 480` — caps (defaults are 8 stages × ~1 min @ 15 Hz).
 - `--hz 15 --chunk-len 25 --max-joint-delta 0.2` — control rate / chunk consumption / safety clip.
 - `--no-video` / `--no-save-frames` — skip MP4 / JPG dumps.
 
+Fix-image + retriever shared flag:
+- `--rewriter-model gemini-2.5-flash` — override the yaml.
+
 Retriever-only flags:
 - `--memory-sample-hz 0.5` — bank sample rate (default 1.0; bank caps at `N_MAX=240` in `retriever/dataset.py`).
-- `--retriever-ckpt`, `--openpi-config`, `--openpi-ckpt-dir`, `--rewriter-model`, `--retriever-device` — override the yaml.
+- `--retriever-ckpt`, `--openpi-config`, `--openpi-ckpt-dir`, `--retriever-device` — override the yaml.
 
 ## Memory writer (attention-distilled keyframe selector)
 
