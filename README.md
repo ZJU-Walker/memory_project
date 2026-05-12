@@ -298,6 +298,99 @@ Confirm via the log lines:
 
 Run inside `tmux new -s server` so it survives terminal disconnects. From the robot computer, sanity-check connectivity with `curl http://<workstation_tailscale_ip>:8000/healthz`.
 
+### Realtime eval — robot computer
+
+Three eval clients live in `eval/real/`. All connect to the policy server via WebSocket and read the YAM joint state + 3 RealSense streams. Run each on the **robot computer** (not the workstation that's serving the policy). Stop signals are identical: `'q'` in the pygame window, Ctrl-C (twice = hard kill), or `--max-steps` / `--max-time-s` timeouts.
+
+| Script | Prompt source |
+|---|---|
+| `run_eval.py` | Static `--prompt`, never updated. Baseline. |
+| `run_eval_fix_image.py` | Press `n` to advance stage 0→7. Stages 3-6 rewrite with the **first top-camera frame** (snapshot at preflight); stage 7 rewrites with the current frame; stages 1, 2 leave the prompt untouched. No retriever / SigLIP. |
+| `run_eval_retriever.py` | Press `n` to advance stage 0→7. Builds a live SigLIP keyframe bank from the top camera at `--memory-sample-hz` (default 1.0) **across all stages**; on each `n` past stage 0, retriever picks top-1 from the bank, rewriter generates a new prompt. |
+
+#### Prereqs on the robot computer
+
+1. **openpi venv + i2rt + CAN bus** — install steps 3, 4, 6 from the [Install](#install) section above. `run_eval_retriever.py` additionally loads PaliGemma SigLIP locally, so the robot box needs a CUDA GPU (≥ 8 GB VRAM free; tested on a 4090).
+
+2. **Activate venv:**
+   ```bash
+   source /home/kewalk/memory_project/openpi/.venv/bin/activate
+   cd /home/kewalk/memory_project
+   ```
+
+3. **Camera serials** in `eval/real/configs/yam_eval.yaml` must match the RealSenses plugged into this box. Defaults are set for the workstation rig — edit if needed:
+   ```bash
+   ls /dev/v4l/by-id/ | grep RealSense   # quick sanity check
+   ```
+
+4. **(retriever variant only) Local PaliGemma + retriever checkpoints.** Defaults in `eval/real/configs/yam_eval.yaml`:
+   ```yaml
+   retriever:
+     ckpt: retriever/runs/v1_0511/best.pt
+     openpi_ckpt_dir: openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510/29999
+   ```
+   Both paths must exist locally. Copy from the workstation if needed (e.g. `rsync -av <workstation>:/home/kewalk/memory_project/retriever/runs/v1_0511 retriever/runs/`).
+
+5. **(fix-image + retriever variants only) Gemini API key** for the rewriter:
+   ```bash
+   export GEMINI_API_KEY="..."
+   ```
+   Add to `~/.bashrc` to persist.
+
+6. **Server reachable** from this box. Check before each rollout:
+   ```bash
+   curl http://<workstation_tailscale_ip>:8000/healthz
+   ```
+
+#### Run
+
+Always start with `--dry-run` once per session to validate the full path (preflight + 1 inference + retrieval pipeline) before the arm moves:
+
+```bash
+python eval/real/run_eval_retriever.py \
+    --host <workstation_tailscale_ip> \
+    --prompt "Place the object originally on the pink plate onto the pink plate." \
+    --dry-run
+```
+
+Then live:
+
+```bash
+python eval/real/run_eval_retriever.py \
+    --host <workstation_tailscale_ip> \
+    --prompt "Place the object originally on the pink plate onto the pink plate."
+```
+
+Click the small pygame window once to give it focus, then:
+- `n` — advance stage (0→1→…→7, clamped). Past stage 0 each press triggers retriever + rewriter; the new prompt is logged and used for the next chunk's `policy.infer`.
+- `q` — graceful stop (holds last pose ~0.5 s, closes cameras, flushes logs).
+
+The fix-image variant is a drop-in replacement of the script name; same flags otherwise:
+
+```bash
+python eval/real/run_eval_fix_image.py \
+    --host <workstation_tailscale_ip> \
+    --prompt "Place the object originally on the pink plate onto the pink plate."
+```
+
+#### Logs
+
+Each rollout writes to `eval/real/runs/<timestamp>/`:
+- `top_camera_rgb.mp4` / `left_camera_rgb.mp4` / `right_camera_rgb.mp4`
+- `events.log` — every stage transition, retriever pick, rewriter output, server `infer_ms`
+- `chunks/`, `frames/` — per-chunk JPGs + action arrays
+- `metadata.json` — CLI args, prompt, server metadata, stop reason
+- (`run_eval_fix_image.py` only) `first_image.jpg` — the snapshot fed to the rewriter for query stages
+
+Useful flags (all three scripts):
+- `--max-steps 600 --max-time-s 30` — cap rollout length.
+- `--no-video` / `--no-save-frames` — skip MP4 / JPG dumps.
+- `--chunk-len 5` — execute only the first 5 of each 10-step action chunk before re-inferring (more reactive, more server traffic).
+
+Retriever-only flags:
+- `--memory-sample-hz 0.5` — bank sample rate (default 1.0; bank caps at `N_MAX=240` in `retriever/dataset.py`).
+- `--retriever-ckpt`, `--openpi-ckpt-dir`, `--rewriter-model`, `--retriever-device` — override the yaml.
+
 ## Memory writer (attention-distilled keyframe selector)
 
 Two-stage method. **Offline teacher**: replay each demo through π₀.₅ every 30 frames (1 Hz at 30 Hz video), extract middle-layer language→image attention (layers 8-11, top camera, prompt-pooled → 256-D), and run a greedy attention-change loop to produce pseudo write/skip labels. **Online student**: a frozen CLIP ViT-B/32 image+text encoder feeds a tiny MLP head that predicts write probability — no π₀.₅ at inference time. Standalone module under `memory_writer/`; independent of `retriever/` and `rewriter/`.
