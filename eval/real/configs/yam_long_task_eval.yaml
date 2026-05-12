@@ -1,0 +1,10 @@
+# Real-robot deploy config for pi05_long_task_mem_lora.
+# Right wrist camera is NOT used at runtime — the right_wrist_0_rgb slot
+# is filled by the StageManager (observe keyframe on query stages, zeros
+# otherwise) via the training-time YamLongTaskInputs transform.
+robot:
+  channel: can_left
+cameras:
+  top_serial:  "409122273280"
+  left_serial: "409122271088"
+# No `prompt` field — instructions come from QueryPlan / StageManager.
