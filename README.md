@@ -13,6 +13,9 @@ memory_project/
 ├── openpi/                  # cloned openpi repo + venv (gitignored)
 ├── i2rt/                    # cloned i2rt repo (YAM URDF, FK, MuJoCo SimRobot)
 ├── eval/                    # offline-eval scripts + outputs (npz, figs)
+├── retriever/               # coarse-to-fine attention retriever (SigLIP + cross-attn reranker)
+├── rewriter/                # Gemini VLM prompt rewriter over retrieved keyframes
+├── memory_writer/           # attention-distilled keyframe writer (pi0.5 teacher → CLIP+MLP student)
 ├── test/                    # standalone validation scripts
 └── plan_claude.md           # living plan & status tracker
 ```
@@ -294,3 +297,116 @@ Confirm via the log lines:
 - `server listening on 0.0.0.0:8000`
 
 Run inside `tmux new -s server` so it survives terminal disconnects. From the robot computer, sanity-check connectivity with `curl http://<workstation_tailscale_ip>:8000/healthz`.
+
+## Memory writer (attention-distilled keyframe selector)
+
+Two-stage method. **Offline teacher**: replay each demo through π₀.₅ every 30 frames (1 Hz at 30 Hz video), extract middle-layer language→image attention (layers 8-11, top camera, prompt-pooled → 256-D), and run a greedy attention-change loop to produce pseudo write/skip labels. **Online student**: a frozen CLIP ViT-B/32 image+text encoder feeds a tiny MLP head that predicts write probability — no π₀.₅ at inference time. Standalone module under `memory_writer/`; independent of `retriever/` and `rewriter/`.
+
+Plate is the primary testbed (long episodes, memory-relevant); cup is a single-instruction sanity baseline. Activate the openpi venv first:
+
+```bash
+source /home/kewalk/memory_project/openpi/.venv/bin/activate
+cd /home/kewalk/memory_project
+```
+
+### 1. Teacher pass — extract π₀.₅ attention per sampled frame
+
+Heavy step (~5 s per π₀.₅ forward → ~10 min per plate demo at 1 Hz sampling, ~6 h for all 37 demos on a 4090). Saves `<demo>.npz` (signatures + visual features) and `<demo>_labels.npz` (pseudo write labels) under `memory_writer/cache/teacher/<task>/`. The CLI skips per-demo if both files already exist, so it's safe to interrupt and resume — run inside `tmux new -s teacher`.
+
+Smoke on one demo first:
+
+```bash
+python -m memory_writer.build_teacher --task plate --demos 36 \
+    --ckpt /home/kewalk/memory_project/openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510/29999 \
+    --config pi05_plate_task
+```
+
+Then sanity-check the output:
+
+```bash
+python -c "from memory_writer.labels import inspect; inspect('memory_writer/cache/teacher/plate/demo36.npz')"
+```
+
+Expect S ≈ 100 sampled frames (≈ 2900 / 30), signature rows sum to 1, multiple unique prompts, positive fraction in [10%, 40%].
+
+Full plate run (resumable — already-cached demos are skipped):
+
+```bash
+python -m memory_writer.build_teacher --task plate --demos 1-37 \
+    --ckpt /home/kewalk/memory_project/openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510/29999 \
+    --config pi05_plate_task
+```
+
+Cup equivalent uses `--task cup --config pi05_yam_cup_lora` and `checkpoints/pi05_yam_cup_lora/cup_0429_v1/29999`.
+
+Flags:
+- `--sample-every K` — π₀.₅ forward stride in frames (default 10).
+- `--attention-threshold T` — cosine-distance cutoff for the pseudo-label loop (default 0.25).
+- `--min-gap-steps N` — min raw-frame gap between consecutive kept keyframes (default 15 for plate, 10 for cup).
+- `--overwrite` — redo demos that already have cache + labels.
+
+### 2. CLIP feature cache — student-facing image+text features
+
+Downloads `openai/clip-vit-base-patch32` on first run. Reads each demo's teacher cache and writes parallel `<demo>.npz` files of CLIP image + per-frame prompt embeddings under `memory_writer/cache/clip/<task>/`.
+
+```bash
+python -m memory_writer.build_clip_cache --task plate --demos 1-37
+```
+
+Fast (~1 min total for plate on a 4090). After this, training never touches images directly — all features are cached.
+
+### 3. Train the student
+
+BCE on pseudo write labels + λ·MSE regression to the teacher attention-change score. AdamW + WeightedRandomSampler keeps positive/negative balanced. Frozen encoders; only the ~470 k-param head is trained.
+
+```bash
+python -m memory_writer.train --task plate \
+    --train-demos 1-35 --val-demos 36-37 \
+    --out memory_writer/cache/student_runs/plate_v1
+```
+
+Saves `best.pt` (by val F1), `last.pt`, `train_log.jsonl`, and `args.json`. Converges in a few minutes.
+
+Flags:
+- `--epochs 30 --batch-size 256 --lr 3e-4 --lambda-score 0.5` — defaults.
+- `--hidden 256` — MLP width.
+
+### 4. Run the student on held-out demos → memory bank
+
+Student-only: frozen CLIP + trained head, no π₀.₅. Replays each demo, emits an `AttentionMemoryBank` `.npz` plus per-keyframe PNG dumps under `memory_writer/cache/debug/<task>/<demo>/`.
+
+```bash
+python -m memory_writer.run_online --task plate --demos 36-37 \
+    --ckpt memory_writer/cache/student_runs/plate_v1/best.pt \
+    --out memory_writer/cache/banks/plate \
+    --debug-dir memory_writer/cache/debug/plate
+```
+
+Flags:
+- `--write-threshold 0.5` — sigmoid cutoff for write decisions.
+- `--min-gap-steps 10` — min raw-frame gap.
+- `--check-every-n-steps 3` — student is invoked every N frames (cheaper).
+- `--redundancy-threshold 0.95` — skip if cosine-sim to last kept kf exceeds this.
+- `--no-save-images` — skip the PNG dumps (banks only).
+
+### 5. Evaluate the bank
+
+Generic metrics (size, per-stage coverage, temporal coverage, visual diversity, redundancy) and teacher-agreement P/R/F1 if a teacher cache is provided.
+
+```bash
+python -m memory_writer.eval_bank \
+    --bank memory_writer/cache/banks/plate/demo36.npz \
+    --teacher memory_writer/cache/teacher/plate/demo36.npz \
+    --out memory_writer/cache/banks/plate/demo36_eval.json
+```
+
+### 6. Debug timeline plot
+
+Overlays student write events (colored by reason) on the teacher attention-change curve.
+
+```bash
+python -m memory_writer.viz \
+    --bank memory_writer/cache/banks/plate/demo36.npz \
+    --teacher memory_writer/cache/teacher/plate/demo36.npz \
+    --out memory_writer/cache/debug/plate/demo36_timeline.png
+```
