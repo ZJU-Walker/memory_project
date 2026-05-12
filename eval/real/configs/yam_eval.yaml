@@ -8,3 +8,12 @@ cameras:
   left_serial:  "409122271088"
   right_serial: "409122271086"
 prompt: "pick up the cup with yellow object inside"
+
+# Used only by run_eval_retriever.py — ignored by run_eval.py.
+retriever:
+  ckpt: retriever/runs/v1_0511/best.pt
+  openpi_config: pi05_plate_task
+  openpi_ckpt_dir: openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510/29999
+  rewriter_model: gemini-2.5-flash
+  memory_sample_hz: 1.0
+  device: cuda

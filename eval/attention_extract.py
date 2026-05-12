@@ -61,8 +61,9 @@ class AttentionExtractor:
         self._prompt = prompt
         self._action_horizon = self._model.action_horizon
         self._action_dim = self._model.action_dim
-        # Cached after first call — boundaries depend only on prompt token length, image grid size.
-        self._boundaries: TokenBoundaries | None = None
+        # Boundaries depend on (prompt token length, image grid size). Image grid
+        # is fixed by the policy, so cache by prompt string.
+        self._boundaries_cache: dict[str, TokenBoundaries] = {}
         self._image_keys = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
         self._image_to_camera = {
             "base_0_rgb": "img_top",
@@ -85,14 +86,18 @@ class AttentionExtractor:
         nnx_attrs = {name: getattr(bridge, name) for name in bridge.linen_attributes}
         return _bv.nnx_attrs_to_linen_vars(nnx_attrs)
 
-    def _build_obs(self, top, left, right, state) -> _model.Observation:
+    def set_prompt(self, prompt: str) -> None:
+        """Update the active prompt. Boundaries are recomputed lazily on next extract()."""
+        self._prompt = prompt
+
+    def _build_obs(self, top, left, right, state, prompt: str | None = None) -> _model.Observation:
         # Mirror the YamInputs key names used during training.
         raw = {
             "observation/top_image": top,
             "observation/left_image": left,
             "observation/right_image": right,
             "observation/state": np.asarray(state, dtype=np.float32),
-            "prompt": self._prompt,
+            "prompt": prompt if prompt is not None else self._prompt,
         }
         inputs = self._input_transform(jax.tree.map(lambda x: x, raw))
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
@@ -131,6 +136,8 @@ class AttentionExtractor:
         state: np.ndarray,
         action_seed: np.ndarray | None = None,
         time: float = 0.0,
+        prompt: str | None = None,
+        return_visual: bool = False,
     ) -> dict[str, Any]:
         """Run one forward pass and return predicted v_t plus captured attention.
 
@@ -141,17 +148,25 @@ class AttentionExtractor:
             at time=1 doesn't make sense here — we use the simplest "clean action ≈ 0" prior).
           time: denoise time in [0, 1]. 0 = clean (data), 1 = pure noise. Default 0 captures
             "what does the model attend to right at the data manifold".
+          prompt: optional one-shot override; if given, used for this call without changing
+            self._prompt. If None, uses the current self._prompt.
+          return_visual: if True, also returns "visual_top" — a mean-pooled feature over the
+            top camera's patch outputs from prefix_out. Reuses the same forward pass.
 
         Returns:
           {
             "v_t": (action_horizon, action_dim) np.ndarray,
             "attn_probs": (num_layers, B=1, num_kv_heads, group, T_q, T_k) np.ndarray,
             "boundaries": TokenBoundaries,
+            "visual_top": (D,) np.ndarray  # only when return_visual=True
           }
         """
-        obs = self._build_obs(top, left, right, state)
-        if self._boundaries is None:
-            self._boundaries = self._compute_boundaries(obs, self._action_horizon)
+        active_prompt = prompt if prompt is not None else self._prompt
+        obs = self._build_obs(top, left, right, state, prompt=active_prompt)
+        boundaries = self._boundaries_cache.get(active_prompt)
+        if boundaries is None:
+            boundaries = self._compute_boundaries(obs, self._action_horizon)
+            self._boundaries_cache[active_prompt] = boundaries
 
         # Build x_t from action_seed at the requested denoise time. action_seed=None => zeros.
         if action_seed is None:
@@ -189,13 +204,18 @@ class AttentionExtractor:
             raise RuntimeError("attn_probs not found in updates tree")
 
         v_t = self._action_out_proj(suffix_out[:, -self._action_horizon :])
-        return {
+        result = {
             "v_t": np.asarray(v_t[0]),
             "attn_probs": np.asarray(attn_probs),
-            "boundaries": self._boundaries,
+            "boundaries": boundaries,
             "prefix_len": int(prefix_tokens.shape[1]),
             "suffix_len": int(suffix_tokens.shape[1]),
         }
+        if return_visual:
+            i0, i1 = boundaries.img_top
+            top_patches = np.asarray(prefix_out[0, i0:i1, :])  # (n_patches, D)
+            result["visual_top"] = top_patches.mean(axis=0).astype(np.float32)
+        return result
 
     @staticmethod
     def _find_attn_probs(node: Any) -> Any:
@@ -248,9 +268,10 @@ def _smoke():
     H, W = 480, 640
     img = np.zeros((H, W, 3), dtype=np.uint8)
     state = np.zeros(7, dtype=np.float32)
-    out = extractor.extract(img, img, img, state)
+    out = extractor.extract(img, img, img, state, return_visual=True)
     print("v_t shape         :", out["v_t"].shape)
     print("attn_probs shape  :", out["attn_probs"].shape)
+    print("visual_top shape  :", out["visual_top"].shape)
     print("prefix_len        :", out["prefix_len"])
     print("suffix_len        :", out["suffix_len"])
     print("boundaries        :", out["boundaries"])
@@ -258,6 +279,14 @@ def _smoke():
     probs = out["attn_probs"]
     s = np.asarray(probs).sum(axis=-1)
     print(f"key-sum stats      mean={float(s.mean()):.3f} min={float(s.min()):.3f} max={float(s.max()):.3f}")
+    # Multi-prompt check: switching prompt should produce a different boundaries.prompt range.
+    p1 = out["boundaries"].prompt
+    extractor.set_prompt("Observe and remember which object is on each colored plate.")
+    out2 = extractor.extract(img, img, img, state)
+    p2 = out2["boundaries"].prompt
+    print(f"prompt range #1   : {p1}")
+    print(f"prompt range #2   : {p2}")
+    assert len(extractor._boundaries_cache) == 2, "expected two cached prompts"
 
 
 if __name__ == "__main__":

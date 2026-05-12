@@ -92,6 +92,9 @@ class YamPolicyEnv:
         assert action_7.shape == (7,), f"expected (7,) action, got {action_7.shape}"
         self._robot.command_joint_state(action_7)
 
+    def set_prompt(self, prompt: str) -> None:
+        self._prompt = prompt
+
     def current_state(self) -> np.ndarray:
         return self._robot.get_joint_state().astype(np.float32)
 
