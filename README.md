@@ -300,17 +300,18 @@ Run inside `tmux new -s server` so it survives terminal disconnects. From the ro
 
 ### Realtime eval — robot computer
 
-Three eval clients live in `eval/real/`. All connect to the policy server via WebSocket and read the YAM joint state + 3 RealSense streams. Run each on the **robot computer** (not the workstation that's serving the policy). Stop signals are identical: `'q'` in the pygame window, Ctrl-C (twice = hard kill), or `--max-steps` / `--max-time-s` timeouts.
+Two clients in `eval/real/` drive the long-horizon plate-memory policy (`pi05_long_task_mem_lora`). Both run on the **robot computer**, connect to the policy server over WebSocket, read YAM joint state + 2 RealSense streams (top + left), and use the operator-driven 8-stage flow (press `n` to advance `observe → mix → delay → query1..4 → return_home`). They differ only in what fills `observation/memory_image` and `prompt` on the four query stages:
 
-| Script | Prompt source |
-|---|---|
-| `run_eval.py` | Static `--prompt`, never updated. Baseline. |
-| `run_eval_fix_image.py` | Press `n` to advance stage 0→7. Stages 3-6 rewrite with the **first top-camera frame** (snapshot at preflight); stage 7 rewrites with the current frame; stages 1, 2 leave the prompt untouched. No retriever / SigLIP. |
-| `run_eval_retriever.py` | Press `n` to advance stage 0→7. Builds a live SigLIP keyframe bank from the top camera at `--memory-sample-hz` (default 1.0) **across all stages**; on each `n` past stage 0, retriever picks top-1 from the bank, rewriter generates a new prompt. |
+| Script | memory_image (stages 3-6) | prompt (stages 3-6) |
+|---|---|---|
+| `run_long_task.py` | Top-camera frame snapshot taken at the moment `n` advanced 0→1 (StageManager). | Deterministic relational instruction from `QueryPlan`. |
+| `run_long_task_retriever.py` | **Top-1 keyframe** from a live SigLIP bank built across all stages at `--memory-sample-hz` (default 1.0), picked on each query-stage entry. | **Gemini rewriter output** — `rewrite(top1_image, relational_instruction)` (e.g. "put red chili on the pink plate"). |
+
+Both share `eval/real/configs/yam_long_task_eval.yaml`, both use `QueryPlan(mode={fixed,random,manual})`, and both stop on `q` / Ctrl-C / `--max-steps` / `--max-time-s`.
 
 #### Prereqs on the robot computer
 
-1. **openpi venv + i2rt + CAN bus** — install steps 3, 4, 6 from the [Install](#install) section above. `run_eval_retriever.py` additionally loads PaliGemma SigLIP locally, so the robot box needs a CUDA GPU (≥ 8 GB VRAM free; tested on a 4090).
+1. **openpi venv + i2rt + CAN bus** — install steps 3, 4, 6 from the [Install](#install) section above. `run_long_task_retriever.py` additionally loads PaliGemma SigLIP locally, so the robot box needs a CUDA GPU (≥ 8 GB free VRAM; tested on a 4090).
 
 2. **Activate venv:**
    ```bash
@@ -318,78 +319,83 @@ Three eval clients live in `eval/real/`. All connect to the policy server via We
    cd /home/kewalk/memory_project
    ```
 
-3. **Camera serials** in `eval/real/configs/yam_eval.yaml` must match the RealSenses plugged into this box. Defaults are set for the workstation rig — edit if needed:
+3. **Camera serials** in `eval/real/configs/yam_long_task_eval.yaml` must match the RealSenses plugged into this box. Quick sanity check:
    ```bash
-   ls /dev/v4l/by-id/ | grep RealSense   # quick sanity check
+   ls /dev/v4l/by-id/ | grep RealSense
    ```
 
-4. **(retriever variant only) Local PaliGemma + retriever checkpoints.** Defaults in `eval/real/configs/yam_eval.yaml`:
+4. **(retriever variant only) Local PaliGemma + retriever checkpoints.** Defaults under the `retriever:` block in the same yaml:
    ```yaml
    retriever:
      ckpt: retriever/runs/v1_0511/best.pt
      openpi_ckpt_dir: openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510/29999
    ```
-   Both paths must exist locally. Copy from the workstation if needed (e.g. `rsync -av <workstation>:/home/kewalk/memory_project/retriever/runs/v1_0511 retriever/runs/`).
+   Both paths must exist locally. Copy from the workstation if needed:
+   ```bash
+   rsync -av <workstation>:/home/kewalk/memory_project/retriever/runs/v1_0511 retriever/runs/
+   rsync -av <workstation>:/home/kewalk/memory_project/openpi/checkpoints/pi05_plate_task/plate_oracle_v2_0510 \
+       openpi/checkpoints/pi05_plate_task/
+   ```
 
-5. **(fix-image + retriever variants only) Gemini API key** for the rewriter:
+5. **(retriever variant only) Gemini API key** for the rewriter:
    ```bash
    export GEMINI_API_KEY="..."
    ```
    Add to `~/.bashrc` to persist.
 
-6. **Server reachable** from this box. Check before each rollout:
+6. **Server reachable** from this box (`pi05_long_task_mem_lora` policy):
    ```bash
    curl http://<workstation_tailscale_ip>:8000/healthz
    ```
 
-#### Run
+#### Physical setup
 
-Always start with `--dry-run` once per session to validate the full path (preflight + 1 inference + retrieval pipeline) before the arm moves:
+`QueryPlan` prints the required plate→object placement at boot and waits for Enter. Default `--query-mode fixed` is deterministic across runs (best for A/B'ing baseline vs retriever).
+
+#### Run — baseline
 
 ```bash
-python eval/real/run_eval_retriever.py \
-    --host <workstation_tailscale_ip> \
-    --prompt "Place the object originally on the pink plate onto the pink plate." \
-    --dry-run
+python -m eval.real.run_long_task --host <workstation_tailscale_ip> --dry-run
+python -m eval.real.run_long_task --host <workstation_tailscale_ip>
+```
+
+#### Run — retriever variant
+
+Always start with `--dry-run` once per session to validate the retrieval path (preflight + 1 inference + 1 retrieve+rewrite call) before the arm moves:
+
+```bash
+python -m eval.real.run_long_task_retriever --host <workstation_tailscale_ip> --dry-run
 ```
 
 Then live:
 
 ```bash
-python eval/real/run_eval_retriever.py \
-    --host <workstation_tailscale_ip> \
-    --prompt "Place the object originally on the pink plate onto the pink plate."
+python -m eval.real.run_long_task_retriever --host <workstation_tailscale_ip>
 ```
 
-Click the small pygame window once to give it focus, then:
-- `n` — advance stage (0→1→…→7, clamped). Past stage 0 each press triggers retriever + rewriter; the new prompt is logged and used for the next chunk's `policy.infer`.
+Startup takes ~15-30 s on first invocation: PaliGemma SigLIP is loaded locally and JIT-compiled. Click the small pygame window once to give it focus, then:
+- `n` — advance stage. Entering stages 3-6 triggers retriever (top-1 from the live bank) + rewriter; the resolved prompt and selected keyframe are logged and used for subsequent `policy.infer` calls until the next `n`. Past stage 7, `n` triggers a graceful shutdown after ~8 s.
 - `q` — graceful stop (holds last pose ~0.5 s, closes cameras, flushes logs).
 
-The fix-image variant is a drop-in replacement of the script name; same flags otherwise:
-
-```bash
-python eval/real/run_eval_fix_image.py \
-    --host <workstation_tailscale_ip> \
-    --prompt "Place the object originally on the pink plate onto the pink plate."
-```
+The bank fills throughout the rollout (not just observe — matches the offline pipeline's causal candidate set), so later query stages see more candidates.
 
 #### Logs
 
-Each rollout writes to `eval/real/runs/<timestamp>/`:
-- `top_camera_rgb.mp4` / `left_camera_rgb.mp4` / `right_camera_rgb.mp4`
-- `events.log` — every stage transition, retriever pick, rewriter output, server `infer_ms`
+Each rollout writes to `eval/real/runs/<timestamp>_long[_retr]/`:
+- `top_camera_rgb.mp4`, `left_camera_rgb.mp4`
+- `events.log` — every stage transition, `[bank]` / `[retrieval]` events, server `infer_ms`
 - `chunks/`, `frames/` — per-chunk JPGs + action arrays
-- `metadata.json` — CLI args, prompt, server metadata, stop reason
-- (`run_eval_fix_image.py` only) `first_image.jpg` — the snapshot fed to the rewriter for query stages
+- `metadata.json` — CLI args, query plan, server metadata, stop reason, full stage timeline
 
-Useful flags (all three scripts):
-- `--max-steps 600 --max-time-s 30` — cap rollout length.
+Useful flags (both scripts):
+- `--query-mode {fixed,random,manual}`, `--seed N`
+- `--max-steps 5400 --max-time-s 480` — caps (defaults are 8 stages × ~1 min @ 15 Hz).
+- `--hz 15 --chunk-len 25 --max-joint-delta 0.2` — control rate / chunk consumption / safety clip.
 - `--no-video` / `--no-save-frames` — skip MP4 / JPG dumps.
-- `--chunk-len 5` — execute only the first 5 of each 10-step action chunk before re-inferring (more reactive, more server traffic).
 
 Retriever-only flags:
 - `--memory-sample-hz 0.5` — bank sample rate (default 1.0; bank caps at `N_MAX=240` in `retriever/dataset.py`).
-- `--retriever-ckpt`, `--openpi-ckpt-dir`, `--rewriter-model`, `--retriever-device` — override the yaml.
+- `--retriever-ckpt`, `--openpi-config`, `--openpi-ckpt-dir`, `--rewriter-model`, `--retriever-device` — override the yaml.
 
 ## Memory writer (attention-distilled keyframe selector)
 
