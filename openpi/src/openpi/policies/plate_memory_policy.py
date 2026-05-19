@@ -1,19 +1,20 @@
 """Policy I/O transforms for the plate-memory base (no-memory) baseline.
 
 Dataset keys (as written by examples/yam/convert_plate_memory_to_lerobot.py):
-    top_image, left_image, right_image  -> uint8 (H, W, 3)
-    state                                -> float32 (7,)
-    actions                              -> float32 (7,)
-    task                                 -> str  (per-frame segment instruction)
+    top_image, left_image  -> uint8 (H, W, 3)
+    state                   -> float32 (7,)
+    actions                 -> float32 (7,)
+    task                    -> str  (per-frame segment instruction)
 
 Camera mapping into pi0.5's three image slots:
-    top_image    -> base_0_rgb         (third-person view)
-    left_image   -> left_wrist_0_rgb
-    right_image  -> right_wrist_0_rgb  (DISABLED for this baseline)
+    top_image                -> base_0_rgb         (third-person view)
+    left_image               -> left_wrist_0_rgb
+    np.zeros_like(top_image) -> right_wrist_0_rgb  (DISABLED for this baseline)
 
-The right camera is intentionally disabled for this baseline:
-the slot is filled with all-zero pixels and image_mask['right_wrist_0_rgb'] is
-np.False_, matching the missing-camera convention used in droid_policy / aloha_policy.
+The right camera is intentionally disabled for this baseline. The dataset omits
+the right camera entirely, and the right_wrist_0_rgb slot is synthesized here
+as zeros with image_mask['right_wrist_0_rgb'] = np.False_, matching the
+missing-camera convention used in droid_policy / aloha_policy.
 """
 
 import dataclasses
@@ -31,7 +32,6 @@ def make_plate_memory_example() -> dict:
         "observation/state": np.random.rand(7),
         "observation/top_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/left_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/right_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "Observe and remember which object is on each colored plate.",
     }
 

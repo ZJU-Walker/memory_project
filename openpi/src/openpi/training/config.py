@@ -401,9 +401,10 @@ class LeRobotYamCupDataConfig(DataConfigFactory):
 class LeRobotPlateMemoryBaseDataConfig(DataConfigFactory):
     """Data config for the plate-memory no-memory baseline (kewalk/plate_memory_base).
 
-    Same dataset feature schema as the YAM cup task (top_image, left_image, right_image,
-    state(7,), actions(7,), task), but the right camera slot is disabled inside
-    PlateMemoryInputs (zero pixels + image_mask=False).
+    Dataset features: top_image, left_image, state(7,), actions(7,), task. The
+    right camera is dropped from the dataset entirely; PlateMemoryInputs
+    synthesizes zeros + image_mask=False for the right_wrist_0_rgb slot at
+    training time.
     """
 
     @override
@@ -414,7 +415,6 @@ class LeRobotPlateMemoryBaseDataConfig(DataConfigFactory):
                     {
                         "observation/top_image": "top_image",
                         "observation/left_image": "left_image",
-                        "observation/right_image": "right_image",
                         "observation/state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
