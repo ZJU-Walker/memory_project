@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -353,6 +354,65 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamDataConfig(DataConfigFactory):
+    """Data config for the bimanual YAM dataset (3 cameras, 14-dim state/action)."""
+
+    # The dataset has no language instruction, so inject a fixed prompt.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap the keys produced by the conversion script to the keys our policy transform expects.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/left_wrist_image": "left_wrist_image",
+                        "observation/right_wrist_image": "right_wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamInputs(model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # The dataset stores absolute joint-position targets, so convert to delta actions for
+        # training (and back to absolute at inference). Delta on the 6 arm joints of each arm,
+        # gripper stays absolute (the -1 entries): mask = [6 True, 1 False, 6 True, 1 False].
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamMemoryDataConfig(LeRobotYamDataConfig):
+    """YAM data config for the memory model: identical transforms to LeRobotYamDataConfig, plus
+    episode-sequence sampling params consumed by memory_data_loader.create_memory_data_loader."""
+
+    # Number of causal observation frames per item (including the final action/loss frame).
+    n_mem: int = 16
+    # How to sample the action-frame t: "recall_weighted" (bias to the back third) or "uniform".
+    t_sampling: str = "recall_weighted"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -759,6 +819,53 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Fine-tune pi05_base on the bimanual YAM `bin_memory_banana` dataset (3 cameras, delta actions).
+    TrainConfig(
+        name="pi05_yam",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_banana",
+            default_prompt="find the bin with banana",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # MAC-style online episodic memory on top of pi05 for the YAM bin_memory_banana task. Additive:
+    # the pi05_yam baseline above is left untouched. Joint finetune from pi05_base with SigLIP frozen
+    # (freeze_vision=True); memory params are kept at init by the weight loader's missing_regex.
+    TrainConfig(
+        name="pi05_yam_memory",
+        model=(_pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(pi05=True)),
+        data=LeRobotYamMemoryDataConfig(
+            repo_id="yam/bin_memory_banana",
+            default_prompt="find the bin with banana",
+            n_mem=16,
+        ),
+        freeze_filter=_pi05_yam_memory_model.get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*(lora|mem_).*"
+        ),
+        batch_size=8,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
         num_train_steps=30_000,
     ),
     #

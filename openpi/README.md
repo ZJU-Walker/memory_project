@@ -180,6 +180,44 @@ If you want to embed a policy server call in your own robot runtime, we have a m
 
 
 
+## Fine-tuning π₀.₅ on the bimanual YAM dataset
+
+This repo includes a ready-to-use setup for fine-tuning `pi05_base` on the bimanual YAM `bin_memory_banana` dataset. It uses **3 cameras** (one third-person + two wrist views), a **14-dim** state/action (6 arm joints + 1 gripper per arm), and **delta actions** on the arm joints (the grippers stay absolute). The relevant pieces are:
+
+- [`convert_yam_data_to_lerobot.py`](examples/yam/convert_yam_data_to_lerobot.py): converts the raw demo folders to a LeRobot dataset (`state` = follower `joint_positions`, `actions` = leader `control`).
+- [`YamInputs` and `YamOutputs`](src/openpi/policies/yam_policy.py): maps the YAM data to/from the model.
+- [`LeRobotYamDataConfig` and the `pi05_yam` `TrainConfig`](src/openpi/training/config.py): data processing and fine-tuning hyperparameters.
+
+### 1. Convert the raw data to a LeRobot dataset
+
+```bash
+uv run examples/yam/convert_yam_data_to_lerobot.py --data_dir /iris/u/kewalk/memory_project/data/bin_memory_banana
+```
+
+This writes the dataset to `$HF_LEROBOT_HOME/yam/bin_memory_banana`.
+
+### 2. Compute normalization statistics
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_yam
+```
+
+### 3. Run training
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_yam --exp-name=yam_banana_pi05 --overwrite
+```
+
+Checkpoints are saved to `checkpoints/pi05_yam/yam_banana_pi05/`.
+
+### 4. Serve the trained policy for inference
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_yam --policy.dir=checkpoints/pi05_yam/yam_banana_pi05/29999
+```
+
+
+
 ### More Examples
 
 We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:

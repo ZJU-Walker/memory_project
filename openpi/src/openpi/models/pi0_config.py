@@ -115,3 +115,43 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0MemoryConfig(Pi0Config):
+    """pi05 + Titans/MAC-style online episodic memory (see openpi.models.pi0_memory.Pi0Memory).
+
+    The memory MLP operates in `d_mem` (the GPT plan's 4096 does not match pi05; prefix width is
+    2048, so W_Q/W_K/W_V map 2048 -> d_mem). v1 defaults are deliberately small: the unroll's single
+    action forward dominates cost, not the ~8.4M-param memory MLP.
+    """
+
+    # This is a pi05-based model.
+    pi05: bool = True
+
+    # Memory MLP dimensions: d_mem -> d_hidden -> d_mem (SiLU).
+    d_mem: int = 1024
+    d_hidden: int = 4096
+    # Online surprise-momentum update: S = eta*S - theta*grad_M(L_mem); M = (1-alpha)*M + S.
+    # NOTE: theta is the key knob to sweep. At 1e-5 the memory barely moves within an episode (the
+    # write-path gradients are ~1e-4), so it stores nothing useful; start around 1e-2 and sweep
+    # ~[1e-3, 1e-1], watching ||M - M_0|| (should grow but not blow up; add mem_alpha>0 if unstable).
+    mem_eta: float = 0.9
+    mem_theta: float = 1e-2
+    mem_alpha: float = 0.0
+    # Freeze the SigLIP vision tower so the N-1 write-only memory frames are forward-only/cacheable.
+    # Still joint-trains the Gemma LLM + action expert + memory module.
+    freeze_vision: bool = True
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        from openpi.models.pi0_memory import Pi0Memory
+
+        return Pi0Memory(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        if self.freeze_vision:
+            # Freeze only the vision tower (PaliGemma/img/...); train LLM + action expert + memory.
+            return nnx_utils.PathRegex(".*img.*")
+        return super().get_freeze_filter()

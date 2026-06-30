@@ -46,12 +46,16 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Regex for params present in the reference model but absent from the checkpoint that should be
+    # kept at their initialized values (e.g. LoRA adapters, or a new memory module). Anything not
+    # matched and not in the checkpoint is dropped (and would fail the strict structure check).
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing weights (e.g. LoRA / memory) from the reference params.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

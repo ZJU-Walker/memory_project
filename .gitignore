@@ -2,3 +2,6 @@ dataset/
 .claude
 *.npz
 __pycache__
+openpi/third_party
+gello_software/
+data/
