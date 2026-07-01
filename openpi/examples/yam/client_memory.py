@@ -4,11 +4,14 @@ Runs on the robot computer, alongside `client_base.py`. Reads YAM state + the th
 directly and talks to a stateful memory server (`scripts/serve_policy_memory.py`) that maintains the
 online episodic memory `(mem, surprise)` server-side.
 
-Cadence (per the design): the episodic memory must accumulate at the full inspection rate, but action
-inference (the expensive LLM forward) only needs to run per action chunk. So each control step we send
-a cheap **write-only** message (server runs `memory_write`, no LLM); only when the current 50-step
-action chunk is exhausted do we send an **action** message (server writes *and* samples a fresh chunk
-conditioned on the current memory). At episode start we send a **reset** so memory clears to M_0.
+Cadence (per the design): memory writes are decoupled from the control loop. A background daemon
+thread sends cheap **write-only** messages (server runs `memory_write`, no LLM) at ~``write_hz``
+(default 10 Hz), always using the most recent frame published by the control loop. The 30 Hz control
+loop itself never blocks on writes; it only sends an **action** message when the current 50-step
+action chunk is exhausted (server writes that frame *and* samples a fresh chunk conditioned on the
+current memory). Both threads share one websocket, serialized by a lock. At episode start we send a
+**reset** so memory clears to M_0. Server responses carry ``policy_timing`` with ``write_ms`` (memory
+update) and ``query_ms`` (action sampling), logged per step and echoed to the console.
 
 Control keys understood by the server (placed in the obs dict):
     reset=True       -> clear (mem, surprise) to M_0
@@ -31,6 +34,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 
 import numpy as np
@@ -42,7 +46,7 @@ PROMPT = "find the bin with banana"
 BIMANUAL_DOF = 14
 
 # Per-step scalar columns pulled from the server response (memory diagnostics + timing).
-_STAT_COLUMNS = ("mem_delta", "surprise_norm", "mem_norm", "infer_ms", "write_ms")
+_STAT_COLUMNS = ("mem_delta", "surprise_norm", "mem_norm", "infer_ms", "write_ms", "query_ms")
 
 
 class _H264Writer:
@@ -85,6 +89,8 @@ class _StepLogger:
     Columns: step, t (s since start), kind (write|action), chunk_i, the memory-stat scalars from
     the server (mem_delta, surprise_norm, mem_norm, timing), a per-step d(mem_delta), the commanded
     14-dim action, and the measured 14-dim joint state. Flushed every row so Ctrl+C keeps the data.
+    ``write`` rows come from the background writer thread (NaN action/state, chunk_i=-1); ``log`` is
+    lock-guarded so the two threads can't interleave rows.
 
     Also writes a sidecar ``<path>.meta.json`` with the run args + column layout for reproducibility.
     """
@@ -94,6 +100,7 @@ class _StepLogger:
         self._w = csv.writer(self._f)
         self._prev_mem_delta = None
         self._t0 = time.monotonic()
+        self._lock = threading.Lock()
         header = (
             ["step", "t", "kind", "chunk_i", *_STAT_COLUMNS, "d_mem_delta"]
             + [f"action_{i}" for i in range(BIMANUAL_DOF)]
@@ -112,23 +119,75 @@ class _StepLogger:
             "mem_norm": resp.get("mem_norm", float("nan")),
             "infer_ms": timing.get("infer_ms", float("nan")),
             "write_ms": timing.get("write_ms", float("nan")),
+            "query_ms": timing.get("query_ms", float("nan")),
         }
-        md = stats["mem_delta"]
-        d_md = float("nan") if self._prev_mem_delta is None or md != md else md - self._prev_mem_delta
-        if md == md:  # not NaN
-            self._prev_mem_delta = md
-        row = (
-            [step, round(time.monotonic() - self._t0, 4), kind, chunk_i]
-            + [stats[c] for c in _STAT_COLUMNS]
-            + [d_md]
-            + [round(float(a), 6) for a in action]
-            + [round(float(s), 6) for s in state]
-        )
-        self._w.writerow(row)
-        self._f.flush()
+        with self._lock:
+            md = stats["mem_delta"]
+            d_md = float("nan") if self._prev_mem_delta is None or md != md else md - self._prev_mem_delta
+            if md == md:  # not NaN
+                self._prev_mem_delta = md
+            row = (
+                [step, round(time.monotonic() - self._t0, 4), kind, chunk_i]
+                + [stats[c] for c in _STAT_COLUMNS]
+                + [d_md]
+                + [round(float(a), 6) for a in action]
+                + [round(float(s), 6) for s in state]
+            )
+            self._w.writerow(row)
+            self._f.flush()
 
     def release(self) -> None:
         self._f.close()
+
+
+class _BackgroundMemoryWriter:
+    """Send write-only memory updates to the server at ~``hz`` from a daemon thread.
+
+    The control loop publishes its latest observation via ``update()``; each tick this thread
+    snapshots it (consume-once, so a stalled control loop never writes the same frame twice),
+    sends a ``write_only`` message, and hands the response to ``on_result(step, resp)`` (logging).
+    The websocket is shared with the control loop's action requests via ``ws_lock`` -- worst-case
+    an action request waits one write (~write_ms) for the lock.
+    """
+
+    def __init__(self, ws, ws_lock: threading.Lock, hz: float, prompt: str, on_result):
+        self._ws = ws
+        self._ws_lock = ws_lock
+        self._period = 1.0 / hz
+        self._prompt = prompt
+        self._on_result = on_result
+        self._latest: tuple[int, dict] | None = None
+        self._latest_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="memory-writer", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def update(self, step: int, obs: dict) -> None:
+        """Publish the newest frame (called from the control loop; never blocks on the network)."""
+        with self._latest_lock:
+            self._latest = (step, obs)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            with self._latest_lock:
+                latest, self._latest = self._latest, None
+            if latest is not None:
+                step, obs = latest
+                try:
+                    req = _obs_to_request(obs, self._prompt)
+                    with self._ws_lock:
+                        out = self._ws.infer({**req, "write_only": True})
+                    self._on_result(step, out)
+                except Exception:
+                    logging.exception("Background memory write failed (step %d)", step)
+            self._stop.wait(max(0.0, self._period - (time.monotonic() - t0)))
 
 
 @dataclasses.dataclass
@@ -143,6 +202,9 @@ class Args:
     action_horizon (pi05_yam_memory = 50); a smaller value re-samples (and re-reads memory) sooner."""
     max_steps: int = 12000
     hz: float = 30.0
+    write_hz: float = 10.0
+    """Rate of the background memory-write thread. Writes run off the control loop's latest frame in
+    a daemon thread, so the control loop only blocks on the network for action requests."""
     prompt: str = PROMPT
     max_joint_delta: float = 1.0
     """Per-step safety clamp: cap |target - current| across all joints to this many radians."""
@@ -219,15 +281,43 @@ def _run_dry(ws, args: Args) -> None:
         r = ws.infer(req(write_only=True))
         d = r.get("mem_delta", float("nan"))
         logging.info(
-            "  write %d: mem_delta=%.4g (d=%+.4g) surprise=%.4g",
+            "  write %d: mem_delta=%.4g (d=%+.4g) surprise=%.4g write_ms=%.1f",
             i, d, d - prev, r.get("surprise_norm", float("nan")),
+            (r.get("policy_timing", {}) or {}).get("write_ms", float("nan")),
         )
         prev = d
     out = ws.infer(req())  # action step
     actions = np.asarray(out["actions"])
     assert actions.shape == (args.action_horizon, BIMANUAL_DOF), f"got {actions.shape}"
     assert np.all(np.isfinite(actions)), "non-finite actions"
-    logging.info("  action step: actions shape=%s finite=True", actions.shape)
+    timing = out.get("policy_timing", {}) or {}
+    logging.info(
+        "  action step: actions shape=%s finite=True write_ms=%.1f query_ms=%.1f",
+        actions.shape, timing.get("write_ms", float("nan")), timing.get("query_ms", float("nan")),
+    )
+
+    # Exercise the background writer for ~2 s (same code path the control loop uses).
+    ws_lock = threading.Lock()
+    writes: list[float] = []
+    mem_writer = _BackgroundMemoryWriter(
+        ws, ws_lock, args.write_hz, args.prompt,
+        lambda _step, resp: writes.append((resp.get("policy_timing", {}) or {}).get("write_ms", float("nan"))),
+    )
+    mem_writer.start()
+    for i in range(20):
+        # The writer thread runs _obs_to_request itself, so publish raw robot-format obs.
+        mem_writer.update(i, {
+            "joint_positions": np.random.rand(BIMANUAL_DOF).astype(np.float32),
+            "top_camera_rgb": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+            "left_camera_rgb": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+            "right_camera_rgb": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        })
+        time.sleep(0.1)
+    mem_writer.stop()
+    logging.info(
+        "  background writer: %d writes in ~2 s at %.1f Hz (expect ~%d), mean write_ms=%.1f",
+        len(writes), args.write_hz, int(2 * args.write_hz), float(np.nanmean(writes)) if writes else float("nan"),
+    )
     r = ws.infer(req(reset=True))
     logging.info("  after reset: mem_delta=%.4g (expect ~0)", r.get("mem_delta", float("nan")))
     logging.info("Dry run OK.")
@@ -318,6 +408,22 @@ def main(args: Args) -> None:
         step_logger = _StepLogger(log_path, args)
         logging.info("Logging per-step memory stats to %s (+ %s.meta.json)", log_path, log_path)
 
+    # --- Background memory writer (writes at ~write_hz off the control loop's latest frame) ---
+    ws_lock = threading.Lock()
+    # Seed console stats from the reset response so the first log lines aren't all NaN.
+    last_write: dict = {k: out[k] for k in ("mem_delta", "surprise_norm", "mem_norm", "policy_timing") if k in out}
+    last_action_timing: dict = out.get("policy_timing", {}) or {}
+
+    def _on_write(write_step: int, resp: dict) -> None:
+        last_write.update(resp)
+        if step_logger is not None:
+            nan14 = np.full(BIMANUAL_DOF, np.nan)
+            step_logger.log(write_step, "write", -1, resp, nan14, nan14)
+
+    mem_writer = _BackgroundMemoryWriter(ws, ws_lock, args.write_hz, args.prompt, _on_write)
+    mem_writer.start()
+    logging.info("Background memory writer running at %.1f Hz", args.write_hz)
+
     # --- Control loop ---
     logging.info("Starting control loop: %d steps @ %.1f Hz", args.max_steps, args.hz)
     obs = env.get_obs()
@@ -327,37 +433,44 @@ def main(args: Args) -> None:
                 # obs["top_camera_rgb"] is the RGB frame the policy sees this step.
                 writer.write(image_tools.convert_to_uint8(obs["top_camera_rgb"]))
                 frames_written += 1
-            req = _obs_to_request(obs, args.prompt)
+            # Publish this frame to the background writer (non-blocking; it writes at write_hz).
+            mem_writer.update(step, obs)
+            out = None
             if chunk_i >= args.action_horizon:
                 # Chunk exhausted: action message (server writes this frame + samples a new chunk).
-                out = ws.infer(req)
+                with ws_lock:
+                    out = ws.infer(_obs_to_request(obs, args.prompt))
                 chunk = np.asarray(out["actions"], dtype=np.float64)
                 chunk_i = 0
-                kind = "action"
-            else:
-                # Mid-chunk: cheap write-only update so memory keeps accumulating at full rate.
-                out = ws.infer({**req, "write_only": True})
-                kind = "write"
+                last_action_timing = out.get("policy_timing", {}) or {}
+                logging.info(
+                    "  action step %d: write_ms=%.1f query_ms=%.1f",
+                    step,
+                    last_action_timing.get("write_ms", float("nan")),
+                    last_action_timing.get("query_ms", float("nan")),
+                )
 
             cur = np.asarray(obs["joint_positions"], dtype=np.float64)
             action = _clamp_joint_delta(chunk[chunk_i], cur, args.max_joint_delta)
-            if step_logger is not None:
-                # `out` is this step's response (write or action), so mem stats are current.
-                step_logger.log(step, kind, chunk_i, out, action, cur)
+            if step_logger is not None and out is not None:
+                step_logger.log(step, "action", chunk_i, out, action, cur)
             chunk_i += 1
             obs = env.step(action)
 
             if step % args.hz == 0:
+                write_timing = last_write.get("policy_timing", {}) or {}
                 logging.info(
-                    "  step %d / %d  mem_delta=%.4g  surprise=%.4g  (%s)",
+                    "  step %d / %d  mem_delta=%.4g  surprise=%.4g  write_ms=%.1f  query_ms=%.1f",
                     step, args.max_steps,
-                    out.get("mem_delta", float("nan")),
-                    out.get("surprise_norm", float("nan")),
-                    kind,
+                    last_write.get("mem_delta", float("nan")),
+                    last_write.get("surprise_norm", float("nan")),
+                    write_timing.get("write_ms", float("nan")),
+                    last_action_timing.get("query_ms", float("nan")),
                 )
     except KeyboardInterrupt:
         logging.info("Interrupted by user -- stopping (arms left in place).")
     finally:
+        mem_writer.stop()
         if step_logger is not None:
             step_logger.release()
             logging.info("Saved memory log: %s", log_path)

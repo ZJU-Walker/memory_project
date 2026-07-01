@@ -11,9 +11,14 @@ control keys placed in the observation dict, so the existing `WebsocketPolicySer
 
   - ``reset=True``       -> clear `(mem, surprise)` back to `M_0` (start a new episode). Returns an ack.
   - ``write_only=True``  -> run a single cheap memory write (SigLIP encode + MLP update, no LLM) and
-                            return an ack. Used for the per-step write stream during inspection.
+                            return an ack. The client sends these from a background thread (~10 Hz),
+                            decoupled from its control loop.
   - (neither)            -> an action step: write this frame, then sample a full action chunk with the
                             current memory. Returns ``{"state", "actions", "policy_timing"}``.
+
+Timing: ``policy_timing`` reports ``write_ms`` (memory update) and, on action steps, ``query_ms``
+(action sampling) separately; both are measured with ``jax.block_until_ready`` so they reflect device
+compute, not async dispatch. ``infer_ms`` = write_ms + query_ms is kept for backward compatibility.
 """
 
 from collections.abc import Sequence
@@ -138,25 +143,29 @@ class MemoryPolicy(_base_policy.BasePolicy):
 
         observation = self._to_observation(obs)
 
-        # Always write the current frame into memory first.
+        # Always write the current frame into memory first. block_until_ready so write_ms measures
+        # the device compute, not just JAX async dispatch.
         start = time.monotonic()
         self._mem, self._surprise = self._memory_write(observation, self._mem, self._surprise)
+        jax.block_until_ready(self._mem)
+        write_ms = (time.monotonic() - start) * 1000
 
         if write_only:
-            write_ms = (time.monotonic() - start) * 1000
             return {"ok": True, "policy_timing": {"write_ms": write_ms}, **self.memory_stats()}
 
         # Action step: sample a full chunk conditioned on the (just-updated) memory.
         # Both fields keep their leading batch dim here, then get sliced [0] together (as in Policy).
         self._rng, sample_rng = jax.random.split(self._rng)
+        query_start = time.monotonic()
         outputs = {
             "state": observation.state,  # [1, state_dim]
             "actions": self._sample_actions(sample_rng, observation, mem=self._mem, **self._sample_kwargs),  # [1, 50, 32]
         }
-        model_ms = (time.monotonic() - start) * 1000
+        jax.block_until_ready(outputs["actions"])
+        query_ms = (time.monotonic() - query_start) * 1000
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         outputs = self._output_transform(outputs)
-        outputs["policy_timing"] = {"infer_ms": model_ms}
+        outputs["policy_timing"] = {"write_ms": write_ms, "query_ms": query_ms, "infer_ms": write_ms + query_ms}
         outputs.update(self.memory_stats())
         return outputs
 
