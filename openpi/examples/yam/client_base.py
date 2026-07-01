@@ -20,7 +20,11 @@ Smoke-test the obs/action contract without hardware:
 """
 
 import dataclasses
+import datetime
 import logging
+import os
+import shutil
+import subprocess
 
 import numpy as np
 from openpi_client import action_chunk_broker
@@ -38,15 +42,15 @@ BIMANUAL_DOF = 14
 @dataclasses.dataclass
 class Args:
     # --- Policy server (remote GPU box) ---
-    host: str = "0.0.0.0"
+    host: str = "10.79.12.64"
     port: int = 8000
 
     # --- Inference / control ---
-    action_horizon: int = 50
+    action_horizon: int = 25
     """Steps consumed from each inferred chunk before re-querying the server. Must match the
     model's action_horizon (pi05_yam = 50)."""
-    max_steps: int = 1200
-    hz: float = 30.0
+    max_steps: int = 12000
+    hz: float = 20.0
     prompt: str = PROMPT
     max_joint_delta: float = 1.0
     """Per-step safety clamp: cap |target - current| across all joints to this many radians."""
@@ -58,10 +62,52 @@ class Args:
     left_camera_serial: str = "409122271088"
     right_camera_serial: str = "409122271086"
 
+    # --- Recording ---
+    record: bool = True
+    """Record the top camera view during the control loop; saved on exit (incl. Ctrl+C)."""
+    record_dir: str = "eval"
+    """Directory for the top camera recording (created if missing)."""
+    record_path: str = ""
+    """Output .mp4 path. Empty -> `<record_dir>/top_camera_<timestamp>.mp4`."""
+
     # --- Debug ---
     dry_run: bool = False
     """Skip hardware: feed random observations to the policy to validate the obs/action
     contract (shapes, keys, finiteness) against a running server."""
+
+
+class _H264Writer:
+    """Encode RGB frames to a browser/VSCode-previewable H.264 mp4 via an `ffmpeg` subprocess.
+
+    OpenCV's bundled ffmpeg here only exposes the hardware `h264_v4l2m2m` encoder (no valid
+    device), so we pipe raw frames to the system ffmpeg + libx264 instead.
+    """
+
+    def __init__(self, path: str, width: int, height: int, fps: float):
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found on PATH -- needed to encode the recording")
+        self._proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{fps}",
+                "-i", "-",
+                "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                # libx264 + yuv420p needs even dimensions; pad up if a camera reports odd ones.
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                path,
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+    def write(self, frame_rgb: np.ndarray) -> None:
+        self._proc.stdin.write(np.ascontiguousarray(frame_rgb).tobytes())
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        self._proc.wait()
 
 
 def _obs_to_request(obs: dict, prompt: str) -> dict:
@@ -159,11 +205,33 @@ def main(args: Args) -> None:
     # The ramp consumed broker steps; reset so the episode starts from a fresh chunk.
     policy.reset()
 
+    # --- Set up top camera recording (written incrementally so Ctrl+C still saves it) ---
+    writer = None
+    frames_written = 0
+    if args.record:
+        record_path = args.record_path
+        if not record_path:
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(args.record_dir, exist_ok=True)
+            record_path = os.path.join(args.record_dir, f"top_camera_{stamp}.mp4")
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(record_path)), exist_ok=True)
+        first_frame = image_tools.convert_to_uint8(obs["top_camera_rgb"])
+        writer = _H264Writer(record_path, first_frame.shape[1], first_frame.shape[0], args.hz)
+        logging.info(
+            "Recording top camera (H.264) to %s (%dx%d @ %.1f Hz)",
+            record_path, first_frame.shape[1], first_frame.shape[0], args.hz,
+        )
+
     # --- Control loop (paced to `hz` by RobotEnv.step's internal Rate) ---
     logging.info("Starting control loop: %d steps @ %.1f Hz", args.max_steps, args.hz)
     obs = env.get_obs()
     try:
         for step in range(args.max_steps):
+            if writer is not None:
+                # obs["top_camera_rgb"] is the RGB frame the policy sees this step.
+                writer.write(image_tools.convert_to_uint8(obs["top_camera_rgb"]))
+                frames_written += 1
             action = np.asarray(policy.infer(_obs_to_request(obs, args.prompt))["actions"], dtype=np.float64)
             cur = np.asarray(obs["joint_positions"], dtype=np.float64)
             action = _clamp_joint_delta(action, cur, args.max_joint_delta)
@@ -173,6 +241,9 @@ def main(args: Args) -> None:
     except KeyboardInterrupt:
         logging.info("Interrupted by user -- stopping (arms left in place).")
     finally:
+        if writer is not None:
+            writer.release()
+            logging.info("Saved recording: %s (%d frames)", record_path, frames_written)
         logging.info("Control loop finished.")
 
 

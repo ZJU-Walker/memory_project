@@ -5,3 +5,4 @@ __pycache__
 openpi/third_party
 gello_software/
 data/
+*.mp4

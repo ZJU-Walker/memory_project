@@ -216,6 +216,30 @@ Checkpoints are saved to `checkpoints/pi05_yam/yam_banana_pi05/`.
 uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_yam --policy.dir=checkpoints/pi05_yam/yam_banana_pi05/29999
 ```
 
+### 5. Run the robot client
+
+On the **robot computer** (needs both `gello_software` and `openpi_client` importable), point the client at the GPU box running the server:
+
+```bash
+python examples/yam/client_base.py --host <gpu-host> --port 8000
+```
+
+The top camera view is recorded during the control loop and saved as a browser/VSCode-previewable H.264 mp4 (`eval/top_camera_<timestamp>.mp4`) on exit — including when you press Ctrl+C. Encoding uses the system `ffmpeg` (libx264), so make sure `ffmpeg` is on your PATH. Options:
+
+```bash
+# Custom output directory (default: eval/)
+python examples/yam/client_base.py --host <gpu-host> --port 8000 --record-dir eval
+
+# Custom output path
+python examples/yam/client_base.py --host <gpu-host> --port 8000 --record-path eval/run1.mp4
+
+# Disable recording
+python examples/yam/client_base.py --host <gpu-host> --port 8000 --no-record
+
+# Smoke-test the obs/action contract against the server without hardware
+python examples/yam/client_base.py --host <gpu-host> --port 8000 --dry-run
+```
+
 
 
 ### More Examples
