@@ -76,15 +76,15 @@ class _H264Writer:
 @dataclasses.dataclass
 class Args:
     # --- Policy server (remote GPU box) ---
-    host: str = "10.79.12.64"
+    host: str = "10.79.12.252"
     port: int = 8000
 
     # --- Inference / control ---
-    action_horizon: int = 25
+    action_horizon: int = 50
     """Steps executed from each sampled action chunk before requesting a new one. <= the model's
     action_horizon (pi05_yam_memory = 50); a smaller value re-samples (and re-reads memory) sooner."""
     max_steps: int = 12000
-    hz: float = 20.0
+    hz: float = 30.0
     prompt: str = PROMPT
     max_joint_delta: float = 1.0
     """Per-step safety clamp: cap |target - current| across all joints to this many radians."""
