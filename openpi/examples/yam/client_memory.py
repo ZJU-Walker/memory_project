@@ -23,12 +23,15 @@ Client (robot computer; needs both `gello_software` and `openpi_client` importab
     python examples/yam/client_memory.py --host <gpu-host> --port 8000
 """
 
+import csv
 import dataclasses
 import datetime
+import json
 import logging
 import os
 import shutil
 import subprocess
+import time
 
 import numpy as np
 from openpi_client import image_tools
@@ -37,6 +40,9 @@ import tyro
 
 PROMPT = "find the bin with banana"
 BIMANUAL_DOF = 14
+
+# Per-step scalar columns pulled from the server response (memory diagnostics + timing).
+_STAT_COLUMNS = ("mem_delta", "surprise_norm", "mem_norm", "infer_ms", "write_ms")
 
 
 class _H264Writer:
@@ -73,6 +79,58 @@ class _H264Writer:
         self._proc.wait()
 
 
+class _StepLogger:
+    """Append one CSV row per control step for offline memory-dynamics analysis.
+
+    Columns: step, t (s since start), kind (write|action), chunk_i, the memory-stat scalars from
+    the server (mem_delta, surprise_norm, mem_norm, timing), a per-step d(mem_delta), the commanded
+    14-dim action, and the measured 14-dim joint state. Flushed every row so Ctrl+C keeps the data.
+
+    Also writes a sidecar ``<path>.meta.json`` with the run args + column layout for reproducibility.
+    """
+
+    def __init__(self, path: str, args: "Args"):
+        self._f = open(path, "w", newline="")  # noqa: SIM115 (kept open for the run; closed in release)
+        self._w = csv.writer(self._f)
+        self._prev_mem_delta = None
+        self._t0 = time.monotonic()
+        header = (
+            ["step", "t", "kind", "chunk_i", *_STAT_COLUMNS, "d_mem_delta"]
+            + [f"action_{i}" for i in range(BIMANUAL_DOF)]
+            + [f"state_{i}" for i in range(BIMANUAL_DOF)]
+        )
+        self._w.writerow(header)
+        self._f.flush()
+        with open(path + ".meta.json", "w") as mf:
+            json.dump({"args": dataclasses.asdict(args), "columns": header}, mf, indent=2)
+
+    def log(self, step: int, kind: str, chunk_i: int, resp: dict, action: np.ndarray, state: np.ndarray) -> None:
+        timing = resp.get("policy_timing", {}) or {}
+        stats = {
+            "mem_delta": resp.get("mem_delta", float("nan")),
+            "surprise_norm": resp.get("surprise_norm", float("nan")),
+            "mem_norm": resp.get("mem_norm", float("nan")),
+            "infer_ms": timing.get("infer_ms", float("nan")),
+            "write_ms": timing.get("write_ms", float("nan")),
+        }
+        md = stats["mem_delta"]
+        d_md = float("nan") if self._prev_mem_delta is None or md != md else md - self._prev_mem_delta
+        if md == md:  # not NaN
+            self._prev_mem_delta = md
+        row = (
+            [step, round(time.monotonic() - self._t0, 4), kind, chunk_i]
+            + [stats[c] for c in _STAT_COLUMNS]
+            + [d_md]
+            + [round(float(a), 6) for a in action]
+            + [round(float(s), 6) for s in state]
+        )
+        self._w.writerow(row)
+        self._f.flush()
+
+    def release(self) -> None:
+        self._f.close()
+
+
 @dataclasses.dataclass
 class Args:
     # --- Policy server (remote GPU box) ---
@@ -103,6 +161,12 @@ class Args:
     """Directory for the top camera recording (created if missing)."""
     record_path: str = ""
     """Output .mp4 path. Empty -> `<record_dir>/top_camera_<timestamp>.mp4`."""
+
+    # --- Per-step memory log (CSV for offline analysis) ---
+    log: bool = True
+    """Write one CSV row per control step (memory stats + action + state) for analysis."""
+    log_path: str = ""
+    """Output .csv path. Empty -> `<record_dir>/mem_log_<timestamp>.csv` (+ a .meta.json sidecar)."""
 
     # --- Debug ---
     dry_run: bool = False
@@ -146,12 +210,18 @@ def _run_dry(ws, args: Args) -> None:
 
     logging.info("Dry run: reset -> writes -> action -> reset")
     r = ws.infer(req(reset=True, write_only=True))
-    logging.info("  after reset+write: mem_delta=%.4g", r.get("mem_delta", float("nan")))
+    logging.info(
+        "  after reset+write: mem_delta=%.4g surprise=%.4g mem_norm=%.4g",
+        r.get("mem_delta", float("nan")), r.get("surprise_norm", float("nan")), r.get("mem_norm", float("nan")),
+    )
     prev = r.get("mem_delta", 0.0)
-    for i in range(5):
+    for i in range(10):
         r = ws.infer(req(write_only=True))
         d = r.get("mem_delta", float("nan"))
-        logging.info("  write %d: mem_delta=%.4g (grew=%s)", i, d, d >= prev)
+        logging.info(
+            "  write %d: mem_delta=%.4g (d=%+.4g) surprise=%.4g",
+            i, d, d - prev, r.get("surprise_norm", float("nan")),
+        )
         prev = d
     out = ws.infer(req())  # action step
     actions = np.asarray(out["actions"])
@@ -235,6 +305,19 @@ def main(args: Args) -> None:
             record_path, first_frame.shape[1], first_frame.shape[0], args.hz,
         )
 
+    # --- Set up per-step memory log (CSV, flushed each row so Ctrl+C keeps it) ---
+    step_logger = None
+    log_path = args.log_path
+    if args.log:
+        if not log_path:
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(args.record_dir, exist_ok=True)
+            log_path = os.path.join(args.record_dir, f"mem_log_{stamp}.csv")
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        step_logger = _StepLogger(log_path, args)
+        logging.info("Logging per-step memory stats to %s (+ %s.meta.json)", log_path, log_path)
+
     # --- Control loop ---
     logging.info("Starting control loop: %d steps @ %.1f Hz", args.max_steps, args.hz)
     obs = env.get_obs()
@@ -250,20 +333,34 @@ def main(args: Args) -> None:
                 out = ws.infer(req)
                 chunk = np.asarray(out["actions"], dtype=np.float64)
                 chunk_i = 0
+                kind = "action"
             else:
                 # Mid-chunk: cheap write-only update so memory keeps accumulating at full rate.
-                ws.infer({**req, "write_only": True})
+                out = ws.infer({**req, "write_only": True})
+                kind = "write"
 
             cur = np.asarray(obs["joint_positions"], dtype=np.float64)
             action = _clamp_joint_delta(chunk[chunk_i], cur, args.max_joint_delta)
+            if step_logger is not None:
+                # `out` is this step's response (write or action), so mem stats are current.
+                step_logger.log(step, kind, chunk_i, out, action, cur)
             chunk_i += 1
             obs = env.step(action)
 
             if step % args.hz == 0:
-                logging.info("  step %d / %d (mem_delta=%.4g)", step, args.max_steps, out.get("mem_delta", float("nan")))
+                logging.info(
+                    "  step %d / %d  mem_delta=%.4g  surprise=%.4g  (%s)",
+                    step, args.max_steps,
+                    out.get("mem_delta", float("nan")),
+                    out.get("surprise_norm", float("nan")),
+                    kind,
+                )
     except KeyboardInterrupt:
         logging.info("Interrupted by user -- stopping (arms left in place).")
     finally:
+        if step_logger is not None:
+            step_logger.release()
+            logging.info("Saved memory log: %s", log_path)
         if writer is not None:
             writer.release()
             logging.info("Saved recording: %s (%d frames)", record_path, frames_written)

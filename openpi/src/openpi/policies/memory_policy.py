@@ -96,6 +96,32 @@ class MemoryPolicy(_base_policy.BasePolicy):
         total = sum(float(v) for v in jax.tree.leaves(sq))
         return float(np.sqrt(total))
 
+    def memory_stats(self) -> dict:
+        """Richer memory diagnostics for offline analysis (all forced to host floats).
+
+        - ``mem_delta``     : ||mem - M_0||  (total drift from episode start)
+        - ``surprise_norm`` : ||S||          (write momentum magnitude; ~0 => writes have gone quiet)
+        - ``mem_norm``      : ||mem||        (absolute size; watch for blow-up)
+        - ``delta_by_param``: per-param ||mem_p - M_0_p|| (which of w1/b1/w2/b2 is moving)
+
+        Returns NaNs when `report_mem_delta` is disabled (skips the device->host sync).
+        """
+        if not self._report_mem_delta:
+            return {"mem_delta": float("nan"), "surprise_norm": float("nan"), "mem_norm": float("nan")}
+        m0 = self._model.mem_init(1)
+        delta_by_param = {k: float(jnp.sqrt(jnp.sum(jnp.square(self._mem[k] - m0[k])))) for k in self._mem}
+        mem_delta = float(np.sqrt(sum(v * v for v in delta_by_param.values())))
+        surprise_norm = float(
+            jnp.sqrt(sum(jnp.sum(jnp.square(s)) for s in jax.tree.leaves(self._surprise)))
+        )
+        mem_norm = float(jnp.sqrt(sum(jnp.sum(jnp.square(m)) for m in jax.tree.leaves(self._mem))))
+        return {
+            "mem_delta": mem_delta,
+            "surprise_norm": surprise_norm,
+            "mem_norm": mem_norm,
+            "delta_by_param": delta_by_param,
+        }
+
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         obs = dict(obs)  # shallow copy so we can pop control keys
@@ -108,7 +134,7 @@ class MemoryPolicy(_base_policy.BasePolicy):
         # A reset can be piggybacked on a frame that also writes/acts; only bail out early if the
         # message carries no actual observation (a bare reset ping).
         if "observation/state" not in obs and "state" not in obs:
-            return {"ok": True, "reset": reset, "mem_delta": self.memory_delta_norm()}
+            return {"ok": True, "reset": reset, **self.memory_stats()}
 
         observation = self._to_observation(obs)
 
@@ -118,7 +144,7 @@ class MemoryPolicy(_base_policy.BasePolicy):
 
         if write_only:
             write_ms = (time.monotonic() - start) * 1000
-            return {"ok": True, "policy_timing": {"write_ms": write_ms}, "mem_delta": self.memory_delta_norm()}
+            return {"ok": True, "policy_timing": {"write_ms": write_ms}, **self.memory_stats()}
 
         # Action step: sample a full chunk conditioned on the (just-updated) memory.
         # Both fields keep their leading batch dim here, then get sliced [0] together (as in Policy).
@@ -131,7 +157,7 @@ class MemoryPolicy(_base_policy.BasePolicy):
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {"infer_ms": model_ms}
-        outputs["mem_delta"] = self.memory_delta_norm()
+        outputs.update(self.memory_stats())
         return outputs
 
     @property
