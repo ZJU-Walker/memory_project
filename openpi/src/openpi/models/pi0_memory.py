@@ -35,10 +35,11 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-# Defined at module level so the initializer's function identity is stable across model
-# instantiations. Creating it inside __init__ yields a fresh closure each time, which makes the
-# nnx graphdef differ between jax.eval_shape and the real init -> pjit out_shardings mismatch.
-_MEM_OUT_KERNEL_INIT = nnx.initializers.normal(stddev=0.01)
+# Defined at module level so each initializer's function identity is stable across model
+# instantiations. Creating them inside __init__ yields a fresh closure each time, which makes the nnx
+# graphdef differ between jax.eval_shape and the real init -> pjit out_shardings mismatch at train init.
+_MEM_ZERO_INIT = nnx.initializers.zeros_init()
+_MEM_GATE_BIAS_INIT = nnx.initializers.constant(-4.0)
 
 
 def mem_apply(mem: dict, z: at.Array) -> at.Array:
@@ -68,11 +69,20 @@ class Pi0Memory(Pi0):
         self.mem_q_proj = nnx.Linear(self.embed_dim, self.d_mem, rngs=rngs)
         self.mem_k_proj = nnx.Linear(self.embed_dim, self.d_mem, rngs=rngs)
         self.mem_v_proj = nnx.Linear(self.embed_dim, self.d_mem, rngs=rngs)
-        # Projects the retrieved memory r_t into a single prefix "memory token". Small-random (not
-        # zero) init: the token starts small so the base policy is barely perturbed, while gradients
-        # still flow into the whole memory chain from step 1. (Zero-init here would dead-path the
-        # upstream memory gradients.)
-        self.mem_out_proj = nnx.Linear(self.d_mem, self.embed_dim, kernel_init=_MEM_OUT_KERNEL_INIT, rngs=rngs)
+        # Projects the retrieved memory r_t into a single prefix "memory token". Zero-init the kernel so
+        # the token is *exactly* zero at step 0 and training starts as stock pi05 (no base-skill
+        # regression from a memory token perturbing the frozen policy). Gradients still flow into the
+        # whole memory chain (W_Q, M, and the gate below) because those paths are nonzero, so zero-init
+        # here does not dead-path them -- it only kills the constant offset the untrained token added.
+        self.mem_out_proj = nnx.Linear(self.d_mem, self.embed_dim, kernel_init=_MEM_ZERO_INIT, rngs=rngs)
+        # Input-conditioned gate on the memory token: token = sigmoid(w.x + b) * mem_out_proj(r). The
+        # bias starts strongly negative so the gate ~= sigmoid(-4) ~= 0.018 initially -- memory is
+        # silent during the motor phases (approach/grasp/place) that don't need it, and the action loss
+        # learns to *open* the gate only when the pooled context (e.g. a closed-lid recall scene) calls
+        # for memory. This is what stops the always-on token from eroding base skills.
+        self.mem_gate_proj = nnx.Linear(
+            self.embed_dim, 1, kernel_init=_MEM_ZERO_INIT, bias_init=_MEM_GATE_BIAS_INIT, rngs=rngs
+        )
 
         # Learned memory initialization M_0 (slow params, trained by the outer loss). Small-random
         # weights so the initial read r_t is small-but-nonzero (keeps gradients alive) and the
@@ -80,7 +90,11 @@ class Pi0Memory(Pi0):
         key_w1, key_w2 = jax.random.split(rngs.params())
         self.mem_w1 = nnx.Param(0.02 * jax.random.normal(key_w1, (self.d_mem, self.d_hidden)))
         self.mem_b1 = nnx.Param(jnp.zeros((self.d_hidden,)))
-        self.mem_w2 = nnx.Param(0.02 * jax.random.normal(key_w2, (self.d_hidden, self.d_mem)))
+        # w2's fan-in is d_hidden, so a flat 0.02 over-scales the layer-2 pre-activations (and shifts
+        # the inner-surprise-grad conditioning) as d_hidden grows. Scale by sqrt(4096/d_hidden) so the
+        # init matches the original 0.02 at the v1 width (4096) and shrinks for wider memories.
+        w2_std = 0.02 * (4096.0 / self.d_hidden) ** 0.5
+        self.mem_w2 = nnx.Param(w2_std * jax.random.normal(key_w2, (self.d_hidden, self.d_mem)))
         self.mem_b2 = nnx.Param(jnp.zeros((self.d_mem,)))
 
     # ------------------------------------------------------------------ memory helpers
@@ -126,10 +140,16 @@ class Pi0Memory(Pi0):
         return self._surprise_update(mem, surprise, self.mem_k_proj(x), self.mem_v_proj(x))
 
     def _read_memory_token(self, prefix_tokens: at.Array, prefix_mask: at.Array, mem: dict) -> at.Array:
-        """r_t = M(W_Q x_t); memory token = mem_out_proj(r_t), cast to the prefix dtype."""
+        """r_t = M(W_Q x_t); memory token = gate(x_t) * mem_out_proj(r_t), cast to the prefix dtype.
+
+        The scalar gate (sigmoid, strongly-negative bias init) keeps the token ~0 unless the pooled
+        context calls for memory, so the base policy is undisturbed during memory-irrelevant phases.
+        """
         x = self._pool_prefix(prefix_tokens, prefix_mask)
         r = mem_apply(mem, self.mem_q_proj(x))
-        return self.mem_out_proj(r).astype(prefix_tokens.dtype)[:, None, :]
+        gate = nnx.sigmoid(self.mem_gate_proj(x))  # [B, 1], in (0, 1)
+        token = gate * self.mem_out_proj(r)
+        return token.astype(prefix_tokens.dtype)[:, None, :]
 
     @staticmethod
     def _append_memory_token(prefix_tokens, prefix_mask, prefix_ar_mask, mem_token):

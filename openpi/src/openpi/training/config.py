@@ -846,7 +846,10 @@ _CONFIGS = [
     # (freeze_vision=True); memory params are kept at init by the weight loader's missing_regex.
     TrainConfig(
         name="pi05_yam_memory",
-        model=(_pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(pi05=True)),
+        # ~100M online memory MLP: d_hidden 4096 -> 49152 (d_mem stays 1024, so the frozen
+        # projections + memory token are unchanged). mem_theta lowered from the 8.4M-tuned 1e-2 since
+        # the 12x-wider layer has a larger surprise-gradient norm (sweep ~[3e-4, 3e-2]).
+        model=(_pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(pi05=True, d_hidden=49152, mem_theta=1e-3)),
         data=LeRobotYamMemoryDataConfig(
             repo_id="yam/bin_memory_banana",
             default_prompt="find the bin with banana",
@@ -856,7 +859,10 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*(lora|mem_).*"
         ),
-        batch_size=8,
+        # Reduced from 8: at d_hidden=49152 the per-example memory weights carry a leading batch dim
+        # (w1/w2 ~1.6 GB/tensor/example) and the n_mem=16 unroll is differentiated end-to-end, so the
+        # activation footprint scales with batch_size * n_mem * d_hidden. batch_size=2 fits one H200.
+        batch_size=2,
         num_workers=4,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
