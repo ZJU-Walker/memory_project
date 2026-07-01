@@ -173,12 +173,18 @@ def create_trained_memory_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, _transforms.NormStats] | None = None,
+    mem_overrides: dict[str, float] | None = None,
 ) -> MemoryPolicy:
     """Load a `Pi0Memory` checkpoint into a stateful `MemoryPolicy`.
 
     Mirrors `openpi.policies.policy_config.create_trained_policy` (same transform pipeline and norm
     stats), but instantiates the stateful memory policy. JAX-only (the memory model is a JAX nnx
     module). `train_config` must be a memory config, e.g. `get_config("pi05_yam_memory")`.
+
+    `mem_overrides` optionally overrides the online-memory hyperparameters (`mem_theta`, `mem_eta`,
+    `mem_alpha`) on the loaded model *before* the policy jits it -- they are plain attributes read
+    inside `_surprise_update`, so this changes deployment write dynamics without retraining (useful
+    to fix instant saturation: lower `mem_theta` and/or raise `mem_alpha`).
     """
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
@@ -187,6 +193,14 @@ def create_trained_memory_policy(
     model = train_config.model.load(_model.restore_params(pathlib.Path(checkpoint_dir) / "params", dtype=jnp.bfloat16))
     if not isinstance(model, _pi0_memory.Pi0Memory):
         raise TypeError(f"Expected a Pi0Memory model, got {type(model).__name__}. Use a memory config.")
+
+    for name, value in (mem_overrides or {}).items():
+        if value is None:
+            continue
+        if not hasattr(model, name):
+            raise ValueError(f"Unknown mem override '{name}' (expected one of mem_theta/mem_eta/mem_alpha).")
+        logging.info("Overriding %s: %s -> %s", name, getattr(model, name), value)
+        setattr(model, name, float(value))
 
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:

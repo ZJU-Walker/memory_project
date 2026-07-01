@@ -44,12 +44,21 @@ class Args:
     # Port to serve on.
     port: int = 8000
 
+    # Online-memory hyperparameter overrides (None -> keep the checkpoint's trained value). These
+    # change deployment write dynamics without retraining. If the memory saturates instantly
+    # (mem_delta maxes out in the first ~1-2 s while surprise_norm collapses to ~0), lower
+    # mem_theta (try 1e-3) and/or raise mem_alpha (e.g. 0.01) so old surprise decays.
+    mem_theta: float | None = None
+    mem_eta: float | None = None
+    mem_alpha: float | None = None
+
 
 def main(args: Args) -> None:
     policy = _memory_policy.create_trained_memory_policy(
         _config.get_config(args.policy.config),
         args.policy.dir,
         default_prompt=args.default_prompt,
+        mem_overrides={"mem_theta": args.mem_theta, "mem_eta": args.mem_eta, "mem_alpha": args.mem_alpha},
     )
 
     hostname = socket.gethostname()
