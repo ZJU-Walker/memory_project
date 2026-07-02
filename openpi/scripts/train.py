@@ -161,6 +161,14 @@ def train_step(
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
+    # Skip the step entirely if any gradient is non-finite: one bad batch must waste one step, not
+    # poison the run (clip_by_global_norm turns a single NaN gradient into a NaN scale for EVERY
+    # param, which is unrecoverable). Multiplexing old/new keeps the opt_state tree structure
+    # unchanged (unlike optax.apply_if_finite), so checkpoints stay resume-compatible.
+    grads_finite = jnp.isfinite(optax.global_norm(grads))
+    new_params = jax.tree.map(lambda new, old: jnp.where(grads_finite, new, old), new_params, params)
+    new_opt_state = jax.tree.map(lambda new, old: jnp.where(grads_finite, new, old), new_opt_state, state.opt_state)
+
     # Update the model in place and return the new full state.
     nnx.update(model, new_params)
     new_params = nnx.state(model)
@@ -187,6 +195,9 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        # Fraction of steps skipped due to non-finite grads (averaged over the log window). A brief
+        # nonzero blip is a survived bad batch; pinned at 1.0 means training is stalled -- investigate.
+        "nonfinite_grads": 1.0 - grads_finite.astype(jnp.float32),
     }
     return new_state, info
 

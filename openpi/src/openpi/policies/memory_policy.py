@@ -194,6 +194,11 @@ def create_trained_memory_policy(
     `mem_alpha`) on the loaded model *before* the policy jits it -- they are plain attributes read
     inside `_surprise_update`, so this changes deployment write dynamics without retraining (useful
     to fix instant saturation: lower `mem_theta` and/or raise `mem_alpha`).
+
+    `mem_camera` is also overridable: pass "all" (or "none") to encode ALL cameras in the memory
+    path -- required to faithfully serve checkpoints trained before the top-camera-only change
+    (e.g. yam_banana_memory_400m_v1) -- or a camera name like "base_0_rgb". Empty/None keeps the
+    training config's value.
     """
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
@@ -204,12 +209,22 @@ def create_trained_memory_policy(
         raise TypeError(f"Expected a Pi0Memory model, got {type(model).__name__}. Use a memory config.")
 
     for name, value in (mem_overrides or {}).items():
-        if value is None:
+        if value is None or value == "":
             continue
         if not hasattr(model, name):
-            raise ValueError(f"Unknown mem override '{name}' (expected one of mem_theta/mem_eta/mem_alpha).")
+            raise ValueError(
+                f"Unknown mem override '{name}' (expected mem_theta/mem_eta/mem_alpha/mem_camera/mem_x_scale)."
+            )
+        if name == "mem_camera":
+            # "all"/"none" -> None: encode all cameras (the pre-top-only behavior).
+            value = None if str(value).lower() in ("all", "none") else str(value)
+        elif name == "mem_x_scale":
+            # <= 0 -> None: disable encoding normalization (the pre-mem_x_scale behavior).
+            value = None if float(value) <= 0 else float(value)
+        else:
+            value = float(value)
         logging.info("Overriding %s: %s -> %s", name, getattr(model, name), value)
-        setattr(model, name, float(value))
+        setattr(model, name, value)
 
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:

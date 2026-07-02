@@ -139,6 +139,22 @@ class Pi0MemoryConfig(Pi0Config):
     mem_eta: float = 0.9
     mem_theta: float = 1e-2
     mem_alpha: float = 0.0
+    # Fixed L2 norm the pooled memory encoding x_t is rescaled to before the q/k/v projections
+    # (None disables and uses the raw pooled norm -- only for serving pre-normalization checkpoints).
+    # The online write recursion is surprise-momentum gradient descent whose curvature scales with
+    # ||x||^2; it has a hard stability cliff (measured ~||x||=450 at the trained 400M weights, inf
+    # within ~10 writes past it) and an unfrozen SigLIP drifts ||x|| across training -- this is what
+    # NaN'd the 400m v1/v2 runs at ~12k/~7k steps. 200 reproduces the empirically healthy operating
+    # point (first-write ||S|| ~ 0.2 at theta=1e-3, matching the stable robot-eval dynamics) and
+    # makes the write dynamics independent of encoder drift.
+    mem_x_scale: float | None = 200.0
+    # The single camera the memory path encodes (reads AND writes): x_t = pool(SigLIP(mem_camera) +
+    # prompt embed). Wrist views are excluded from the memory -- they dilute the pooled vector and
+    # inject arm-motion noise into the surprise objective. pi05's action path is unaffected and
+    # keeps all cameras. SigLIP encodes each camera independently, so the shared encoder serves both.
+    # None = encode ALL cameras (the pre-top-only behavior; needed to faithfully serve checkpoints
+    # trained before this option existed, e.g. yam_banana_memory_400m_v1).
+    mem_camera: str | None = "base_0_rgb"
     # Truncated BPTT depth for training: only the last mem_bptt_steps write steps are differentiated
     # by the outer loss; all earlier writes run forward-only (stop-gradient on the carry). Bounds the
     # unroll's activation memory (scales with batch_size * mem_bptt_steps * d_hidden) independently

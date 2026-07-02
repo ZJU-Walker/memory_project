@@ -856,9 +856,12 @@ _CONFIGS = [
         # ~400M online memory MLP: d_hidden=196608 (=192*1024; d_mem stays 1024, so the projections
         # + memory token interface are unchanged). mem_theta lowered from the 8.4M-tuned 1e-2 since
         # the wider layer has a larger surprise-gradient norm (sweep ~[3e-4, 3e-2]).
+        # mem_bptt_steps=4: even with the remat around each write step's update core, backward needs
+        # the (mem, surprise) carry saved at every differentiated step (~12.9 GB/step at batch 4).
+        # K=8 peaked at 137.6 GB and OOM'd the H200 (measured); K=4 lands around ~86 GB.
         model=(
             _pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(
-                pi05=True, d_hidden=196608, mem_theta=1e-3, freeze_vision=False
+                pi05=True, d_hidden=196608, mem_theta=1e-3, freeze_vision=False, mem_bptt_steps=4
             )
         ),
         data=LeRobotYamMemoryDataConfig(
@@ -874,8 +877,8 @@ _CONFIGS = [
         # At d_hidden=196608 the per-example memory weights carry a leading batch dim (w1/w2
         # ~800 MB/tensor/example fp32) and the last mem_bptt_steps write steps are differentiated
         # end-to-end, so the activation footprint scales with batch_size * mem_bptt_steps * d_hidden.
-        # batch_size=2 with mem_bptt_steps=8 fits one H200 (if OOM: mem_bptt_steps 8->4, then batch 1).
-        batch_size=2,
+        # batch_size=4 fits with mem_bptt_steps=4 (see the model comment above). If OOM: batch 4->2.
+        batch_size=4,
         # Each sample decodes ~(n_mem_max + 1) frames x 3 cameras, so loading is the throughput risk.
         num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(

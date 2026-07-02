@@ -69,6 +69,10 @@ uv run scripts/compute_norm_stats.py --config-name pi05_yam
 cd /iris/u/kewalk/memory_project/openpi
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
     uv run scripts/train.py pi05_yam --exp-name=yam_banana_pi05 --overwrite
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train_memory.py pi05_yam_memory \
+    --exp-name=yam_banana_pi05_mem_400m_v3 --overwrite
 ```
 
 Checkpoints land in `openpi/checkpoints/pi05_yam/yam_banana_pi05/`. Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` so JAX can use up to 90% of GPU memory.
@@ -82,6 +86,14 @@ cd /iris/u/kewalk/memory_project/openpi
 uv run scripts/serve_policy.py policy:checkpoint \
     --policy.config=pi05_yam \
     --policy.dir=/iris/u/kewalk/memory_project/openpi/checkpoints/pi05_yam/yam_banana_pi05/6000
+
+# v1 — 3-camera memory encoding, forced via mem_camera=all:
+uv run scripts/serve_policy_memory_v1.py \
+--policy.dir=checkpoints/pi05_yam_memory/yam_banana_memory_400m_v1/<step>
+
+# v2 — top-camera-only (training config default, nothing forced):
+uv run scripts/serve_policy_memory_v2.py \
+--policy.dir=checkpoints/pi05_yam_memory/yam_banana_memory_400m_v2/<step>
 ```
 
 `<step>` is the checkpoint iteration to load (e.g. `29999` for the final step of a 30k-step run). Run inside `tmux` so it survives terminal disconnects.

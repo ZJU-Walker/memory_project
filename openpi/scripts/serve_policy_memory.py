@@ -51,6 +51,15 @@ class Args:
     mem_theta: float | None = None
     mem_eta: float | None = None
     mem_alpha: float | None = None
+    # Fixed L2 norm for the pooled memory encoding (stability; see Pi0MemoryConfig.mem_x_scale).
+    # None keeps the checkpoint's trained value; 0 (or negative) disables normalization entirely --
+    # required to faithfully serve checkpoints trained before mem_x_scale existed.
+    mem_x_scale: float | None = None
+    # Memory-encoding camera override: "" keeps the training config's value (top camera only);
+    # "all" encodes all cameras -- required for checkpoints trained before the top-camera-only
+    # change (e.g. yam_banana_memory_400m_v1); or an explicit camera name like "base_0_rgb".
+    # Prefer the serve_policy_memory_v1.py / serve_policy_memory_v2.py wrappers, which set this.
+    mem_camera: str = ""
 
 
 def main(args: Args) -> None:
@@ -58,7 +67,13 @@ def main(args: Args) -> None:
         _config.get_config(args.policy.config),
         args.policy.dir,
         default_prompt=args.default_prompt,
-        mem_overrides={"mem_theta": args.mem_theta, "mem_eta": args.mem_eta, "mem_alpha": args.mem_alpha},
+        mem_overrides={
+            "mem_theta": args.mem_theta,
+            "mem_eta": args.mem_eta,
+            "mem_alpha": args.mem_alpha,
+            "mem_camera": args.mem_camera,
+            "mem_x_scale": args.mem_x_scale,
+        },
     )
 
     hostname = socket.gethostname()
