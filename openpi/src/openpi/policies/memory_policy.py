@@ -11,8 +11,8 @@ control keys placed in the observation dict, so the existing `WebsocketPolicySer
 
   - ``reset=True``       -> clear `(mem, surprise)` back to `M_0` (start a new episode). Returns an ack.
   - ``write_only=True``  -> run a single cheap memory write (SigLIP encode + MLP update, no LLM) and
-                            return an ack. The client sends these from a background thread (~10 Hz),
-                            decoupled from its control loop.
+                            return an ack. The client sends these from a background thread (~3 Hz,
+                            matching the training write spacing), decoupled from its control loop.
   - (neither)            -> an action step: write this frame, then sample a full action chunk with the
                             current memory. Returns ``{"state", "actions", "policy_timing"}``.
 

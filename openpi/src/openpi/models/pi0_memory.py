@@ -7,15 +7,22 @@ are updated *online* within an episode) and a "memory token" that is appended to
 
 Training uses a **causal split-cost unroll** (see memory_network_plan.md):
   - `compute_loss` receives a sequence of N causal observation frames `[B, N, ...]` plus a single
-    action chunk `[B, H, ad]` at the final frame `t`.
-  - The first `N-1` frames perform a **write-only** memory update (cheap: SigLIP `embed_prefix` +
-    an inner `jax.grad` surprise-momentum step, no LLM pass).
+    action chunk `[B, H, ad]` at the final frame `t`. The first N-1 frames are the episode's write
+    frames (fixed-stride, ~3 Hz, from the episode start; front-padded to a static length with
+    all-False image masks marking the padding -- see memory_data_loader.py).
+  - Each write frame performs a **write-only** memory update (cheap: SigLIP `embed_prefix` + an
+    inner `jax.grad` surprise-momentum step, no LLM pass). Writes are masked to no-ops on padded
+    frames. All write-frame encodings are wrapped in `stop_gradient`, so SigLIP never backprops
+    through write frames even when it is trainable (`freeze_vision=False`).
+  - **Truncated BPTT**: only the last `mem_bptt_steps` writes are differentiated by the outer loss
+    (Python loop); all earlier writes run forward-only inside a `jax.lax.scan` with the carry
+    stop-gradded at the boundary. This bounds activation memory independently of episode length.
   - The final frame reads the accumulated memory, appends the memory token to the prefix, and runs
     the single full LLM/action-expert forward to produce the flow-matching loss.
 
-The outer `nnx.value_and_grad` differentiates the whole unroll (including the inner `jax.grad`) into
-the slow params: `mem_{q,k,v}_proj`, `mem_out_proj`, the learned memory init `M_0`, and the base
-model (minus whatever the freeze filter excludes, e.g. vision).
+The outer `nnx.value_and_grad` differentiates the last-K writes + final read/forward into the slow
+params: `mem_{q,k,v}_proj`, `mem_out_proj`, the learned memory init `M_0`, and the base model
+(including SigLIP -- via the final action frame only -- unless the freeze filter excludes it).
 """
 
 import logging
@@ -35,11 +42,10 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-# Defined at module level so each initializer's function identity is stable across model
-# instantiations. Creating them inside __init__ yields a fresh closure each time, which makes the nnx
+# Defined at module level so the initializer's function identity is stable across model
+# instantiations. Creating it inside __init__ yields a fresh closure each time, which makes the nnx
 # graphdef differ between jax.eval_shape and the real init -> pjit out_shardings mismatch at train init.
 _MEM_ZERO_INIT = nnx.initializers.zeros_init()
-_MEM_GATE_BIAS_INIT = nnx.initializers.constant(-4.0)
 
 
 def mem_apply(mem: dict, z: at.Array) -> at.Array:
@@ -64,6 +70,8 @@ class Pi0Memory(Pi0):
         self.mem_eta = config.mem_eta
         self.mem_theta = config.mem_theta
         self.mem_alpha = config.mem_alpha
+        # Training-only: how many trailing write steps the outer loss differentiates (TBPTT depth).
+        self.mem_bptt_steps = config.mem_bptt_steps
 
         # Read/write projections (W_Q, W_K, W_V): pooled VLA encoding (2048) -> d_mem.
         self.mem_q_proj = nnx.Linear(self.embed_dim, self.d_mem, rngs=rngs)
@@ -71,18 +79,12 @@ class Pi0Memory(Pi0):
         self.mem_v_proj = nnx.Linear(self.embed_dim, self.d_mem, rngs=rngs)
         # Projects the retrieved memory r_t into a single prefix "memory token". Zero-init the kernel so
         # the token is *exactly* zero at step 0 and training starts as stock pi05 (no base-skill
-        # regression from a memory token perturbing the frozen policy). Gradients still flow into the
-        # whole memory chain (W_Q, M, and the gate below) because those paths are nonzero, so zero-init
-        # here does not dead-path them -- it only kills the constant offset the untrained token added.
+        # regression from an untrained memory token perturbing the policy). Zero-init does not
+        # dead-path training: the kernel's gradient (retrieved memory input x upstream signal) is
+        # nonzero, so the token grows as soon as memory content helps the action loss. (A sigmoid gate
+        # with a -4 bias was tried here and removed: it scaled every gradient into the memory
+        # subsystem by ~0.02 and the memory never trained.)
         self.mem_out_proj = nnx.Linear(self.d_mem, self.embed_dim, kernel_init=_MEM_ZERO_INIT, rngs=rngs)
-        # Input-conditioned gate on the memory token: token = sigmoid(w.x + b) * mem_out_proj(r). The
-        # bias starts strongly negative so the gate ~= sigmoid(-4) ~= 0.018 initially -- memory is
-        # silent during the motor phases (approach/grasp/place) that don't need it, and the action loss
-        # learns to *open* the gate only when the pooled context (e.g. a closed-lid recall scene) calls
-        # for memory. This is what stops the always-on token from eroding base skills.
-        self.mem_gate_proj = nnx.Linear(
-            self.embed_dim, 1, kernel_init=_MEM_ZERO_INIT, bias_init=_MEM_GATE_BIAS_INIT, rngs=rngs
-        )
 
         # Learned memory initialization M_0 (slow params, trained by the outer loss). Small-random
         # weights so the initial read r_t is small-but-nonzero (keeps gradients alive) and the
@@ -140,15 +142,14 @@ class Pi0Memory(Pi0):
         return self._surprise_update(mem, surprise, self.mem_k_proj(x), self.mem_v_proj(x))
 
     def _read_memory_token(self, prefix_tokens: at.Array, prefix_mask: at.Array, mem: dict) -> at.Array:
-        """r_t = M(W_Q x_t); memory token = gate(x_t) * mem_out_proj(r_t), cast to the prefix dtype.
+        """r_t = M(W_Q x_t); memory token = mem_out_proj(r_t), cast to the prefix dtype.
 
-        The scalar gate (sigmoid, strongly-negative bias init) keeps the token ~0 unless the pooled
-        context calls for memory, so the base policy is undisturbed during memory-irrelevant phases.
+        The token is exactly zero at init (zero-init mem_out_proj kernel), so an untrained memory
+        cannot disturb the base policy; its magnitude is learned by the action loss.
         """
         x = self._pool_prefix(prefix_tokens, prefix_mask)
         r = mem_apply(mem, self.mem_q_proj(x))
-        gate = nnx.sigmoid(self.mem_gate_proj(x))  # [B, 1], in (0, 1)
-        token = gate * self.mem_out_proj(r)
+        token = self.mem_out_proj(r)
         return token.astype(prefix_tokens.dtype)[:, None, :]
 
     @staticmethod
@@ -162,24 +163,74 @@ class Pi0Memory(Pi0):
 
     # ------------------------------------------------------------------ training
 
+    def _masked_write(
+        self,
+        mem: dict,
+        surprise: dict,
+        obs_i: _model.Observation,
+        rng_i: at.KeyArrayLike,
+        valid_i: at.Array,
+        *,
+        train: bool,
+    ) -> tuple[dict, dict]:
+        """One training write step, no-op'ed on padded frames.
+
+        `valid_i` is [B] bool derived from the loader's image masks (padded frames are all-False).
+        The frame encoding is stop-gradded so SigLIP (and the prompt embedder) never backprop through
+        write frames -- vision trains only via the final action frame. Gradients into mem_k/v_proj
+        and the memory itself sit after the stop and are unaffected.
+        """
+        obs_i = _model.preprocess_observation(rng_i, obs_i, train=train)
+        x_i = jax.lax.stop_gradient(self._encode(obs_i)).astype(jnp.float32)
+        new_mem, new_surprise = self._surprise_update(mem, surprise, self.mem_k_proj(x_i), self.mem_v_proj(x_i))
+
+        def keep(new: at.Array, old: at.Array) -> at.Array:
+            return jnp.where(valid_i.reshape((-1,) + (1,) * (new.ndim - 1)), new, old)
+
+        return jax.tree.map(keep, new_mem, mem), jax.tree.map(keep, new_surprise, surprise)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        # observation fields are [B, N, ...] (N causal frames); actions is [B, H, ad] at the final frame.
+        # observation fields are [B, N, ...] (N causal frames, front-padded to a static length by the
+        # memory data loader); actions is [B, H, ad] at the final frame.
         batch_size = observation.state.shape[0]
-        n = observation.state.shape[1]  # static under jit
+        n = observation.state.shape[1]  # static under jit; = n_mem_max + 1
         rngs = jax.random.split(rng, n + 1)
 
         mem = self.mem_init(batch_size)
         surprise = jax.tree.map(jnp.zeros_like, mem)
 
-        # Write-only memory updates over the first N-1 frames (no LLM, no read).
-        for i in range(n - 1):
-            obs_i = jax.tree.map(lambda a: a[:, i], observation)  # noqa: B023  (eager: i is concrete)
-            obs_i = _model.preprocess_observation(rngs[i], obs_i, train=train)
-            x_i = self._encode(obs_i).astype(jnp.float32)
-            mem, surprise = self._surprise_update(mem, surprise, self.mem_k_proj(x_i), self.mem_v_proj(x_i))
+        # Padding marker from the loader: padded frames carry all-False image masks.
+        valid = jnp.stack(list(observation.image_masks.values()), axis=0).any(axis=0)  # [B, N]
+
+        n_write = n - 1
+        k = min(self.mem_bptt_steps, n_write)
+        n_fwd = n_write - k
+
+        # Phase A (TBPTT): all but the last k writes run forward-only inside a scan (a Python loop
+        # over ~100 SigLIP graphs would blow up compile). Stop-gradding the carry at the boundary
+        # means the outer grad never unrolls through these steps, so no activations are kept and the
+        # unroll's memory footprint is bounded by k, not by episode length.
+        if n_fwd > 0:
+            xs = (
+                jax.tree.map(lambda a: jnp.moveaxis(a[:, :n_fwd], 1, 0), observation),
+                rngs[:n_fwd],
+                jnp.moveaxis(valid[:, :n_fwd], 1, 0),
+            )
+
+            def write_step(carry, xs_i):
+                obs_i, rng_i, valid_i = xs_i
+                return self._masked_write(*carry, obs_i, rng_i, valid_i, train=train), None
+
+            (mem, surprise), _ = jax.lax.scan(write_step, (mem, surprise), xs)
+            mem, surprise = jax.tree.map(jax.lax.stop_gradient, (mem, surprise))
+
+        # Phase B: the last k writes, differentiated end-to-end (the original unrolled loop).
+        for i in range(n_fwd, n_write):
+            obs_i = jax.tree.map(lambda a, i=i: a[:, i], observation)
+            mem, surprise = self._masked_write(mem, surprise, obs_i, rngs[i], valid[:, i], train=train)
 
         # Final frame t: read memory + single full forward + flow-matching loss.
         obs_t = jax.tree.map(lambda a: a[:, n - 1], observation)

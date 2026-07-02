@@ -139,8 +139,16 @@ class Pi0MemoryConfig(Pi0Config):
     mem_eta: float = 0.9
     mem_theta: float = 1e-2
     mem_alpha: float = 0.0
-    # Freeze the SigLIP vision tower so the N-1 write-only memory frames are forward-only/cacheable.
-    # Still joint-trains the Gemma LLM + action expert + memory module.
+    # Truncated BPTT depth for training: only the last mem_bptt_steps write steps are differentiated
+    # by the outer loss; all earlier writes run forward-only (stop-gradient on the carry). Bounds the
+    # unroll's activation memory (scales with batch_size * mem_bptt_steps * d_hidden) independently
+    # of how many write frames an episode contributes. The write projections are shared across steps,
+    # so behavior learned on the last K steps generalizes to the earlier forward-only writes.
+    mem_bptt_steps: int = 8
+    # Freeze the SigLIP vision tower. Pi0Memory.compute_loss stop-grads the write-frame encodings, so
+    # the write frames are forward-only regardless of this flag; freeze_vision=False additionally
+    # lets the final action frame tune SigLIP (equivalent to the non-memory baseline finetune).
+    # Default True matches the v1 (8.4M) runs.
     freeze_vision: bool = True
 
     @override

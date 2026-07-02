@@ -409,8 +409,13 @@ class LeRobotYamMemoryDataConfig(LeRobotYamDataConfig):
     """YAM data config for the memory model: identical transforms to LeRobotYamDataConfig, plus
     episode-sequence sampling params consumed by memory_data_loader.create_memory_data_loader."""
 
-    # Number of causal observation frames per item (including the final action/loss frame).
-    n_mem: int = 16
+    # Memory write frames are sampled at a fixed stride from the episode start up to (excluding) the
+    # action frame t: indices [start, start+stride, ...] < t. At the dataset's 30 fps, stride 10 = 3 Hz.
+    mem_stride: int = 10
+    # Max write frames per item. Sequences are front-padded (all-False image masks mark the padding)
+    # to a fixed n_mem_max + 1 frames (writes + the final action/loss frame) so shapes are static
+    # under jit. 96 covers the longest episode (1002 frames / stride 10) with no truncation.
+    n_mem_max: int = 96
     # How to sample the action-frame t: "recall_weighted" (bias to the back third) or "uniform".
     t_sampling: str = "recall_weighted"
 
@@ -842,28 +847,37 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     # MAC-style online episodic memory on top of pi05 for the YAM bin_memory_banana task. Additive:
-    # the pi05_yam baseline above is left untouched. Joint finetune from pi05_base with SigLIP frozen
-    # (freeze_vision=True); memory params are kept at init by the weight loader's missing_regex.
+    # the pi05_yam baseline above is left untouched. Joint finetune from pi05_base with SigLIP
+    # trainable (freeze_vision=False) like the baseline -- Pi0Memory.compute_loss stop-grads the
+    # write-frame encodings, so SigLIP only backprops through the final action frame regardless.
+    # Memory params are kept at init by the weight loader's missing_regex.
     TrainConfig(
         name="pi05_yam_memory",
-        # ~100M online memory MLP: d_hidden 4096 -> 49152 (d_mem stays 1024, so the frozen
-        # projections + memory token are unchanged). mem_theta lowered from the 8.4M-tuned 1e-2 since
-        # the 12x-wider layer has a larger surprise-gradient norm (sweep ~[3e-4, 3e-2]).
-        model=(_pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(pi05=True, d_hidden=49152, mem_theta=1e-3)),
+        # ~400M online memory MLP: d_hidden=196608 (=192*1024; d_mem stays 1024, so the projections
+        # + memory token interface are unchanged). mem_theta lowered from the 8.4M-tuned 1e-2 since
+        # the wider layer has a larger surprise-gradient norm (sweep ~[3e-4, 3e-2]).
+        model=(
+            _pi05_yam_memory_model := pi0_config.Pi0MemoryConfig(
+                pi05=True, d_hidden=196608, mem_theta=1e-3, freeze_vision=False
+            )
+        ),
         data=LeRobotYamMemoryDataConfig(
             repo_id="yam/bin_memory_banana",
             default_prompt="find the bin with banana",
-            n_mem=16,
+            mem_stride=10,
+            n_mem_max=96,
         ),
         freeze_filter=_pi05_yam_memory_model.get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*(lora|mem_).*"
         ),
-        # Reduced from 8: at d_hidden=49152 the per-example memory weights carry a leading batch dim
-        # (w1/w2 ~1.6 GB/tensor/example) and the n_mem=16 unroll is differentiated end-to-end, so the
-        # activation footprint scales with batch_size * n_mem * d_hidden. batch_size=2 fits one H200.
+        # At d_hidden=196608 the per-example memory weights carry a leading batch dim (w1/w2
+        # ~800 MB/tensor/example fp32) and the last mem_bptt_steps write steps are differentiated
+        # end-to-end, so the activation footprint scales with batch_size * mem_bptt_steps * d_hidden.
+        # batch_size=2 with mem_bptt_steps=8 fits one H200 (if OOM: mem_bptt_steps 8->4, then batch 1).
         batch_size=2,
-        num_workers=4,
+        # Each sample decodes ~(n_mem_max + 1) frames x 3 cameras, so loading is the throughput risk.
+        num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,

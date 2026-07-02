@@ -6,7 +6,8 @@ online episodic memory `(mem, surprise)` server-side.
 
 Cadence (per the design): memory writes are decoupled from the control loop. A background daemon
 thread sends cheap **write-only** messages (server runs `memory_write`, no LLM) at ~``write_hz``
-(default 10 Hz), always using the most recent frame published by the control loop. The 30 Hz control
+(default 3 Hz, matching the training write spacing), always using the most recent frame published
+by the control loop. The 30 Hz control
 loop itself never blocks on writes; it only sends an **action** message when the current 50-step
 action chunk is exhausted (server writes that frame *and* samples a fresh chunk conditioned on the
 current memory). Both threads share one websocket, serialized by a lock. At episode start we send a
@@ -202,9 +203,10 @@ class Args:
     action_horizon (pi05_yam_memory = 50); a smaller value re-samples (and re-reads memory) sooner."""
     max_steps: int = 12000
     hz: float = 30.0
-    write_hz: float = 10.0
+    write_hz: float = 3.0
     """Rate of the background memory-write thread. Writes run off the control loop's latest frame in
-    a daemon thread, so the control loop only blocks on the network for action requests."""
+    a daemon thread, so the control loop only blocks on the network for action requests. Default 3.0
+    matches the training write spacing (stride-10 frames at the dataset's 30 fps)."""
     prompt: str = PROMPT
     max_joint_delta: float = 1.0
     """Per-step safety clamp: cap |target - current| across all joints to this many radians."""
@@ -364,6 +366,13 @@ def main(args: Args) -> None:
     # --- New episode: clear server memory, and get the first action chunk ---
     logging.info("Resetting server memory for a new episode...")
     out = ws.infer({**_obs_to_request(obs, args.prompt), "reset": True})
+    if "mem_delta" not in out:
+        # The stock stateless server (serve_policy.py) answers these requests too -- it just ignores
+        # reset/write_only and never returns memory stats, so the run silently has no memory.
+        raise RuntimeError(
+            f"Server at {args.host}:{args.port} is not a memory server (no mem stats in response). "
+            "Launch it with scripts/serve_policy_memory.py --policy.config=pi05_yam_memory."
+        )
     chunk = np.asarray(out["actions"], dtype=np.float64)  # (50, 14)
     chunk_i = 0
 
