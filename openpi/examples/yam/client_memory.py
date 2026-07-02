@@ -194,7 +194,7 @@ class _BackgroundMemoryWriter:
 @dataclasses.dataclass
 class Args:
     # --- Policy server (remote GPU box) ---
-    host: str = "10.79.12.149"
+    host: str = "10.79.12.252"
     port: int = 8000
 
     # --- Inference / control ---
