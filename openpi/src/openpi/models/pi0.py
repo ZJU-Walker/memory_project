@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.predict_subtask = config.predict_subtask
+        self.ce_loss_weight = config.ce_loss_weight
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -105,7 +107,7 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Int[at.Array, "b s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
@@ -121,19 +123,23 @@ class Pi0(_model.BaseModel):
                     s=image_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+            # image tokens attend to each other --> AR mask = 0
+            ar_mask.append(0 * input_mask[-1])
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if obs.token_ar_mask is not None:
+                # per-sample AR mask (subtask co-training: causal subtask + FAST branches)
+                ar_mask.append(obs.token_ar_mask)
+            else:
+                # full attention between image and language inputs
+                ar_mask.append(0 * obs.tokenized_prompt_mask)
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        ar_mask = jnp.concatenate(ar_mask, axis=1).astype(jnp.int32)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -188,7 +194,7 @@ class Pi0(_model.BaseModel):
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> at.Float[at.Array, "*b ah"] | dict[str, at.Array]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -199,19 +205,67 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+
+        if not self.predict_subtask:
+            # one big forward pass of prefix + suffix at once
+            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+            suffix_ar = jnp.broadcast_to(suffix_ar_mask.astype(jnp.int32), suffix_mask.shape)
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar], axis=1)
+            attn_mask = make_attn_mask(input_mask, ar_mask)
+            positions = jnp.cumsum(input_mask, axis=1) - 1
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+        # Subtask + FAST co-training (knowledge insulation): the VLM backbone is trained by a
+        # next-token CE on the subtask + FAST tokens (pass 1); the action expert is trained by flow
+        # matching against a stop-gradient'ed prefix (pass 2). With all token masks zero this is
+        # mathematically equivalent to the joint pass above.
+
+        # Pass 1: prefix through the VLM expert only, exactly like the prefill in `sample_actions`.
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions
+        )
+
+        # Next-token CE over the text region of the prefix: position i predicts token i+1.
+        text_out = prefix_out[:, -self.max_token_len :]
+        logits = self.PaliGemma.llm(text_out[:, :-1], method="decode").astype(jnp.float32)
+        targets = observation.tokenized_prompt[:, 1:]
+        loss_mask = observation.token_loss_mask[:, 1:]
+        token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), targets[..., None], axis=-1)[..., 0]
+        ce_loss = -jnp.sum(token_logp * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, axis=-1), 1)
+
+        # Pass 2: suffix through the action expert, attending to the cached prefix. The stop
+        # gradient insulates the VLM from the flow loss. The FAST branch exists only at training
+        # time, so it is hidden from the suffix in both attention and the position offset -- the
+        # action expert sees the same prefix geometry as at inference time.
+        kv_cache = jax.lax.stop_gradient(kv_cache)
+        num_img_tokens = prefix_mask.shape[1] - self.max_token_len
+        fast_mask = jnp.concatenate(
+            [jnp.zeros((prefix_mask.shape[0], num_img_tokens), dtype=bool), observation.token_fast_mask], axis=1
+        )
+        suffix_view = prefix_mask & ~fast_mask
+        prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(suffix_view, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return {"flow": jnp.mean(jnp.square(v_t - u_t), axis=-1), "ce": ce_loss}
 
     @override
     def sample_actions(

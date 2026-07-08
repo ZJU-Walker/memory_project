@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -90,6 +91,10 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # If true, will use the LeRobot dataset task to define the per-frame subtask (stored in the
+    # "subtask" field, separate from the "prompt" field which carries the high-level instruction).
+    subtask_from_task: bool = False
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -125,6 +130,19 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
+                if model_config.predict_subtask:
+                    # Subtask + FAST co-training: the prompt additionally carries the subtask and
+                    # the FAST-tokenized actions as CE targets for the VLM backbone.
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizeFASTSubtaskInputs(
+                                _tokenizer.FASTSubtaskTokenizer(model_config.max_token_len),
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -347,6 +365,54 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamDataConfig(DataConfigFactory):
+    """Data config for the bimanual YAM dataset (3 cameras, 14-dim state/action)."""
+
+    # The dataset has no per-frame language instruction; inject a fixed high-level prompt.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap the keys produced by examples/yam/convert_yam_data_to_lerobot.py to the keys our
+        # policy transform expects. The repack transform drops every key not listed here, so the
+        # per-frame subtask (added by SubtaskFromLeRobotTask when `subtask_from_task` is set) has
+        # to be carried through explicitly.
+        structure = {
+            "observation/image": "image",
+            "observation/left_wrist_image": "left_wrist_image",
+            "observation/right_wrist_image": "right_wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+        }
+        if self.base_config is not None and self.base_config.subtask_from_task:
+            structure["subtask"] = "subtask"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(structure)])
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamInputs(model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # The dataset stores absolute joint-position targets, so convert to delta actions for
+        # training (and back to absolute at inference). Delta on the 6 arm joints of each arm,
+        # gripper stays absolute (the -1 entries): mask = [6 True, 1 False, 6 True, 1 False].
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -915,6 +981,32 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # Bimanual YAM configs.
+    #
+    TrainConfig(
+        # Fine-tune pi05_base on the bimanual YAM `bin_memory_banana` dataset (3 cameras, delta
+        # actions). The per-frame LeRobot `task` field carries the subtask label; the high-level
+        # prompt is injected via `default_prompt`.
+        name="pi05_yam",
+        model=pi0_config.Pi0Config(pi05=True, predict_subtask=True),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_banana_subtask",
+            default_prompt="find the bin with banana",
+            base_config=DataConfig(subtask_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

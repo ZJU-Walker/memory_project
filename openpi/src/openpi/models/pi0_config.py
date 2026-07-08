@@ -32,6 +32,13 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # If true, the VLM backbone is additionally supervised with a next-token CE loss on the
+    # per-frame subtask text + FAST-tokenized actions (knowledge-insulation-style co-training).
+    # Only supported for pi05.
+    predict_subtask: bool = False
+    # Weight of the token CE loss relative to the flow matching loss.
+    ce_loss_weight: float = 1.0
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -39,6 +46,8 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.predict_subtask and not self.pi05:
+            raise ValueError("predict_subtask is only supported for pi05.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -80,6 +89,15 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                **(
+                    {
+                        "token_ar_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                        "token_loss_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                        "token_fast_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                    }
+                    if self.predict_subtask
+                    else {}
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

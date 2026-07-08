@@ -289,6 +289,34 @@ class TokenizeFASTInputs(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeFASTSubtaskInputs(DataTransformFn):
+    tokenizer: _tokenizer.FASTSubtaskTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+
+        # The subtask is only present during training. Pop it so no string reaches the batch.
+        if (subtask := data.pop("subtask", None)) is not None and not isinstance(subtask, str):
+            subtask = subtask.item()
+
+        # Actions stay in the dict: they are still the flow matching target of the action expert.
+        state, actions = data["state"], data.get("actions")
+        tokens, token_mask, ar_mask, loss_mask, fast_mask = self.tokenizer.tokenize(prompt, state, subtask, actions)
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+            "token_fast_mask": fast_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ExtractFASTActions(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
     action_horizon: int
@@ -322,6 +350,28 @@ class PromptFromLeRobotTask(DataTransformFn):
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class SubtaskFromLeRobotTask(DataTransformFn):
+    """Extracts a per-frame subtask string from the current LeRobot dataset task.
+
+    Unlike `PromptFromLeRobotTask`, the result is stored in the "subtask" field, leaving the
+    "prompt" field free to carry the high-level task instruction (e.g. via `InjectDefaultPrompt`).
+    """
+
+    # Contains the LeRobot dataset tasks (dataset.meta.tasks).
+    tasks: dict[int, str]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "task_index" not in data:
+            raise ValueError('Cannot extract subtask without "task_index"')
+
+        task_index = int(data["task_index"])
+        if (subtask := self.tasks.get(task_index)) is None:
+            raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
+
+        return {**data, "subtask": subtask}
 
 
 @dataclasses.dataclass(frozen=True)

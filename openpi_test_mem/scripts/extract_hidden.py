@@ -74,7 +74,6 @@ def make_probe(model: pi0.Pi0, layer: int):
             [prefix_tokens, None], mask=attn_mask, positions=positions, return_prefix_hiddens=True
         )
         return hiddens[layer, :, :NUM_PATCHES, :].astype(jnp.float32)  # [B, 256, 2048]
-
     return functools.partial(probe, state)
 
 

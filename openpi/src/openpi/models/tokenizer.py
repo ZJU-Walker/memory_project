@@ -139,6 +139,82 @@ class FASTTokenizer:
         return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
 
 
+class FASTSubtaskTokenizer(FASTTokenizer):
+    """FAST tokenizer variant that inserts a subtask segment between the prefix and the FAST branch:
+
+        Task: {prompt}, State: {state};\\n{subtask}\\nAction: <FAST tokens>|<eos>
+
+    Both the subtask and the FAST branch are causal next-token CE targets for the VLM backbone
+    (knowledge-insulation-style co-training with the flow matching action expert). The extra
+    `fast_mask` marks the FAST branch, which exists only at training time and must be hidden from
+    the action expert (attention and positions) to avoid leaking the action targets.
+    """
+
+    def tokenize(  # type: ignore[override]
+        self, prompt: str, state: np.ndarray, subtask: str | None, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        # Subtask segment, terminated by "\n" (the stop signal when generating the subtask).
+        subtask_tokens = []
+        if subtask is not None:
+            cleaned_subtask = subtask.lower().strip().replace("_", " ")
+            subtask_tokens = self._paligemma_tokenizer.encode(cleaned_subtask + "\n")
+
+        # FAST branch, same convention as FASTTokenizer: 'Action: ' + FAST tokens + '|' + eos.
+        fast_tokens = []
+        if actions is not None:
+            action_tokens = self._fast_tokenizer(actions[None])[0]
+            fast_tokens = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + self._act_tokens_to_paligemma_tokens(action_tokens).tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+
+        # AR mask is 0 on the prefix (bidirectional attention) and 1 on the subtask + FAST branches
+        # (causal attention); the CE loss covers exactly the causal region.
+        tokens = prefix_tokens + subtask_tokens + fast_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * (len(subtask_tokens) + len(fast_tokens))
+        loss_mask = [False] * len(prefix_tokens) + [True] * (len(subtask_tokens) + len(fast_tokens))
+        fast_mask = [False] * (len(prefix_tokens) + len(subtask_tokens)) + [True] * len(fast_tokens)
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+            fast_mask = fast_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+            fast_mask = fast_mask[: self._max_len]
+
+        return (
+            np.asarray(tokens),
+            np.asarray(token_mask),
+            np.asarray(ar_mask),
+            np.asarray(loss_mask),
+            np.asarray(fast_mask),
+        )
+
+
 ###########################################################################
 ## The tokenizers below are used for RoboArena baseline implementations. ##
 ## They are *not* used for pi0-style models.                             ##
