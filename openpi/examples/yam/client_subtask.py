@@ -191,12 +191,16 @@ def _clamp_joint_delta(target: np.ndarray, current: np.ndarray, max_delta: float
 
 def _run_dry(policy, args: Args) -> None:
     """Validate the obs/action contract with random data -- no hardware needed."""
-    from openpi.policies import yam_policy
-
     logging.info("Dry run: sending %d random observations to the server...", 5)
+    rng = np.random.default_rng(0)
     for i in range(5):
-        example = yam_policy.make_yam_example()
-        example["prompt"] = args.prompt
+        example = {
+            "observation/state": rng.random(BIMANUAL_DOF).astype(np.float32),
+            "observation/image": rng.integers(256, size=(480, 640, 3), dtype=np.uint8),
+            "observation/left_wrist_image": rng.integers(256, size=(480, 640, 3), dtype=np.uint8),
+            "observation/right_wrist_image": rng.integers(256, size=(480, 640, 3), dtype=np.uint8),
+            "prompt": args.prompt,
+        }
         result = policy.infer(example)
         action = np.asarray(result["actions"])
         assert action.shape == (BIMANUAL_DOF,), f"expected (14,) per broker step, got {action.shape}"
