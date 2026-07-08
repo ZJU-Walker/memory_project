@@ -88,17 +88,18 @@ def _load_frame_subtasks(demo: pathlib.Path, num_frames: int) -> list[str] | Non
 def main(
     data_dir: str = "/iris/u/kewalk/memory_project/data/bin_memory_banana",
     *,
+    repo_name: str = REPO_NAME,
     push_to_hub: bool = False,
 ):
     data_path = pathlib.Path(data_dir)
 
     # Clean up any existing dataset in the output directory.
-    output_path = HF_LEROBOT_HOME / REPO_NAME
+    output_path = HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
 
     dataset = LeRobotDataset.create(
-        repo_id=REPO_NAME,
+        repo_id=repo_name,
         robot_type="yam",
         fps=FPS,
         features={
@@ -156,18 +157,18 @@ def main(
         right = _read_video_frames(demo / "right_camera_rgb.mp4")
 
         # Guard against off-by-one between proprio and video frame counts.
-        T = min(len(state), len(actions), len(top), len(left), len(right))
-        if T == 0:
+        num_frames = min(len(state), len(actions), len(top), len(left), len(right))
+        if num_frames == 0:
             print(f"  skipping {demo.name}: no frames")
             continue
 
-        subtasks = _load_frame_subtasks(demo, T)
+        subtasks = _load_frame_subtasks(demo, num_frames)
         if subtasks is None:
             print(f"  skipping {demo.name}: incomplete subtask_labels.json")
             continue
-        print(f"  {demo.name}: {T} frames, {len(set(subtasks))} subtasks")
+        print(f"  {demo.name}: {num_frames} frames, {len(set(subtasks))} subtasks")
 
-        for t in range(T):
+        for t in range(num_frames):
             dataset.add_frame(
                 {
                     "image": top[t],

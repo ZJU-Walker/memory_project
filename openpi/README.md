@@ -1,3 +1,23 @@
+# training commands:
+```
+# 1. Compute normalization statistics for your dataset (required before training):
+uv run scripts/compute_norm_stats.py --config-name <your_config_name>
+# 2. Train a model on your dataset:
+uv run scripts/train.py pi05_yam --exp-name=<name> --overwrite
+```
+# offline eval commands:
+```
+uv run python scripts/eval_yam_subtask.py
+```
+
+# realtime eval commands:
+```
+# on server:
+uv run scripts/serve_yam_subtask.py --dir checkpoints/pi05_yam/pi05_yam_KI_test/<step>
+# on client:
+uv run python examples/yam/client_subtask.py --host
+```
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

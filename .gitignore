@@ -7,3 +7,4 @@ gello_software/
 data/
 *.mp4
 eval/
+openpi/scripts/eval_results/

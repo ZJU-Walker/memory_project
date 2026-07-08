@@ -15,6 +15,8 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+PALIGEMMA_EOS_TOKEN = 1
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -331,3 +333,166 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def _decode_subtask(self, preprocessed: _model.Observation, *, stop_token: int, max_decode_steps: int):
+        """Prefill + greedy AR decoding of the subtask, using the indexed KV cache.
+
+        Returns the updated (prompt, prompt_mask, ar_mask) text arrays plus everything needed to
+        run the flow denoising against the same cache: (kv_cache, prefix_mask, n0, num_img).
+        Generated tokens are written both into the text arrays (at each sample's own cursor) and
+        into the appended cache slots [prefix_len:] shared across samples; their RoPE positions
+        continue each sample's own sequence, so the geometry matches training exactly.
+        """
+        # embed the images once; only the newest token is embedded per decoding step
+        img_tokens = []
+        img_masks = []
+        for name in preprocessed.images:
+            image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            img_tokens.append(image_tokens)
+            img_masks.append(einops.repeat(preprocessed.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+        img_tokens = jnp.concatenate(img_tokens, axis=1)
+        img_mask = jnp.concatenate(img_masks, axis=1)
+
+        prompt = preprocessed.tokenized_prompt
+        prompt_mask = preprocessed.tokenized_prompt_mask
+        ar = (
+            preprocessed.token_ar_mask
+            if preprocessed.token_ar_mask is not None
+            else jnp.zeros(prompt.shape, dtype=jnp.int32)
+        )
+        batch, text_len = prompt.shape
+        num_img = img_mask.shape[1]
+        prefix_len = num_img + text_len
+        batch_idx = jnp.arange(batch)
+        n0 = jnp.sum(prompt_mask, axis=-1).astype(jnp.int32)  # [b] first free slot in the text region
+
+        # prefill through the standard path, then pad the cache with slots for the generated tokens
+        prefix_tokens = jnp.concatenate([img_tokens, self.PaliGemma.llm(prompt, method="embed")], axis=1)
+        prefix_mask = jnp.concatenate([img_mask, prompt_mask], axis=1)
+        prefix_ar = jnp.concatenate([0 * img_mask, ar], axis=1).astype(jnp.int32)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=attn_mask, positions=positions)
+        kv_cache = jax.tree.map(
+            lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, max_decode_steps), (0, 0), (0, 0))), kv_cache
+        )
+
+        def greedy(hidden):  # [b, emb] -> [b] next token
+            logits = self.PaliGemma.llm(hidden[:, None], method="decode")[:, 0]
+            return jnp.argmax(logits, axis=-1).astype(prompt.dtype)
+
+        def write(carry, token, k):
+            """Appends `token` as the k-th generated token of every unfinished sample."""
+            prompt, prompt_mask, ar, done = carry
+            idx = jnp.minimum(n0 + k, text_len - 1)
+            keep = done | (n0 + k >= text_len)  # already stopped, or the text region is full
+            prompt = prompt.at[batch_idx, idx].set(jnp.where(keep, prompt[batch_idx, idx], token))
+            prompt_mask = prompt_mask.at[batch_idx, idx].set(jnp.where(keep, prompt_mask[batch_idx, idx], True))  # noqa: FBT003
+            ar = ar.at[batch_idx, idx].set(jnp.where(keep, ar[batch_idx, idx], 1))
+            done = keep | (token == stop_token) | (token == PALIGEMMA_EOS_TOKEN)
+            return prompt, prompt_mask, ar, done
+
+        # the first generated token comes from the prefill output at each sample's last valid position
+        token0 = greedy(prefix_out[batch_idx, num_img + n0 - 1])
+        written = write((prompt, prompt_mask, ar, jnp.zeros(batch, dtype=bool)), token0, 0)
+
+        def cond(carry):
+            _, _, _, done, _, _, k = carry
+            return (k < max_decode_steps) & ~jnp.all(done)
+
+        def step(carry):
+            prompt, prompt_mask, ar, done, prev, kv_cache, k = carry
+            # feed the previous token: its k/v land in cache slot prefix_len + k - 1
+            tok_emb = self.PaliGemma.llm(prev[:, None], method="embed")
+            pos = (num_img + n0 + k - 1)[:, None]
+            gen_valid = jnp.arange(max_decode_steps)[None, :] < k  # cache slots of generated tokens 0..k-1
+            step_mask = jnp.concatenate(
+                [prefix_mask, jnp.broadcast_to(gen_valid, (batch, max_decode_steps))], axis=1
+            )
+            (out, _), kv_cache = self.PaliGemma.llm(
+                [tok_emb, None],
+                mask=step_mask[:, None, :],
+                positions=pos,
+                kv_cache=kv_cache,
+                cache_position=prefix_len + k - 1,
+            )
+            token = greedy(out[:, 0])
+            prompt, prompt_mask, ar, done = write((prompt, prompt_mask, ar, done), token, k)
+            return prompt, prompt_mask, ar, done, token, kv_cache, k + 1
+
+        carry = (*written, token0, kv_cache, jnp.asarray(1, dtype=jnp.int32))
+        prompt, prompt_mask, ar, _, _, kv_cache, _ = jax.lax.while_loop(cond, step, carry)
+        return prompt, prompt_mask, ar, kv_cache, prefix_mask, n0, num_img
+
+    def sample_subtask(
+        self, observation: _model.Observation, *, stop_token: int, max_decode_steps: int = 10
+    ) -> _model.Observation:
+        """Greedily decodes the subtask from the VLM backbone and returns the observation with the
+        generated tokens appended to the prompt (input/ar masks updated). Per-sample generation
+        stops on `stop_token` (the trained subtask terminator "\\n") or the PaliGemma EOS token.
+        """
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prompt, prompt_mask, ar, *_ = self._decode_subtask(
+            preprocessed, stop_token=stop_token, max_decode_steps=max_decode_steps
+        )
+        return observation.replace(tokenized_prompt=prompt, tokenized_prompt_mask=prompt_mask, token_ar_mask=ar)
+
+    def sample_subtask_and_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        stop_token: int,
+        max_decode_steps: int = 10,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, _model.Observation]:
+        """Fused inference: one prefill, AR subtask decoding, then flow denoising against the same
+        KV cache (the actions are conditioned on the freshly decoded subtask). Returns the actions
+        and the observation with the decoded subtask appended to the prompt.
+        """
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prompt, prompt_mask, ar, kv_cache, prefix_mask, n0, num_img = self._decode_subtask(
+            preprocessed, stop_token=stop_token, max_decode_steps=max_decode_steps
+        )
+        batch = prompt.shape[0]
+
+        # The suffix attends to the valid prefix slots plus each sample's generated cache slots,
+        # at positions continuing after them -- the same geometry as compute_loss pass 2.
+        gen_len = jnp.sum(prompt_mask, axis=-1).astype(jnp.int32) - n0
+        gen_valid = jnp.arange(max_decode_steps)[None, :] < gen_len[:, None]
+        suffix_view = jnp.concatenate([prefix_mask, gen_valid], axis=1)
+        offset = jnp.sum(suffix_view, axis=-1)
+
+        dt = -1.0 / num_steps
+        if noise is None:
+            noise = jax.random.normal(rng, (batch, self.action_horizon, self.action_dim))
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                preprocessed, x_t, jnp.broadcast_to(time, batch)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = offset[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        observation = observation.replace(
+            tokenized_prompt=prompt, tokenized_prompt_mask=prompt_mask, token_ar_mask=ar
+        )
+        return x_0, observation
