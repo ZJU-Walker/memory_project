@@ -94,6 +94,10 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the per-frame subtask (stored in the
     # "subtask" field, separate from the "prompt" field which carries the high-level instruction).
     subtask_from_task: bool = False
+    # If > 0 (with subtask_from_task), the subtask label is taken this many frames in the future
+    # (clamped at the episode end): the subtask conditions the *upcoming* action chunk, so it
+    # should describe what the robot is about to do rather than what it is doing right now.
+    subtask_lookahead: int = 0
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -994,7 +998,7 @@ _CONFIGS = [
         data=LeRobotYamDataConfig(
             repo_id="yam/bin_memory_banana_subtask",
             default_prompt="find the bin with banana",
-            base_config=DataConfig(subtask_from_task=True),
+            base_config=DataConfig(subtask_from_task=True, subtask_lookahead=15),
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(

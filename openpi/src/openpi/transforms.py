@@ -367,7 +367,8 @@ class SubtaskFromLeRobotTask(DataTransformFn):
         if "task_index" not in data:
             raise ValueError('Cannot extract subtask without "task_index"')
 
-        task_index = int(data["task_index"])
+        # A scalar, or a length-1 sequence when the loader delivers a lookahead task_index.
+        task_index = int(np.asarray(data["task_index"]).item())
         if (subtask := self.tasks.get(task_index)) is None:
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
