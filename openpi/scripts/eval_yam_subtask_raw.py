@@ -31,9 +31,9 @@ import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 
-CKPT = pathlib.Path("/iris/u/kewalk/memory_project/openpi/checkpoints/pi05_yam/pi05_yam_KI_test/5000")
+CKPT = pathlib.Path("/iris/u/kewalk/memory_project/openpi/checkpoints/pi05_yam/pi05_yam_KI/10000")
 RAW_DEMO = pathlib.Path("/iris/u/kewalk/memory_project/data/held_out_eval/demo2")
-STRIDE = 50  # evaluate every stride-th frame of the demo
+STRIDE = 1  # evaluate every stride-th frame of the demo
 BATCH_SIZE = 32
 MAX_DECODE_STEPS = 10
 UPSCALE = 3  # video frames are the 224px model inputs, upscaled by this factor
