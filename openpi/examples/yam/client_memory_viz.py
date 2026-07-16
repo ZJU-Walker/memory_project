@@ -22,6 +22,58 @@ Smoke-test the contract without hardware:
 Camera-load note: each camera read blocks on the next RealSense frame behind the node's serial
 ZMQ socket, so heavy polling would slow the 30 Hz teleop loop. The display therefore reads the
 top camera at a modest `display_hz` (default 5) and the wrist cameras only at prediction time.
+
+
+(gello_software) david@SOE-JSTFL84:~/memory_project/openpi$ python examples/yam/client_memory_viz.py 
+INFO:root:Waiting for server at ws://10.79.12.252:8000...
+INFO:root:Server metadata: {}
+INFO:root:top camera node on 127.0.0.1:5000 is up.
+INFO:root:left camera node on 127.0.0.1:5001 is up.
+INFO:root:right camera node on 127.0.0.1:5002 is up.
+INFO:root:robot node on 127.0.0.1:6001 is up.
+INFO:root:Attached: top (480, 640, 3) | state (14,)
+INFO:root:Memory reset (fresh episode).
+INFO:root:Recording overlaid top camera to eval/memory_viz_20260715_185840.mp4 @ 15.0 Hz
+QFontDatabase: Cannot find font directory /home/david/gello_software/.venv/lib/python3.11/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/david/gello_software/.venv/lib/python3.11/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/david/gello_software/.venv/lib/python3.11/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/david/gello_software/.venv/lib/python3.11/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/david/gello_software/.venv/lib/python3.11/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+INFO:root:Saved recording: eval/memory_viz_20260715_185840.mp4 (0 frames)
+Traceback (most recent call last):
+  File "/home/david/memory_project/openpi/examples/yam/client_memory_viz.py", line 332, in <module>
+    main(tyro.cli(Args))
+  File "/home/david/memory_project/openpi/examples/yam/client_memory_viz.py", line 292, in main
+    result = policy.infer(
+             ^^^^^^^^^^^^^
+  File "/home/david/memory_project/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py", line 53, in infer
+    raise RuntimeError(f"Error in inference server:\n{response}")
+RuntimeError: Error in inference server:
+Traceback (most recent call last):
+  File "/iris/u/kewalk/memory_project/openpi/src/openpi/serving/websocket_policy_server.py", line 61, in _handler
+    action = self._policy.infer(obs)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/iris/u/kewalk/memory_project/openpi/scripts/serve_yam_memory.py", line 106, in infer
+    outputs = self._output_transform(outputs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/iris/u/kewalk/memory_project/openpi/src/openpi/transforms.py", line 70, in __call__
+    data = transform(data)
+           ^^^^^^^^^^^^^^^
+  File "/iris/u/kewalk/memory_project/openpi/src/openpi/transforms.py", line 163, in __call__
+    return apply_tree(
+           ^^^^^^^^^^^
+  File "/iris/u/kewalk/memory_project/openpi/src/openpi/transforms.py", line 584, in apply_tree
+    raise ValueError(f"Selector key {k} not found in tree")
+ValueError: Selector key window_state not found in tree
+
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::~QObject: Timers cannot be stopped from another thread
+(gello_software) david@SOE-JSTFL84:~/memory_project/openpi$ 
 """
 
 import dataclasses
@@ -47,7 +99,7 @@ BIMANUAL_DOF = 14
 @dataclasses.dataclass
 class Args:
     # --- Policy server (remote GPU box) ---
-    host: str = "10.79.12.149"
+    host: str = "10.79.12.252"
     port: int = 8000
 
     # --- Local gello ZMQ nodes (started by your teleop launch_yaml.py) ---
@@ -69,7 +121,7 @@ class Args:
     """Send a memory reset to the server before the first prediction (fresh episode)."""
 
     # --- Display / recording ---
-    display_hz: float = 5.0
+    display_hz: float = 15.0
     """Top-camera refresh rate between predictions (kept low: reads share the camera node
     with the teleop loop)."""
     record: bool = True
