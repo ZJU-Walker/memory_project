@@ -28,6 +28,7 @@ import dataclasses
 import datetime
 import logging
 import os
+import pickle
 import shutil
 import subprocess
 import threading
@@ -156,6 +157,39 @@ class _Display:
         self._thread.join(timeout=2)
 
 
+def _wait_for_node(host: str, port: int, payload: bytes, what: str) -> None:
+    """Block until a gello ZMQ node answers a probe request, logging what we're waiting for.
+
+    The nodes are created by your teleop launch (launch_yaml.py); a plain ZMQ request to a
+    port nobody serves waits forever with no output, so probe with a timeout instead.
+    """
+    import zmq
+
+    ctx = zmq.Context.instance()
+    announced = False
+    while True:
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 2000)
+        sock.setsockopt(zmq.SNDTIMEO, 2000)
+        sock.connect(f"tcp://{host}:{port}")
+        try:
+            sock.send(payload)
+            sock.recv()
+            logging.info("%s on %s:%d is up.", what, host, port)
+            return
+        except zmq.error.Again:
+            if not announced:
+                logging.info(
+                    "Waiting for %s on %s:%d -- start your teleop (launch_yaml.py) first...",
+                    what, host, port,
+                )
+                announced = True
+        finally:
+            sock.close()
+        time.sleep(1.0)
+
+
 def _run_dry(policy, args: Args) -> None:
     """Validate the obs/subtask contract with random data -- no hardware needed."""
     rng = np.random.default_rng(0)
@@ -192,6 +226,15 @@ def main(args: Args) -> None:
     # --- Attach (read-only) to the teleop's ZMQ nodes ---
     from gello.zmq_core.camera_node import ZMQClientCamera
     from gello.zmq_core.robot_node import ZMQClientRobot
+
+    for port, what in (
+        (args.top_camera_port, "top camera node"),
+        (args.left_camera_port, "left camera node"),
+        (args.right_camera_port, "right camera node"),
+    ):
+        _wait_for_node(args.zmq_host, port, pickle.dumps(None), what)
+    if not args.no_state:
+        _wait_for_node(args.zmq_host, args.robot_port, pickle.dumps({"method": "num_dofs"}), "robot node")
 
     top = ZMQClientCamera(port=args.top_camera_port, host=args.zmq_host)
     left = ZMQClientCamera(port=args.left_camera_port, host=args.zmq_host)
