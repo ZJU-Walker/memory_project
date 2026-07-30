@@ -316,6 +316,167 @@ class TokenizeFASTSubtaskInputs(DataTransformFn):
         }
 
 
+def _as_uint8_hwc(image: np.ndarray) -> np.ndarray:
+    """LeRobot images may arrive as float32 CHW in [0, 1]; convert to uint8 HWC."""
+    image = np.asarray(image)
+    if np.issubdtype(image.dtype, np.floating):
+        image = (255 * image).astype(np.uint8)
+    if image.shape[0] == 3:
+        image = np.transpose(image, (1, 2, 0))
+    return image
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitMemoryWindow(DataTransformFn):
+    """Splits the stacked frames that lerobot's negative delta_timestamps deliver for memory
+    co-training. Each image key and the state arrive as [live+1, ...] (oldest first, current
+    frame last): the current frame goes back under its original key, the past frames become the
+    live write-window inputs, and the detached writes' cache indices plus the write-validity
+    mask are derived from the frame's position within its episode.
+
+    Emits "window_images" (per-camera [live, h, w, 3] float32 in [-1, 1], resized),
+    "window_state" [live, s] (raw; normalized later by the Normalize stage via the
+    "window_state" norm-stats alias), "memory_cache_indices" [window - live] (episode-clamped
+    global frame indices; absent when every write is live), and "memory_write_mask" [window]
+    (oldest first, False before the episode start).
+
+    With window=0 the window length is inferred from the stacked frames themselves (all-live;
+    the loader's delta_timestamps decide it, so one transform instance serves every window-size
+    bucket). When the quiz fields ("quiz_side" / "reveal_frame" / "close_frame", attached by
+    MemoryQuizInfo) are present, also emits the per-write-position quiz supervision:
+    "memory_probe_labels" [window] (the episode's answer class, -1 unknown),
+    "memory_probe_mask" [window] (real write at/after the reveal frame) and
+    "memory_probe_visible" [window] (the answer is still on screen: before the close frame).
+    """
+
+    window: int
+    live: int
+    stride: int
+    height: int = 224
+    width: int = 224
+
+    def __call__(self, data: DataDict) -> DataDict:
+        frame_index = int(np.asarray(data.pop("frame_index")).item())
+        global_index = int(np.asarray(data.pop("index")).item())
+
+        window_images = {}
+        for out_key, in_key in (
+            ("base_0_rgb", "observation/image"),
+            ("left_wrist_0_rgb", "observation/left_wrist_image"),
+            ("right_wrist_0_rgb", "observation/right_wrist_image"),
+        ):
+            frames = np.stack([_as_uint8_hwc(frame) for frame in np.asarray(data[in_key])])
+            data[in_key] = frames[-1]
+            resized = np.stack([image_tools.resize_with_pad(f, self.height, self.width) for f in frames[:-1]])
+            window_images[out_key] = resized.astype(np.float32) / 255.0 * 2.0 - 1.0
+
+        state = np.asarray(data["observation/state"])
+        data["observation/state"] = state[-1]
+        data["window_state"] = state[:-1].astype(np.float32)
+
+        live = state.shape[0] - 1
+        window = self.window if self.window > 0 else live
+        # write slot k (oldest first) corresponds to the frame stride * (window - k) in the past
+        offsets = np.arange(window, 0, -1) * self.stride
+        write_frames = frame_index - offsets
+        data["memory_write_mask"] = write_frames >= 0
+        detached = window - live
+        if detached > 0:
+            episode_start = global_index - frame_index
+            data["memory_cache_indices"] = np.maximum(global_index - offsets[:detached], episode_start).astype(np.int32)
+
+        if "quiz_side" in data:
+            side = int(np.asarray(data.pop("quiz_side")).item())
+            reveal = int(np.asarray(data.pop("reveal_frame")).item())
+            close = int(np.asarray(data.pop("close_frame")).item())
+            quizzable = data["memory_write_mask"] & (write_frames >= reveal) & (side >= 0)
+            data["memory_probe_labels"] = np.full(window, side, dtype=np.int32)
+            data["memory_probe_mask"] = quizzable
+            data["memory_probe_visible"] = quizzable & (write_frames < close)
+        return {**data, "window_images": window_images}
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryQuizInfo(DataTransformFn):
+    """Attaches the per-episode quiz supervision to each raw LeRobot item (before repack):
+    "quiz_side" (the episode's answer class, -1 = unknown), "reveal_frame" (first frame where
+    the answer is visible) and "close_frame" (first frame where it is hidden again). Consumed by
+    SplitMemoryWindow, which turns them into per-write-position arrays.
+
+    Built by `data_loader._episode_quiz_table` from the episodes' final subtask labels plus an
+    optional reveal-frames json; runs while "episode_index" is still present on the item.
+    """
+
+    # Per-episode arrays, indexed by episode_index.
+    episode_side: np.ndarray
+    episode_reveal: np.ndarray
+    episode_close: np.ndarray
+
+    def __call__(self, data: DataDict) -> DataDict:
+        episode = int(np.asarray(data["episode_index"]).item())
+        return {
+            **data,
+            "quiz_side": np.int32(self.episode_side[episode]),
+            "reveal_frame": np.int32(self.episode_reveal[episode]),
+            "close_frame": np.int32(self.episode_close[episode]),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeMemorySubtaskInputs(DataTransformFn):
+    """Tokenizer for the memory co-training layout [images | context | memory | causal].
+
+    At training (subtask + actions + window present), the ar=0 context and the causal
+    subtask+FAST segment become two separate buffers (`FASTSubtaskTokenizer.tokenize_split`),
+    and each live write-window frame's context is tokenized from its normalized "window_state".
+    At inference it matches TokenizeFASTSubtaskInputs without labels: context tokens only.
+    """
+
+    tokenizer: _tokenizer.FASTSubtaskTokenizer
+    causal_len: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        if (subtask := data.pop("subtask", None)) is not None and not isinstance(subtask, str):
+            subtask = subtask.item()
+
+        state = data["state"]
+        if subtask is None:
+            # inference: pure ar=0 context, same as the no-label FAST subtask path
+            tokens, token_mask, ar_mask, loss_mask, fast_mask = self.tokenizer.tokenize(prompt, state, None, None)
+            return {
+                **data,
+                "tokenized_prompt": tokens,
+                "tokenized_prompt_mask": token_mask,
+                "token_ar_mask": ar_mask,
+                "token_loss_mask": loss_mask,
+                "token_fast_mask": fast_mask,
+            }
+
+        context, context_mask, causal, causal_mask, causal_fast = self.tokenizer.tokenize_split(
+            prompt, state, subtask, data["actions"], self.causal_len
+        )
+        window_state = data.pop("window_state")
+        window = [self.tokenizer.tokenize(prompt, window_state[j], None, None)[:2] for j in range(len(window_state))]
+        return {
+            **data,
+            "tokenized_prompt": context,
+            "tokenized_prompt_mask": context_mask,
+            # the context is pure ar=0; these exist only to keep the batch structure uniform
+            "token_ar_mask": np.zeros(context.shape, dtype=np.int32),
+            "token_loss_mask": np.zeros(context.shape, dtype=bool),
+            "token_fast_mask": np.zeros(context.shape, dtype=bool),
+            "tokenized_causal": causal,
+            "tokenized_causal_mask": causal_mask,
+            "causal_fast_mask": causal_fast,
+            "window_tokens": np.stack([t for t, _ in window]),
+            "window_token_masks": np.stack([m for _, m in window]),
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class ExtractFASTActions(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer

@@ -337,7 +337,10 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        # The block's output is also emitted as an extra scan output: nn.scan stacks it across
+        # layers into per-expert [depth, b, seq, width] hidden states. When the caller does not
+        # use them, the stacked output is dead code and the compiler removes it.
+        return xs, (kv_cache, list(xs))
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -410,19 +413,34 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         cache_position: at.Int[at.Array, ""] | int | None = None,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_hidden_states: bool = False,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            Sequence[at.Float[at.Array, "l b _t _d"] | None],
+        ]
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, cache_position)
+        embedded, (kv_cache, hidden_states) = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, cache_position
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        out = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_hidden_states:
+            # per-expert stacks of every block's output, [depth, b, seq, width]: entry [L] is the
+            # output of block L, so [-1] is the final hidden state before the output norm.
+            return out, kv_cache, hidden_states
+        return out, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

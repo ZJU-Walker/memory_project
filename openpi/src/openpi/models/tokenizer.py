@@ -214,6 +214,55 @@ class FASTSubtaskTokenizer(FASTTokenizer):
             np.asarray(fast_mask),
         )
 
+    def tokenize_split(
+        self, prompt: str, state: np.ndarray, subtask: str, actions: np.ndarray, causal_len: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Memory-layout variant (Pi0Config.predict_with_memory): the ar=0 context and the causal
+        subtask+FAST segment as two separate left-aligned buffers, matching the training/inference
+        layout [images | context | memory | causal]. The context tokenization is byte-identical to
+        the inference-time prompt; every valid causal token is a CE target.
+
+        Returns (context_tokens[max_len], context_mask, causal_tokens[causal_len], causal_mask,
+        causal_fast_mask).
+        """
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        context = self._paligemma_tokenizer.encode(f"Task: {cleaned_text}, State: {state_str};\n", add_bos=True)
+        if len(context) > self._max_len:
+            logging.warning(f"Context length ({len(context)}) exceeds max length ({self._max_len}), truncating.")
+            context = context[: self._max_len]
+
+        cleaned_subtask = subtask.lower().strip().replace("_", " ")
+        subtask_tokens = self._paligemma_tokenizer.encode(cleaned_subtask + "\n")
+        action_tokens = self._fast_tokenizer(actions[None])[0]
+        fast_tokens = (
+            self._paligemma_tokenizer.encode("Action: ")
+            + self._act_tokens_to_paligemma_tokens(action_tokens).tolist()
+            + self._paligemma_tokenizer.encode("|", add_eos=True)
+        )
+        causal = subtask_tokens + fast_tokens
+        fast_flags = [False] * len(subtask_tokens) + [True] * len(fast_tokens)
+        if len(causal) > causal_len:
+            logging.warning(
+                f"Causal length ({len(causal)}) exceeds causal_token_len ({causal_len}), truncating. "
+                "Consider increasing `causal_token_len` in your model config if this happens frequently."
+            )
+            causal = causal[:causal_len]
+            fast_flags = fast_flags[:causal_len]
+
+        context_tokens = np.zeros(self._max_len, dtype=np.int32)
+        context_tokens[: len(context)] = context
+        context_mask = np.zeros(self._max_len, dtype=bool)
+        context_mask[: len(context)] = True
+        causal_tokens = np.zeros(causal_len, dtype=np.int32)
+        causal_tokens[: len(causal)] = causal
+        causal_mask = np.zeros(causal_len, dtype=bool)
+        causal_mask[: len(causal)] = True
+        causal_fast_mask = np.zeros(causal_len, dtype=bool)
+        causal_fast_mask[: len(causal)] = fast_flags
+        return context_tokens, context_mask, causal_tokens, causal_mask, causal_fast_mask
+
 
 ###########################################################################
 ## The tokenizers below are used for RoboArena baseline implementations. ##

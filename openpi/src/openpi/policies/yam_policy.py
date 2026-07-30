@@ -68,6 +68,19 @@ class YamInputs(transforms.DataTransformFn):
         if "subtask" in data:
             inputs["subtask"] = data["subtask"]
 
+        # Memory co-training extras (live write-window inputs + bookkeeping) pass through.
+        for key in (
+            "window_images",
+            "window_state",
+            "memory_cache_indices",
+            "memory_write_mask",
+            "memory_probe_labels",
+            "memory_probe_mask",
+            "memory_probe_visible",
+        ):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 

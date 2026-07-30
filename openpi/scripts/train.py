@@ -22,6 +22,7 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.memory_cache as _memory_cache
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -151,7 +152,28 @@ def train_step(
         if isinstance(chunked_loss, dict):
             # Subtask co-training: combine the flow and (weighted) token CE losses, log both.
             loss = jnp.mean(chunked_loss["flow"]) + model.ce_loss_weight * jnp.mean(chunked_loss["ce"])
-            return loss, {f"{k}_loss": jnp.mean(v) for k, v in chunked_loss.items()}
+            info = {"flow_loss": jnp.mean(chunked_loss["flow"]), "ce_loss": jnp.mean(chunked_loss["ce"])}
+            if "probe_ce_sum" in chunked_loss:
+                # Quiz probes: loss = sum of quiz CEs / number of live quizzes in the batch.
+                count = jnp.sum(chunked_loss["probe_count"])
+                correct = jnp.sum(chunked_loss["probe_correct"])
+                vis_count = jnp.sum(chunked_loss["probe_count_visible"])
+                vis_correct = jnp.sum(chunked_loss["probe_correct_visible"])
+                probe_loss = jnp.sum(chunked_loss["probe_ce_sum"]) / jnp.maximum(count, 1)
+                loss += model.memory_probe_weight * probe_loss
+                info.update(
+                    probe_loss=probe_loss,
+                    probe_count=count,
+                    probe_acc=correct / jnp.maximum(count, 1),
+                    # visible = the answer was still on screen at the quiz (bins open; can be
+                    # read off vision); hidden = bins closed again, memory is the only source
+                    probe_acc_visible=vis_correct / jnp.maximum(vis_count, 1),
+                    probe_acc_hidden=(correct - vis_correct) / jnp.maximum(count - vis_count, 1),
+                    # per-probe-position accuracy along the window (index 0 = oldest position)
+                    probe_acc_grid=jnp.sum(chunked_loss["probe_correct_grid"], axis=0)
+                    / jnp.maximum(jnp.sum(chunked_loss["probe_active_grid"], axis=0), 1),
+                )
+            return loss, info
         return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -231,7 +253,8 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    batch_mb = sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(batch)) / 1e6
+    logging.info(f"Initialized data loader: {len(jax.tree.leaves(batch))} arrays, {batch_mb:.0f} MB/batch")
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -242,10 +265,31 @@ def main(config: _config.TrainConfig):
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    n_params = sum(x.size for x in jax.tree.leaves(train_state.params))
+    logging.info(f"Initialized train state: {n_params / 1e9:.2f}B params")
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    # Memory co-training with detached writes: build the in-RAM hidden cache with the current
+    # params and inject each batch's write-window slices before the train step.
+    memory_cache = None
+    if (
+        getattr(config.model, "predict_with_memory", False)
+        and config.model.memory_window > config.model.memory_live_writes
+    ):
+        memory_cache = _memory_cache.MemoryHiddenCache(data_loader.data_config(), config.model)
+        memory_cache.refresh(train_state.model_def, train_state.params)
+
+    def inject_memory_hiddens(batch):
+        if memory_cache is None:
+            return batch
+        observation, actions = batch
+        indices = np.asarray(jax.device_get(observation.memory_cache_indices))
+        hiddens = jax.make_array_from_process_local_data(data_sharding, memory_cache.gather(indices))
+        return dataclasses.replace(observation, memory_hiddens=hiddens), actions
+
+    batch = inject_memory_hiddens(batch)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -262,19 +306,42 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
+    # With window-size buckets each batch shape is its own jit variant; group the step infos by
+    # window length so stacking works and the probe metrics are reported per bucket.
+    buckets = tuple(data_loader.data_config().memory_window_buckets)
+
+    def window_of(batch) -> int | None:
+        mask = batch[0].memory_write_mask
+        return None if mask is None else mask.shape[1]
+
+    infos = {}
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
+        infos.setdefault(window_of(batch), []).append(info)
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            reduced_info = {}
+            for window, window_infos in infos.items():
+                stacked = common_utils.stack_forest(window_infos)
+                reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked))
+                suffix = f"/L{window}" if buckets else ""
+                for k, v in reduced.items():
+                    if np.ndim(v) == 1:  # per-probe-position arrays -> one scalar per position
+                        reduced_info.update({f"{k}{suffix}_p{i}": float(x) for i, x in enumerate(v)})
+                    else:
+                        reduced_info[f"{k}{suffix}"] = float(v)
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if "_p" not in k)
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+            infos = {}
+        if (
+            memory_cache is not None
+            and config.memory_cache_refresh_interval > 0
+            and step > start_step
+            and step % config.memory_cache_refresh_interval == 0
+        ):
+            memory_cache.refresh(train_state.model_def, train_state.params)
+        batch = inject_memory_hiddens(next(data_iter))
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

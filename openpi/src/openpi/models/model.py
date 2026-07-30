@@ -110,6 +110,35 @@ class Observation(Generic[ArrayT]):
     # training-time-only CE target for the VLM and are hidden from the flow matching action expert.
     token_fast_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # pi05 memory co-training fields (Pi0Config.predict_with_memory). Training layout:
+    # [images | context (tokenized_prompt) | memory | causal | action suffix].
+
+    # Causal subtask+FAST segment (every valid token is a CE target; left-aligned).
+    tokenized_causal: at.Int[ArrayT, "*b cl"] | None = None
+    tokenized_causal_mask: at.Bool[ArrayT, "*b cl"] | None = None
+    # Marks the FAST branch within the causal segment (hidden from the action expert).
+    causal_fast_mask: at.Bool[ArrayT, "*b cl"] | None = None
+    # Detached write-window hidden states from the trainer's cache, oldest first ([b, wc, n, emb]).
+    memory_hiddens: at.Float[ArrayT, "*b wc n emb"] | None = None
+    # Global dataset frame indices of the detached writes (used by the trainer to gather
+    # memory_hiddens from its cache before the step; unused inside the model).
+    memory_cache_indices: at.Int[ArrayT, "*b wc"] | None = None
+    # Live-window inputs for the newest writes, recomputed with the current VLM: per-camera
+    # images ([b, wl, h, w, c], float32 in [-1, 1], already resized) and the tokenized context of
+    # each past frame (its state is embedded in the tokens, pi05-style).
+    window_images: dict[str, at.Float[ArrayT, "*b wl h w c"]] | None = None
+    window_tokens: at.Int[ArrayT, "*b wl l"] | None = None
+    window_token_masks: at.Bool[ArrayT, "*b wl l"] | None = None
+    # Validity of each write in [detached..., live...] order (False before the episode start).
+    memory_write_mask: at.Bool[ArrayT, "*b nw"] | None = None
+    # Quiz-probe supervision (train-only; see Pi0Config.memory_probe_weight). Per write position:
+    # the class label of the episode's answer (banana side; -1 = unknown), whether the position
+    # is quizzable (a real write at/after the episode's reveal frame), and whether the answer is
+    # still visible on screen at that write (bins open; used only to split the accuracy logs).
+    memory_probe_labels: at.Int[ArrayT, "*b nw"] | None = None
+    memory_probe_mask: at.Bool[ArrayT, "*b nw"] | None = None
+    memory_probe_visible: at.Bool[ArrayT, "*b nw"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -131,6 +160,18 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             token_fast_mask=data.get("token_fast_mask"),
+            tokenized_causal=data.get("tokenized_causal"),
+            tokenized_causal_mask=data.get("tokenized_causal_mask"),
+            causal_fast_mask=data.get("causal_fast_mask"),
+            memory_hiddens=data.get("memory_hiddens"),
+            memory_cache_indices=data.get("memory_cache_indices"),
+            window_images=data.get("window_images"),
+            window_tokens=data.get("window_tokens"),
+            window_token_masks=data.get("window_token_masks"),
+            memory_write_mask=data.get("memory_write_mask"),
+            memory_probe_labels=data.get("memory_probe_labels"),
+            memory_probe_mask=data.get("memory_probe_mask"),
+            memory_probe_visible=data.get("memory_probe_visible"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -202,16 +243,10 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
-    return Observation(
-        images=out_images,
-        image_masks=out_masks,
-        state=observation.state,
-        tokenized_prompt=observation.tokenized_prompt,
-        tokenized_prompt_mask=observation.tokenized_prompt_mask,
-        token_ar_mask=observation.token_ar_mask,
-        token_loss_mask=observation.token_loss_mask,
-        token_fast_mask=observation.token_fast_mask,
-    )
+    # every other field (tokenized prompt/causal buffers, memory window inputs, ...) passes
+    # through unchanged; window_images deliberately skip the augmentation, they emulate past
+    # inference-time observations
+    return dataclasses.replace(observation, images=out_images, image_masks=out_masks)
 
 
 @dataclasses.dataclass(frozen=True)
