@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
+MemoryWriteSource = Literal["raw_hidden", "post_attention"]
+
+
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
@@ -26,6 +29,10 @@ class Pi0Config(_model.BaseModelConfig):
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = None  # type: ignore
+    # If set, enables train-time RTC action-prefix conditioning. The value is the
+    # maximum simulated inference delay, inclusive: D samples delays uniformly
+    # from {0, ..., D}. None disables RTC; 0 is a valid no-op configuration.
+    simulated_delay: int | None = None
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
@@ -50,34 +57,38 @@ class Pi0Config(_model.BaseModelConfig):
     memory_layer: int = (
         17  # gemma block whose top-camera hidden states feed the memory (last layer) #TODO change layer here
     )
+    # Representation used by the associative memory write. ``raw_hidden`` preserves the v3
+    # behavior (write the layer-``memory_layer`` top-camera states); ``post_attention`` writes
+    # the contextualized outputs of the appended memory-token block. Reads always use the raw
+    # layer hidden states in both modes.
+    memory_write_source: MemoryWriteSource = "raw_hidden"
     # Slot budget reserved after the memory block for the causal text (the generated subtask at
     # inference; the subtask + FAST labels at training). The action suffix starts at the static
     # position num_img_tokens + max_token_len + num_memory_tokens + causal_token_len.
     causal_token_len: int = 150
     memory: _memory.MemoryConfig = dataclasses.field(default_factory=_memory.MemoryConfig)
-    # Memory training: number of past writes per sample (oldest first; with window buckets this
-    # is the LARGEST bucket) and how many of the newest are recomputed live with the current VLM
-    # (the rest come detached from the trainer's hidden cache; live == window means all-live and
-    # no cache). Gradients flow through the FULL write chain (no truncation): the state
-    # recursion's backward only touches the small memory MLP, so its cost is independent of the
-    # VLM. What IS expensive is VLM co-adaptation, so only every `memory_grad_every`-th live
-    # frame (counted backward from the window end, so the spacing is static under start-padding)
-    # keeps activations for a VLM backward; the other live frames run forward-only.
-    memory_window: int = 16
-    memory_live_writes: int = 4
-    memory_grad_every: int = 4
-    # Quiz probes ("dense supervision"): at each every-`memory_grad_every`-th write position that
-    # the data marks quizzable (a real write at/after the episode's reveal frame), read the
-    # memory as it stands, mean-pool the gated read output, and classify the episode's answer
-    # (banana side) with a small train-only linear head. Loss contribution:
+    # Sequence training (RoboTTT-style): a training sample is `memory_seq_steps` consecutive
+    # prediction steps from one episode, one step per policy replan
+    # (`memory_stride_frames` in the data config). This may be shorter than action_horizon for
+    # overlapping RTC chunks. At every step the
+    # model reads the memory, predicts subtask+FAST (CE) and actions (flow), then writes the
+    # frame. Every step's prefill receives VLM gradients from the losses inside its own
+    # gradient block (per-step rematerialization keeps only one step's activations alive at a
+    # time, so GPU memory does not grow with sequence length).
+    memory_seq_steps: int = 16
+    # Gradient-block length in steps: backprop through the memory state is cut every this many
+    # steps (per-sample random shift comes from the data; the state CONTENT always flows
+    # through, only its gradient is detached -- RoboTTT's TBPTT). 0 or >= memory_seq_steps
+    # means never cut.
+    memory_block_steps: int = 0
+    # Quiz probes ("dense supervision"): at each step the data marks quizzable (the episode's
+    # reveal has been written into this sequence's memory), read the memory post-write,
+    # mean-pool the gated read output, and classify the episode's answer (banana side) with a
+    # small train-only linear head. Loss contribution:
     # memory_probe_weight * (sum of quiz CEs / number of live quizzes). 0 disables the quiz
     # entirely (the head is not constructed, keeping old checkpoints loadable).
     memory_probe_weight: float = 0.0
     memory_probe_classes: int = 2
-    # Gradient-checkpoint interval of the write-chain scan: the fast-weight state is saved every
-    # this many writes and the in-between activations are recomputed during backward. Must divide
-    # every window length the data can deliver (all bucket sizes).
-    memory_remat_chunk: int = 1
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -88,6 +99,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.predict_subtask and not self.pi05:
             raise ValueError("predict_subtask is only supported for pi05.")
+        if self.simulated_delay is not None and not 0 <= self.simulated_delay < self.action_horizon:
+            raise ValueError("simulated_delay must be in [0, action_horizon), or None to disable RTC.")
+        if self.memory_write_source not in ("raw_hidden", "post_attention"):
+            raise ValueError("memory_write_source must be 'raw_hidden' or 'post_attention'.")
         if self.predict_with_memory:
             if not self.predict_subtask:
                 raise ValueError("predict_with_memory requires predict_subtask.")
@@ -96,12 +111,10 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError(f"memory d_input/d_value must equal the PaliGemma width ({paligemma_config.width}).")
             if not 0 <= self.memory_layer < paligemma_config.depth:
                 raise ValueError(f"memory_layer must be in [0, {paligemma_config.depth}).")
-            if not 1 <= self.memory_live_writes <= self.memory_window:
-                raise ValueError("memory_live_writes must be in [1, memory_window].")
-            if not 1 <= self.memory_grad_every <= self.memory_window:
-                raise ValueError("memory_grad_every must be in [1, memory_window].")
-            if not 1 <= self.memory_remat_chunk <= self.memory_window:
-                raise ValueError("memory_remat_chunk must be in [1, memory_window].")
+            if self.memory_seq_steps < 1:
+                raise ValueError("memory_seq_steps must be >= 1.")
+            if self.memory_block_steps < 0:
+                raise ValueError("memory_block_steps must be >= 0 (0 = never cut).")
             if self.memory_probe_weight < 0:
                 raise ValueError("memory_probe_weight must be >= 0.")
             if self.memory_probe_weight > 0 and self.memory_probe_classes < 2:
@@ -129,8 +142,10 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
-        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        # Sequence training (predict_with_memory): every field carries a leading step axis.
+        lead = [batch_size, self.memory_seq_steps] if self.predict_with_memory else [batch_size]
+        image_spec = jax.ShapeDtypeStruct([*lead, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct(lead, jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -144,62 +159,32 @@ class Pi0Config(_model.BaseModelConfig):
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },
-                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                state=jax.ShapeDtypeStruct([*lead, self.action_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([*lead, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([*lead, self.max_token_len], bool),
                 **(
                     {
-                        "token_ar_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                        "token_loss_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
-                        "token_fast_mask": jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                        "token_ar_mask": jax.ShapeDtypeStruct([*lead, self.max_token_len], jnp.int32),
+                        "token_loss_mask": jax.ShapeDtypeStruct([*lead, self.max_token_len], bool),
+                        "token_fast_mask": jax.ShapeDtypeStruct([*lead, self.max_token_len], bool),
                     }
                     if self.predict_subtask
                     else {}
                 ),
                 **(
                     {
-                        "tokenized_causal": jax.ShapeDtypeStruct([batch_size, self.causal_token_len], jnp.int32),
-                        "tokenized_causal_mask": jax.ShapeDtypeStruct([batch_size, self.causal_token_len], bool),
-                        "causal_fast_mask": jax.ShapeDtypeStruct([batch_size, self.causal_token_len], bool),
-                        "memory_write_mask": jax.ShapeDtypeStruct([batch_size, self.memory_window], bool),
+                        "tokenized_causal": jax.ShapeDtypeStruct([*lead, self.causal_token_len], jnp.int32),
+                        "tokenized_causal_mask": jax.ShapeDtypeStruct([*lead, self.causal_token_len], bool),
+                        "causal_fast_mask": jax.ShapeDtypeStruct([*lead, self.causal_token_len], bool),
+                        "seq_step_mask": jax.ShapeDtypeStruct(lead, bool),
+                        "seq_block_boundary": jax.ShapeDtypeStruct(lead, bool),
                         **(
                             {
-                                "memory_probe_labels": jax.ShapeDtypeStruct([batch_size, self.memory_window], jnp.int32),
-                                "memory_probe_mask": jax.ShapeDtypeStruct([batch_size, self.memory_window], bool),
-                                "memory_probe_visible": jax.ShapeDtypeStruct([batch_size, self.memory_window], bool),
+                                "seq_probe_labels": jax.ShapeDtypeStruct(lead, jnp.int32),
+                                "seq_probe_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_probe_visible": jax.ShapeDtypeStruct(lead, bool),
                             }
                             if self.memory_probe_weight > 0
-                            else {}
-                        ),
-                        "window_images": {
-                            name: jax.ShapeDtypeStruct(
-                                [batch_size, self.memory_live_writes, *_model.IMAGE_RESOLUTION, 3], jnp.float32
-                            )
-                            for name in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                        },
-                        "window_tokens": jax.ShapeDtypeStruct(
-                            [batch_size, self.memory_live_writes, self.max_token_len], jnp.int32
-                        ),
-                        "window_token_masks": jax.ShapeDtypeStruct(
-                            [batch_size, self.memory_live_writes, self.max_token_len], bool
-                        ),
-                        **(
-                            {
-                                # 256 = SigLIP So400m/14 tokens of the top camera at 224x224
-                                "memory_hiddens": jax.ShapeDtypeStruct(
-                                    [
-                                        batch_size,
-                                        self.memory_window - self.memory_live_writes,
-                                        256,
-                                        _gemma.get_config(self.paligemma_variant).width,
-                                    ],
-                                    jnp.float32,
-                                ),
-                                "memory_cache_indices": jax.ShapeDtypeStruct(
-                                    [batch_size, self.memory_window - self.memory_live_writes], jnp.int32
-                                ),
-                            }
-                            if self.memory_window > self.memory_live_writes
                             else {}
                         ),
                     }
@@ -207,7 +192,7 @@ class Pi0Config(_model.BaseModelConfig):
                     else {}
                 ),
             )
-        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        action_spec = jax.ShapeDtypeStruct([*lead, self.action_horizon, self.action_dim], jnp.float32)
 
         return observation_spec, action_spec
 

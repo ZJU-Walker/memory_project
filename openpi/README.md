@@ -4,7 +4,29 @@
 uv run scripts/compute_norm_stats.py --config-name <your_config_name>
 # 2. Train a model on your dataset:
 uv run scripts/train.py pi05_yam --exp-name=<name> --overwrite
+# Train on 1 h200 (mem v3 with rtc):
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train.py pi05_yam_mem_v3 \
+  --exp-name rtc_stride10_1gpu \
+  --fsdp-devices 1
+# Train on 2 h200 (mem v3 with rtc):
+CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+uv run scripts/train.py pi05_yam_mem_v3 \
+  --exp-name rtc_stride10_2gpu \
+  --fsdp-devices 2
+# Train on 2 h200 (mem v3.1 with rtc, post attention to write):
+HF_HOME=/iris/u/kewalk/.cache/huggingface \
+OPENPI_DATA_HOME=/iris/u/kewalk/.cache/openpi \
+CUDA_VISIBLE_DEVICES=0,1 \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
+.venv/bin/python scripts/train.py pi05_yam_mem_v31 \
+  --exp-name attnwrite_base_s10_d6_t60_b20-40-60_tb25_bs12_seed42 \
+  --batch-size 12 \
+  --fsdp-devices 2 \
+  --seed 42
+
 ```
+
 # offline eval commands:
 ```
 uv run python scripts/eval_yam_subtask.py

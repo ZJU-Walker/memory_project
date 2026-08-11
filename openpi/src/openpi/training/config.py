@@ -19,11 +19,11 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
-import openpi.shared.nnx_utils as nnx_utils
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -100,25 +100,27 @@ class DataConfig:
     # (clamped at the episode end): the subtask conditions the *upcoming* action chunk, so it
     # should describe what the robot is about to do rather than what it is doing right now.
     subtask_lookahead: int = 0
-    # Frames between consecutive memory writes (memory co-training: one write per executed
-    # action chunk at inference). Together with a predict_with_memory model config this enables
-    # the write-window fetch in the data loader.
+    # Frames between consecutive prediction steps in memory sequence training (one step = one
+    # executed action chunk; normally equal to the model's action_horizon). Together with a
+    # predict_with_memory model config this enables the sequence fetch in the data loader.
     memory_stride_frames: int = 0
-    # Window-size buckets for memory co-training: each training batch samples its write-window
-    # length from this set (one torch loader per bucket, whole batches per bucket -> one jit
-    # variant per bucket). Empty = single fixed window (model_config.memory_live_writes). The
-    # largest bucket must equal model_config.memory_window.
-    memory_window_buckets: Sequence[int] = ()
+    # Probability that a training sequence is a random contiguous SLICE of its episode (memory
+    # blank at the slice start) instead of the full trajectory from frame 0. Slices break the
+    # "steps since blank memory" clock; full trajectories match the standard deployment start.
+    memory_slice_prob: float = 0.5
+    # Slices must leave at least this many steps before the episode end.
+    memory_min_slice_steps: int = 4
+    # Optional static sequence lengths used for homogeneous memory-training batches. Each
+    # sampled sequence is assigned to the smallest bucket that contains all of its valid
+    # steps, and every item in that batch uses the same time-axis shape. The final bucket must
+    # equal the model's memory_seq_steps (the maximum fetched sequence length). Empty disables
+    # bucketing and preserves the ordinary fixed-length loader.
+    memory_sequence_buckets: tuple[int, ...] = ()
     # Optional json labeling when each episode's answer becomes visible ("reveal") and hidden
     # again: {"<episode_index>": reveal_frame | [reveal_frame, close_frame]}. Episodes not in
-    # the file use the conservative defaults (see data_loader._episode_quiz_table). Only read
-    # when the model config enables the quiz probes (memory_probe_weight > 0).
+    # the file use the conservative defaults (see data_loader._episode_info_table). Used for
+    # the quiz probes and the slice dead-zone rule.
     memory_reveal_frames_path: str | None = None
-    # If > 1, training samples the frames within +-subtask_lookahead of a subtask change this
-    # many times more often than the rest (WeightedRandomSampler). Those decision frames are
-    # the only ones whose CE label cannot be read off the current observation, i.e. the only
-    # source of gradient pressure on the memory read; uniformly they are ~2% of the data.
-    memory_decision_oversample: float = 0.0
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -440,25 +442,22 @@ class LeRobotYamDataConfig(DataConfigFactory):
             structure["subtask"] = "subtask"
         use_quiz = use_memory and getattr(model_config, "memory_probe_weight", 0) > 0
         if use_memory:
-            # frame/global indices feed the write-window bookkeeping in SplitMemoryWindow
+            # sequence bookkeeping (attached by MemoryEpisodeInfo / present on raw items)
             structure["frame_index"] = "frame_index"
             structure["index"] = "index"
+            structure["episode_length"] = "episode_length"
         if use_quiz:
-            # per-episode quiz supervision attached by MemoryQuizInfo in the data loader
             structure.update({key: key for key in ("quiz_side", "reveal_frame", "close_frame")})
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(structure)])
 
         input_transforms = [yam_policy.YamInputs(model_type=model_config.model_type)]
         if use_memory:
-            # With window buckets the loader decides the per-sample window length, so the split
-            # transform infers it from the stacked frames (window=0, all-live).
-            use_buckets = len(base_config.memory_window_buckets) > 0
             input_transforms.insert(
                 0,
-                _transforms.SplitMemoryWindow(
-                    window=0 if use_buckets else model_config.memory_window,
-                    live=model_config.memory_live_writes,
+                _transforms.BuildMemorySequence(
                     stride=base_config.memory_stride_frames,
+                    action_horizon=model_config.action_horizon,
+                    block_steps=model_config.memory_block_steps,
                 ),
             )
         data_transforms = _transforms.Group(inputs=input_transforms, outputs=[yam_policy.YamOutputs()])
@@ -474,14 +473,8 @@ class LeRobotYamDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
-        # Alias so the Normalize stage normalizes the past window states exactly like "state".
-        norm_stats = base_config.norm_stats
-        if use_memory and norm_stats is not None and "state" in norm_stats:
-            norm_stats = {**norm_stats, "window_state": norm_stats["state"]}
-
         return dataclasses.replace(
             base_config,
-            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -637,6 +630,12 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Number of microbatches used to compute one optimizer update. The data loader still
+    # samples one homogeneous global batch of `batch_size`; when this is greater than one,
+    # that batch is reshaped to [gradient_accumulation_steps, microbatch_size] and Adam/EMA/LR
+    # advance only after all microbatch gradients have been accumulated. The default preserves
+    # the original one-forward/backward training path exactly.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -649,10 +648,6 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
-    # Memory co-training: how often (in steps) to refresh the in-RAM hidden-state cache with the
-    # current parameters (0 = only once at startup). Only used when the model has detached cache
-    # writes, i.e. memory_window > memory_live_writes.
-    memory_cache_refresh_interval: int = 1000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -691,6 +686,13 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be positive.")
+        if self.batch_size % self.gradient_accumulation_steps != 0:
+            raise ValueError(
+                f"Batch size {self.batch_size} must be divisible by gradient accumulation steps "
+                f"{self.gradient_accumulation_steps}."
+            )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1080,127 +1082,56 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        # Phase-I warmup of the Titans memory co-training: every write-window hidden state is
-        # recomputed live with the current VLM (no cache). Starts from pi05_base (like pi05_yam;
-        # the memory params are new and keep their fresh init), so pi05_yam remains the
-        # matched-budget no-memory baseline. Run ~2000 steps, then continue with pi05_yam_mem
-        # pointing its weight loader at this run's final checkpoint.
-        name="pi05_yam_mem_warmup",  # TODO yam mem warmup
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            predict_subtask=True,
-            predict_with_memory=True,
-            memory_layer=8,
-            memory_window=16,
-            memory_live_writes=16,
-            # every live frame keeps VLM gradients (the old full-window-BPTT semantics)
-            memory_grad_every=1,
-            memory_remat_chunk=4,
-        ),
-        data=LeRobotYamDataConfig(
-            repo_id="yam/bin_memory_banana_subtask",
-            default_prompt="find the bin with banana",
-            # reuse the norm stats computed for pi05_yam (same dataset, same asset_id)
-            assets=AssetsConfig(assets_dir="./assets/pi05_yam"),
-            base_config=DataConfig(
-                subtask_from_task=True,
-                subtask_lookahead=15,
-                memory_stride_frames=25,
-                # ~900 decision frames x8 -> ~25% of samples exercise the memory-dependent CE
-                memory_decision_oversample=8.0,
-            ),
-        ),
-        # Freeze the inner-loop gate head: theta/eta/alpha stay at their measured-stable init
-        # operating point (0.10/0.90/0.01). The v2 run collapsed them (theta,eta -> 0,
-        # alpha -> 0.98): erasing the memory is CE's cheapest way to silence a not-yet-useful
-        # input, and it kills retrieval learning for good. The content gate (memory_gate) and
-        # everything else stay trainable. NOTE: freeze_filter params are cast to bf16 by
-        # train.py; the gate biases round harmlessly.
-        freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
-        # single-H200 budget: with full-window BPTT all 16 prefills/sample keep activations
-        # (~0.7 GiB per grad-frame per sample, ~66 GiB fixed params+opt+EMA), so batch 4
-        # (16x4 = 64 grad-frame-units ~ 46 GiB; the original OOM was 16x8 = 128 units)
-        batch_size=4,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=200,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
-        # the loader decodes 51 video frames per sample (17 timestamps x 3 cameras);
-        # keep this below the machine's CPU count
-        num_workers=8,
-    ),
-    TrainConfig(
-        # Phase-I main run: hybrid write window -- the oldest 12 writes come detached from the
-        # in-RAM hidden cache (refreshed with the current params every
-        # memory_cache_refresh_interval steps), the newest 4 are recomputed live; the read query
-        # is always live. Point the weight loader at the warmup run's checkpoint before
-        # launching (checkpoints/pi05_yam_mem_warmup/<exp_name>/1999/params).
-        name="pi05_yam_mem",  # TODO yam mem main
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            predict_subtask=True,
-            predict_with_memory=True,
-            memory_window=16,
-            memory_live_writes=4,
-            memory_grad_every=1,
-            memory_remat_chunk=4,
-        ),
-        data=LeRobotYamDataConfig(
-            repo_id="yam/bin_memory_banana_subtask",
-            default_prompt="find the bin with banana",
-            # reuse the norm stats computed for pi05_yam (same dataset, same asset_id)
-            assets=AssetsConfig(assets_dir="./assets/pi05_yam"),
-            base_config=DataConfig(subtask_from_task=True, subtask_lookahead=15, memory_stride_frames=25),
-        ),
-        # single-H200 budget with the hybrid window (4 live prefills per sample)
-        batch_size=16,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=200,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.PartialCheckpointWeightLoader(
-            "/iris/u/kewalk/memory_project/openpi/checkpoints/pi05_yam_mem_warmup/pi05_yam_mem_warmup/1999/params"
-        ),
-        num_train_steps=30_000,
-        memory_cache_refresh_interval=1_000,
-        # the loader decodes 15 video frames per sample (5 timestamps x 3 cameras);
-        # keep this below the machine's CPU count
-        num_workers=8,
-    ),
-    TrainConfig(
-        # Memory co-training v2: writes every 6 frames (5 Hz, matching a 4-8 Hz inference policy
-        # loop) over a variable-length window reaching back toward the episode start (window
-        # buckets {50, 100, 150} writes = 10/20/30 s; one jit variant per bucket). All window
-        # frames are recomputed live with the current VLM; gradients flow through the FULL write
-        # chain (no truncation -- its backward only touches the memory MLP, checkpointed every
-        # 10 writes), while VLM activations are kept only at every 15th write from the window
-        # end. Those same positions carry the quiz probes: at each one at/after the episode's
-        # reveal frame, the memory is read and a small linear head must name the banana's side
-        # (label from the episode's final subtask; reveal frames from
-        # ./assets/pi05_yam/reveal_frames.json, defaulting to frame 300). This gives the write
-        # path dense retrieval supervision instead of only the terminal CE at decision frames.
+        # INFERENCE/EVAL ONLY: matches the checkpoints trained by the retired v2 recipe
+        # (anchor + replayed write window, e.g. yam_mem_0728_1). memory_stride_frames=6 is that
+        # recipe's write cadence, used as the default eval stride. Do not launch training with
+        # this config.
         name="pi05_yam_mem_v2",
         model=pi0_config.Pi0Config(
             pi05=True,
             predict_subtask=True,
             predict_with_memory=True,
             memory_layer=8,
-            memory_window=150,
-            memory_live_writes=150,
-            memory_grad_every=15,
             memory_probe_weight=0.5,
             memory_probe_classes=2,
-            memory_remat_chunk=10,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_banana_subtask",
+            default_prompt="find the bin with banana",
+            assets=AssetsConfig(assets_dir="./assets/pi05_yam"),
+            base_config=DataConfig(subtask_from_task=True, subtask_lookahead=15, memory_stride_frames=6),
+        ),
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        # Memory sequence training v3 (RoboTTT-style + train-time RTC): a sample is up to 60
+        # consecutive prediction steps of one episode, one step per RTC replan (10 frames).
+        # The action horizon remains 50, so consecutive targets overlap by 40 frames exactly
+        # like asynchronous deployment. 60 x 10 covers 600 frames while cutting the recurrent
+        # sequence compute by 25% relative to the superseded T80 recipe. At every step the
+        # model reads the memory, predicts subtask+FAST (CE) and actions (flow, with a fresh
+        # noise/time/simulated-delay draw per step), then writes the frame; per-step
+        # rematerialization keeps GPU memory flat in sequence length. Gradient blocks of 25
+        # steps with a random per-sample shift
+        # (seq_block_boundary); the quiz probes + carried state teach storage/retrieval across
+        # block cuts. Half the samples are full trajectories (blank memory at the true episode
+        # start), half random slices (blank memory mid-episode -- kills the step-counting
+        # shortcut); slice starts avoid the reveal->decision dead zone. Starts directly from the
+        # official pi05_base checkpoint. The partial loader keeps the newly added memory and
+        # probe parameters at their fresh, seed-controlled initialization.
+        name="pi05_yam_mem_v3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            memory_layer=8,
+            # Inclusive maximum: sample 0..6 committed actions (up to 200 ms at 30 Hz).
+            simulated_delay=6,
+            memory_seq_steps=60,
+            memory_block_steps=25,
+            memory_probe_weight=0.5,
+            memory_probe_classes=2,
         ),
         data=LeRobotYamDataConfig(
             repo_id="yam/bin_memory_banana_subtask",
@@ -1210,18 +1141,24 @@ _CONFIGS = [
             base_config=DataConfig(
                 subtask_from_task=True,
                 subtask_lookahead=15,
-                memory_stride_frames=6,
-                memory_decision_oversample=8.0,
-                memory_window_buckets=(50, 100, 150),
+                # Replan after 10 controls from each 50-action chunk, leaving a 40-action overlap
+                # for real-time chunking and matching one memory write per inference request.
+                memory_stride_frames=10,
+                memory_slice_prob=0.5,
+                # Keep the pre-RTC minimum slice duration: 20 x 10 = 4 x 50 frames.
+                memory_min_slice_steps=20,
+                # Homogeneous batches execute only the smallest static graph that preserves
+                # every valid step of the sampled sequence.
+                memory_sequence_buckets=(20, 40, 60),
                 memory_reveal_frames_path="./assets/pi05_yam/reveal_frames.json",
             ),
         ),
         # keep the inner-loop write gates at their measured-stable operating point
-        # (0.10/0.90/0.01) -- the v2 warmup run collapsed them (erasing the memory is CE's
-        # cheapest way to silence a not-yet-useful input)
+        # (0.10/0.90/0.01) -- earlier runs collapsed them (erasing the memory is CE's cheapest
+        # way to silence a not-yet-useful input)
         freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
-        # single-H200 budget: ~10 grad-carrying prefills/sample at the largest bucket
-        batch_size=4,
+        # single-H200 budget: per-step remat keeps ~1 step's activations alive per sample
+        batch_size=12,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=200,
             peak_lr=5e-5,
@@ -1232,7 +1169,65 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
-        # 3 bucket loaders x 4 workers each; a largest-bucket sample decodes 151 x 3 video frames
+        # Workers fetch the T60 superset; collate crops homogeneous batches before JAX transfer.
+        num_workers=12,
+    ),
+    TrainConfig(
+        # Memory sequence training v3.1: the controlled MAC-inspired follow-up to v3. Every
+        # data, RTC, loss, probe, TBPTT and optimizer setting is deliberately identical to v3;
+        # only the memory write source changes. The read still queries M_{t-1} with the
+        # layer-8 top-camera states, but the write uses the 256 post-attention memory-token
+        # outputs, which have contextualized the old retrieval against the current observation.
+        # Both v3 and v3.1 load the same official pi05_base parameters; their new memory/probe
+        # parameters receive the same fresh initialization under a matched seed. This preserves
+        # a clean write-source ablation without inheriting any v2 memory training. `--resume`
+        # should only be used to continue an existing v3.1 experiment.
+        name="pi05_yam_mem_v31",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            memory_layer=8,
+            memory_write_source="post_attention",
+            # Inclusive maximum: sample 0..6 committed actions (up to 200 ms at 30 Hz).
+            simulated_delay=6,
+            memory_seq_steps=60,
+            memory_block_steps=25,
+            memory_probe_weight=0.5,
+            memory_probe_classes=2,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_banana_subtask",
+            default_prompt="find the bin with banana",
+            # Reuse the exact v3 data distribution and normalization assets.
+            assets=AssetsConfig(assets_dir="./assets/pi05_yam"),
+            base_config=DataConfig(
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=10,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=20,
+                memory_sequence_buckets=(20, 40, 60),
+                memory_reveal_frames_path="./assets/pi05_yam/reveal_frames.json",
+            ),
+        ),
+        # Keep the inner-loop write gates fixed, exactly as in v3. Note that their input is now
+        # the mean post-attention representation; the server exposes the write-source choice so
+        # a checkpoint cannot be evaluated silently with the wrong semantics.
+        freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
+        batch_size=12,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        # After the initial step-1000 checkpoint, resumed runs save every 500 steps.
+        save_interval=500,
         num_workers=12,
     ),
     #
@@ -1264,10 +1259,8 @@ _CONFIGS = [
             memory_layer=2,
             causal_token_len=16,
             memory=_memory.MemoryConfig(d_input=64, d_key=16, hidden_dims=(32, 32, 32), d_value=64),
-            memory_window=2,
-            memory_live_writes=2,
-            memory_grad_every=2,
-            memory_remat_chunk=1,
+            memory_seq_steps=4,
+            memory_block_steps=2,
             # exercise the quiz-probe path end-to-end on fake data
             memory_probe_weight=0.5,
             memory_probe_classes=2,

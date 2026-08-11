@@ -5,13 +5,13 @@ commands the robot. It attaches read-only to the ZMQ nodes the teleop launch alr
 (robot hardware server on port 6001, the three camera subprocesses on ports 5000/5001/5002),
 periodically sends an observation to a remote `scripts/serve_yam_memory.py` server (each call =
 one prediction + one memory write, so the default interval matches the training write cadence
-of 25 frames @ 30 Hz), and shows the live top camera with the predicted subtask + surprise
+of 10 frames @ 30 Hz), and shows the live top camera with the predicted subtask + surprise
 overlaid. Optionally records that view to an mp4.
 
 Keys in the display window:  r = reset the server-side memory (new episode)   q = quit.
 
 Server (GPU box):
-    uv run scripts/serve_yam_memory.py --dir checkpoints/pi05_yam_mem_warmup/<exp>/<step>
+    uv run scripts/serve_yam_memory.py --dir checkpoints/pi05_yam_mem_v3/<exp>/<step>
 
 Client (robot computer, with your teleop already running):
     python examples/yam/client_memory_viz.py --host <gpu-host> --port 8000
@@ -61,9 +61,9 @@ class Args:
     (yam_left.yaml: top, left, right -> 5000, 5001, 5002)."""
 
     # --- Prediction cadence ---
-    pred_interval: float = 25 / 30
+    pred_interval: float = 10 / 30
     """Seconds between server calls. One call = one memory write; the training cadence is
-    memory_stride_frames=25 at 30 Hz."""
+    memory_stride_frames=10 at 30 Hz."""
     prompt: str = PROMPT
     reset_on_start: bool = True
     """Send a memory reset to the server before the first prediction (fresh episode)."""
@@ -92,13 +92,29 @@ class _H264Writer:
             raise RuntimeError("ffmpeg not found on PATH -- needed to encode the recording")
         self._proc = subprocess.Popen(
             [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-s", f"{width}x{height}", "-r", f"{fps}",
-                "-i", "-",
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                f"{fps}",
+                "-i",
+                "-",
                 "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
                 path,
             ],
             stdin=subprocess.PIPE,
@@ -182,7 +198,9 @@ def _wait_for_node(host: str, port: int, payload: bytes, what: str) -> None:
             if not announced:
                 logging.info(
                     "Waiting for %s on %s:%d -- start your teleop (launch_yaml.py) first...",
-                    what, host, port,
+                    what,
+                    host,
+                    port,
                 )
                 announced = True
         finally:
@@ -209,8 +227,12 @@ def _run_dry(policy, args: Args) -> None:
         assert np.isfinite(result["surprise"]), "non-finite surprise"
         logging.info(
             "  call %d: subtask=%r surprise=%.3f writes=%d gates=%s infer=%.0f ms",
-            i, result["subtask"], result["surprise"], result["writes"],
-            result["gates"], result["policy_timing"]["infer_ms"],
+            i,
+            result["subtask"],
+            result["surprise"],
+            result["writes"],
+            result["gates"],
+            result["policy_timing"]["infer_ms"],
         )
     logging.info("Dry run OK.")
 

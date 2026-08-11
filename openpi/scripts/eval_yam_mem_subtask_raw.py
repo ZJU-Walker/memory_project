@@ -38,7 +38,7 @@ import openpi.transforms as _transforms
 
 CKPT = pathlib.Path("/iris/u/kewalk/memory_project/openpi/checkpoints/pi05_yam_mem_warmup/mem_warmup_v5_layer_8/2000")
 RAW_DEMO = pathlib.Path("/iris/u/kewalk/memory_project/data/held_out_eval/demo1")
-STRIDE = 1  # frames between predictions (each writes the memory once); 0 = the config's memory_stride_frames
+STRIDE = 0  # frames between predictions; 0 = the config's memory_stride_frames (cadence-matched default)
 MAX_DECODE_STEPS = 10
 FPS = 30  # recording rate of the raw mp4s
 PLOT_H = 320  # pixel height of the surprise plot rendered under the camera frame
@@ -53,7 +53,7 @@ class Args:
     raw_demo: pathlib.Path = RAW_DEMO
     stride: int = STRIDE
     max_decode_steps: int = MAX_DECODE_STEPS
-    config: str = "pi05_yam_mem_warmup"
+    config: str = "pi05_yam_mem_v3"
     # A/B control: never thread the writes, so every prediction reads the blank (m0) memory.
     # If the subtask timeline matches the normal run, the episode memory contributed nothing.
     ablate_memory: bool = False
@@ -106,8 +106,16 @@ def _render_plot(pred_frames: list[int], curve: np.ndarray, total: int, size_hw:
         lo, hi = float(curve[1:].min()), float(curve[1:].max())
         ax.set_ylim(max(lo * 0.7, 1e-8), hi * 1.5)
         if curve[0] > hi * 1.5:
-            ax.text(0.99, 0.97, f"first write {curve[0]:.2e} (off scale)", transform=ax.transAxes,
-                    ha="right", va="top", fontsize=8, color="tab:red")
+            ax.text(
+                0.99,
+                0.97,
+                f"first write {curve[0]:.2e} (off scale)",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                color="tab:red",
+            )
     ax.set_xlim(0, total - 1)
     ax.set_xlabel("frame")
     ax.set_ylabel("write surprise")
@@ -148,17 +156,21 @@ def main(args: Args) -> None:
     right, n_right = _read_video_frames(demo / "right_camera_rgb.mp4", stride)
     total = min(len(state_raw), len(actions_raw), n_top, n_left, n_right)
     eval_ts = list(range(0, total, stride))
-    print(f"{demo}: {total} frames -> {len(eval_ts)} predictions (one write per prediction, stride {stride})", flush=True)
+    print(
+        f"{demo}: {total} frames -> {len(eval_ts)} predictions (one write per prediction, stride {stride})", flush=True
+    )
 
-    # The exact inference-time input pipeline from the config. SplitMemoryWindow is the
+    # The exact inference-time input pipeline from the config. BuildMemorySequence is the
     # dataset-side unpacker of lerobot's stacked delta_timestamps frames -- skipped on raw items.
     input_transforms = [
-        tf for tf in data_config.data_transforms.inputs if not isinstance(tf, _transforms.SplitMemoryWindow)
+        tf for tf in data_config.data_transforms.inputs if not isinstance(tf, _transforms.BuildMemorySequence)
     ]
     normalize = _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm)
     model_transforms = list(data_config.model_transforms.inputs)
 
-    unnormalize = _transforms.Unnormalize({"actions": norm_stats["actions"]}, use_quantiles=data_config.use_quantile_norm)
+    unnormalize = _transforms.Unnormalize(
+        {"actions": norm_stats["actions"]}, use_quantiles=data_config.use_quantile_norm
+    )
     arm_mask = np.asarray(_transforms.make_bool_mask(6, -1, 6, -1))
 
     def build_item(t: int) -> dict:
@@ -212,7 +224,9 @@ def main(args: Args) -> None:
         item = build_item(t)
         batch = jax.tree.map(lambda x: np.asarray(x)[None], item)
         t0 = time.perf_counter()
-        actions, new_state, aux = infer(state, mem_state, jax.random.fold_in(jax.random.key(0), k), _model.Observation.from_dict(batch))
+        actions, new_state, aux = infer(
+            state, mem_state, jax.random.fold_in(jax.random.key(0), k), _model.Observation.from_dict(batch)
+        )
         jax.block_until_ready((actions, new_state))
         call_ms.append((time.perf_counter() - t0) * 1e3)
         if not args.ablate_memory:
@@ -249,7 +263,9 @@ def main(args: Args) -> None:
     if args.zero_gate:
         tag += "_zerogate"
 
-    np.savez(out_dir / f"mem_subtask_{tag}.npz", pred_frames=np.asarray(eval_ts), surprise=curve, call_ms=np.asarray(call_ms))
+    np.savez(
+        out_dir / f"mem_subtask_{tag}.npz", pred_frames=np.asarray(eval_ts), surprise=curve, call_ms=np.asarray(call_ms)
+    )
     with open(out_dir / f"mem_subtask_{tag}.txt", "w") as f:
         f.writelines(f"{t}\t{s:.4f}\t{p}\n" for t, s, p in zip(eval_ts, curve, preds, strict=True))
 
@@ -259,9 +275,27 @@ def main(args: Args) -> None:
     plot, cursor_cols, (row0, row1) = _render_plot(eval_ts, curve, total, (PLOT_H, frame_w))
     mp4 = out_dir / f"mem_subtask_{tag}.mp4"
     ffmpeg = subprocess.Popen(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{frame_w}x{frame_h + PLOT_H}", "-r", str(FPS), "-i", "-",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{frame_w}x{frame_h + PLOT_H}",
+            "-r",
+            str(FPS),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(mp4),
+        ],
         stdin=subprocess.PIPE,
     )
     for i in range(total):
@@ -269,8 +303,14 @@ def main(args: Args) -> None:
         cam = top[i].copy()
         cv2.putText(cam, f"pred: {preds[k]}", (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 100, 0), 2, cv2.LINE_AA)
         cv2.putText(
-            cam, f"frame {i}  surprise {curve[k]:.3g}", (12, 64),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (235, 235, 60), 1, cv2.LINE_AA,
+            cam,
+            f"frame {i}  surprise {curve[k]:.3g}",
+            (12, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (235, 235, 60),
+            1,
+            cv2.LINE_AA,
         )
         if i // stride < len(preds) and i % stride < FLASH:
             cv2.circle(cam, (frame_w - 28, 28), 10, (235, 60, 60), -1)
@@ -290,8 +330,14 @@ def main(args: Args) -> None:
         ax = axes[j % 7, j // 7]
         ax.plot(np.arange(total), actions_raw[:total, j], lw=0.9, color="black", label="teleop gt")
         for k, t in enumerate(eval_ts):
-            ax.plot(np.arange(t, t + horizon), pred_chunks[k][:, j], lw=0.7, color="tab:orange", alpha=0.7,
-                    label="pred chunk" if k == 0 else None)
+            ax.plot(
+                np.arange(t, t + horizon),
+                pred_chunks[k][:, j],
+                lw=0.7,
+                color="tab:orange",
+                alpha=0.7,
+                label="pred chunk" if k == 0 else None,
+            )
         ax.set_ylabel(JOINT_NAMES[j])
     axes[0, 0].legend()
     axes[6, 0].set_xlabel("frame")

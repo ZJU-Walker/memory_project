@@ -22,7 +22,6 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
-import openpi.training.memory_cache as _memory_cache
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -80,6 +79,25 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     return traverse_util.unflatten_dict(
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
+
+
+def _pad_probe_grids(correct_grid: at.Array, active_grid: at.Array, max_steps: int) -> tuple[at.Array, at.Array]:
+    if correct_grid.shape != active_grid.shape or correct_grid.ndim != 1:
+        raise ValueError("probe correct/active grids must be matching one-dimensional arrays.")
+    if correct_grid.shape[0] > max_steps:
+        raise ValueError(f"probe grid length {correct_grid.shape[0]} exceeds configured maximum {max_steps}.")
+    pad = max_steps - correct_grid.shape[0]
+    return jnp.pad(correct_grid, (0, pad)), jnp.pad(active_grid, (0, pad))
+
+
+def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
+    stacked_infos = common_utils.stack_forest(infos)
+    reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos))
+    if "probe_correct_grid" in reduced:
+        correct_grid = reduced.pop("probe_correct_grid")
+        active_grid = reduced.pop("probe_active_grid")
+        reduced["probe_acc_grid"] = correct_grid / np.maximum(active_grid, 1)
+    return reduced
 
 
 @at.typecheck
@@ -169,9 +187,22 @@ def train_step(
                     # read off vision); hidden = bins closed again, memory is the only source
                     probe_acc_visible=vis_correct / jnp.maximum(vis_count, 1),
                     probe_acc_hidden=(correct - vis_correct) / jnp.maximum(count - vis_count, 1),
-                    # per-probe-position accuracy along the window (index 0 = oldest position)
-                    probe_acc_grid=jnp.sum(chunked_loss["probe_correct_grid"], axis=0)
-                    / jnp.maximum(jnp.sum(chunked_loss["probe_active_grid"], axis=0), 1),
+                )
+                # Keep the per-position numerator and denominator separate and pad both to the
+                # configured maximum sequence length. Bucket batches have different static T;
+                # padding an already-divided accuracy would incorrectly count absent positions
+                # as errors and would also make stack_forest fail across bucket shapes.
+                correct_grid = jnp.sum(chunked_loss["probe_correct_grid"], axis=0)
+                active_grid = jnp.sum(chunked_loss["probe_active_grid"], axis=0)
+                correct_grid, active_grid = _pad_probe_grids(correct_grid, active_grid, config.model.memory_seq_steps)
+                info.update(
+                    probe_correct_grid=correct_grid,
+                    probe_active_grid=active_grid,
+                )
+            if observation.seq_step_mask is not None:
+                info.update(
+                    sequence_bucket_steps=jnp.asarray(observation.seq_step_mask.shape[1], dtype=jnp.float32),
+                    sequence_valid_fraction=jnp.mean(observation.seq_step_mask),
                 )
             return loss, info
         return jnp.mean(chunked_loss), {}
@@ -181,9 +212,110 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    (loss, loss_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
-        model, train_rng, observation, actions
-    )
+    if config.gradient_accumulation_steps == 1:
+        # Keep the original full-batch path unchanged. Besides avoiding extra overhead on
+        # H200, this preserves the exact pre-accumulation random-number and reduction order.
+        (loss, loss_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+            model, train_rng, observation, actions
+        )
+    else:
+        accumulation_steps = config.gradient_accumulation_steps
+        if observation.state.shape[0] != accumulation_steps or actions.shape[0] != accumulation_steps:
+            raise ValueError(
+                "Accumulated training batches must have leading shape "
+                f"[{accumulation_steps}, microbatch]; got state {observation.state.shape} and actions {actions.shape}."
+            )
+
+        # Probe CE is a ratio over every live quiz in the effective B12 batch. Dividing each
+        # B4 numerator by its own count and then averaging would change the objective, so use
+        # the data-only full-batch denominator for every microbatch contribution.
+        global_probe_count = (
+            None if observation.seq_probe_mask is None else jnp.sum(observation.seq_probe_mask.astype(jnp.float32))
+        )
+
+        def microbatch_loss_fn(model, rng, micro_observation, micro_actions):
+            chunked_loss = model.compute_loss(rng, micro_observation, micro_actions, train=True)
+            if not isinstance(chunked_loss, dict):
+                return jnp.mean(chunked_loss) / accumulation_steps, {}
+
+            flow_loss = jnp.mean(chunked_loss["flow"])
+            ce_loss = jnp.mean(chunked_loss["ce"])
+            loss = (flow_loss + model.ce_loss_weight * ce_loss) / accumulation_steps
+            # These are additive contributions to the metrics of the effective global batch.
+            info = {"flow_loss": flow_loss / accumulation_steps, "ce_loss": ce_loss / accumulation_steps}
+            if "probe_ce_sum" in chunked_loss:
+                if global_probe_count is None:
+                    raise ValueError("Probe losses require observation.seq_probe_mask.")
+                count = jnp.sum(chunked_loss["probe_count"])
+                correct = jnp.sum(chunked_loss["probe_correct"])
+                vis_count = jnp.sum(chunked_loss["probe_count_visible"])
+                vis_correct = jnp.sum(chunked_loss["probe_correct_visible"])
+                probe_loss = jnp.sum(chunked_loss["probe_ce_sum"]) / jnp.maximum(global_probe_count, 1)
+                loss += model.memory_probe_weight * probe_loss
+                info.update(
+                    probe_loss=probe_loss,
+                    probe_count=count,
+                    probe_correct_sum=correct,
+                    probe_visible_count=vis_count,
+                    probe_visible_correct_sum=vis_correct,
+                )
+                correct_grid = jnp.sum(chunked_loss["probe_correct_grid"], axis=0)
+                active_grid = jnp.sum(chunked_loss["probe_active_grid"], axis=0)
+                correct_grid, active_grid = _pad_probe_grids(correct_grid, active_grid, config.model.memory_seq_steps)
+                info.update(probe_correct_grid=correct_grid, probe_active_grid=active_grid)
+            if micro_observation.seq_step_mask is not None:
+                info.update(
+                    sequence_bucket_steps=jnp.asarray(
+                        micro_observation.seq_step_mask.shape[1] / accumulation_steps, dtype=jnp.float32
+                    ),
+                    sequence_valid_fraction=jnp.mean(micro_observation.seq_step_mask) / accumulation_steps,
+                )
+            return loss, info
+
+        value_and_grad = nnx.value_and_grad(microbatch_loss_fn, argnums=diff_state, has_aux=True)
+        # Seed the carry with microbatch zero, then use a real XLA loop for the remainder.
+        # A Python loop would inline one complete VLM forward/backward graph per microbatch;
+        # on 80GB H100s that made B2x6 *larger* than B4x3. `fori_loop` compiles one reusable
+        # body and keeps only one microbatch's activations live at a time.
+        first_observation = jax.tree.map(lambda x: x[0], observation)
+        (loss, loss_info), grads = value_and_grad(
+            model,
+            jax.random.fold_in(train_rng, 0),
+            first_observation,
+            actions[0],
+        )
+
+        def accumulate_microbatch(microbatch_index, carry):
+            accumulated_loss, accumulated_info, accumulated_grads = carry
+            micro_observation = jax.tree.map(lambda x: x[microbatch_index], observation)
+            (micro_loss, micro_info), micro_grads = value_and_grad(
+                model,
+                jax.random.fold_in(train_rng, microbatch_index),
+                micro_observation,
+                actions[microbatch_index],
+            )
+            return (
+                accumulated_loss + micro_loss,
+                jax.tree.map(jnp.add, accumulated_info, micro_info),
+                jax.tree.map(jnp.add, accumulated_grads, micro_grads),
+            )
+
+        loss, loss_info, grads = jax.lax.fori_loop(
+            1,
+            accumulation_steps,
+            accumulate_microbatch,
+            (loss, loss_info, grads),
+        )
+        if "probe_count" in loss_info:
+            count = loss_info["probe_count"]
+            correct = loss_info.pop("probe_correct_sum")
+            vis_count = loss_info.pop("probe_visible_count")
+            vis_correct = loss_info.pop("probe_visible_correct_sum")
+            loss_info.update(
+                probe_acc=correct / jnp.maximum(count, 1),
+                probe_acc_visible=vis_correct / jnp.maximum(vis_count, 1),
+                probe_acc_hidden=(correct - vis_correct) / jnp.maximum(count - vis_count, 1),
+            )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -228,6 +360,11 @@ def main(config: _config.TrainConfig):
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
+    microbatch_size = config.batch_size // config.gradient_accumulation_steps
+    if microbatch_size % jax.device_count() != 0:
+        raise ValueError(
+            f"Microbatch size {microbatch_size} must be divisible by the number of devices {jax.device_count()}."
+        )
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
@@ -235,7 +372,12 @@ def main(config: _config.TrainConfig):
     train_rng, init_rng = jax.random.split(rng)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
-    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
+    data_sharding = jax.sharding.NamedSharding(
+        mesh,
+        jax.sharding.PartitionSpec(sharding.DATA_AXIS)
+        if config.gradient_accumulation_steps == 1
+        else jax.sharding.PartitionSpec(None, sharding.DATA_AXIS),
+    )
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
@@ -254,14 +396,28 @@ def main(config: _config.TrainConfig):
     data_iter = iter(data_loader)
     batch = next(data_iter)
     batch_mb = sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(batch)) / 1e6
-    logging.info(f"Initialized data loader: {len(jax.tree.leaves(batch))} arrays, {batch_mb:.0f} MB/batch")
+    logging.info(
+        f"Initialized data loader: {len(jax.tree.leaves(batch))} arrays, {batch_mb:.0f} MB/effective batch; "
+        f"global_batch={config.batch_size}, microbatch={microbatch_size}, "
+        f"gradient_accumulation_steps={config.gradient_accumulation_steps}"
+    )
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Log images only for a fresh run. On resume W&B rejects a new step-0 record, and staging
+    # these device arrays needlessly fragments the very tight 80GB H100 allocator before the
+    # first accumulated update.
+    if not resuming:
+        log_images = batch[0].images
+        if config.gradient_accumulation_steps > 1:
+            log_images = jax.tree.map(lambda x: x.reshape(config.batch_size, *x.shape[2:]), log_images)
+        images_to_log = [
+            wandb.Image(
+                np.concatenate(
+                    [np.array(img[i, 0] if img.ndim == 5 else img[i]) for img in log_images.values()], axis=1
+                )
+            )
+            for i in range(min(5, len(next(iter(log_images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -270,26 +426,6 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
-    # Memory co-training with detached writes: build the in-RAM hidden cache with the current
-    # params and inject each batch's write-window slices before the train step.
-    memory_cache = None
-    if (
-        getattr(config.model, "predict_with_memory", False)
-        and config.model.memory_window > config.model.memory_live_writes
-    ):
-        memory_cache = _memory_cache.MemoryHiddenCache(data_loader.data_config(), config.model)
-        memory_cache.refresh(train_state.model_def, train_state.params)
-
-    def inject_memory_hiddens(batch):
-        if memory_cache is None:
-            return batch
-        observation, actions = batch
-        indices = np.asarray(jax.device_get(observation.memory_cache_indices))
-        hiddens = jax.make_array_from_process_local_data(data_sharding, memory_cache.gather(indices))
-        return dataclasses.replace(observation, memory_hiddens=hiddens), actions
-
-    batch = inject_memory_hiddens(batch)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -306,42 +442,24 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    # With window-size buckets each batch shape is its own jit variant; group the step infos by
-    # window length so stacking works and the probe metrics are reported per bucket.
-    buckets = tuple(data_loader.data_config().memory_window_buckets)
-
-    def window_of(batch) -> int | None:
-        mask = batch[0].memory_write_mask
-        return None if mask is None else mask.shape[1]
-
-    infos = {}
+    infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.setdefault(window_of(batch), []).append(info)
+        infos.append(info)
         if step % config.log_interval == 0:
+            reduced = _reduce_infos(infos)
             reduced_info = {}
-            for window, window_infos in infos.items():
-                stacked = common_utils.stack_forest(window_infos)
-                reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked))
-                suffix = f"/L{window}" if buckets else ""
-                for k, v in reduced.items():
-                    if np.ndim(v) == 1:  # per-probe-position arrays -> one scalar per position
-                        reduced_info.update({f"{k}{suffix}_p{i}": float(x) for i, x in enumerate(v)})
-                    else:
-                        reduced_info[f"{k}{suffix}"] = float(v)
+            for k, v in reduced.items():
+                if np.ndim(v) == 1:  # per-step quiz accuracy -> one scalar per step index
+                    reduced_info.update({f"{k}_p{i}": float(x) for i, x in enumerate(v)})
+                else:
+                    reduced_info[f"{k}"] = float(v)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if "_p" not in k)
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
-            infos = {}
-        if (
-            memory_cache is not None
-            and config.memory_cache_refresh_interval > 0
-            and step > start_step
-            and step % config.memory_cache_refresh_interval == 0
-        ):
-            memory_cache.refresh(train_state.model_def, train_state.params)
-        batch = inject_memory_hiddens(next(data_iter))
+            infos = []
+        batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

@@ -1,15 +1,16 @@
 import logging
 
+import augmax
 import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
-import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import rtc as _rtc
 import openpi.models.gemma as _gemma
 import openpi.models.memory as _memory
 import openpi.models.siglip as _siglip
@@ -67,16 +68,16 @@ def make_memory_step_mask(prefix_mask, prefix_ar, mem_len, causal_len):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    pos: at.Real[at.Array, "*shape"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "*shape {embedding_dim}"]:
+    """Computes sine-cosine embeddings for scalar or token-wise positions."""
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
     sinusoid_input = jnp.einsum(
-        "i,j->ij",
+        "...,j->...j",
         pos,
         1.0 / period * 2 * jnp.pi,
         precision=jax.lax.Precision.HIGHEST,
@@ -88,6 +89,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.simulated_delay = config.simulated_delay
         self.predict_subtask = config.predict_subtask
         self.ce_loss_weight = config.ce_loss_weight
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -110,7 +112,10 @@ class Pi0(_model.BaseModel):
                 dtype_mm=config.dtype,
             )
         )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        fake_image = next(iter(config.fake_obs().images.values()))
+        if fake_image.ndim == 5:  # sequence configs carry a step axis; SigLIP sees folded frames
+            fake_image = fake_image.reshape(-1, *fake_image.shape[2:])
+        img.lazy_init(fake_image, train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
@@ -128,9 +133,8 @@ class Pi0(_model.BaseModel):
             # zero-init content gate: an untrained/empty memory injects exactly-zero token content
             self.memory_gate = nnx.Param(jnp.zeros((config.memory.d_value,), dtype=jnp.float32))
             self.memory_layer = config.memory_layer
+            self.memory_write_source = config.memory_write_source
             self.causal_token_len = config.causal_token_len
-            self.memory_grad_every = config.memory_grad_every
-            self.memory_remat_chunk = config.memory_remat_chunk
             self.memory_probe_weight = config.memory_probe_weight
             if config.memory_probe_weight > 0:
                 # train-only quiz head: classifies the episode's answer from the mean-pooled
@@ -139,6 +143,37 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _select_memory_write_source(self, raw_hidden: at.Array, post_attention: at.Array) -> at.Array:
+        """Selects the configured write representation while keeping all inner math float32."""
+        if raw_hidden.shape != post_attention.shape:
+            raise ValueError(
+                "raw and post-attention memory write sources must have matching shapes; "
+                f"got {raw_hidden.shape} and {post_attention.shape}."
+            )
+        if self.memory_write_source == "raw_hidden":
+            return raw_hidden.astype(jnp.float32)
+        if self.memory_write_source == "post_attention":
+            return post_attention.astype(jnp.float32)
+        raise ValueError(f"unsupported memory_write_source: {self.memory_write_source!r}")
+
+    def _check_action_prefix_shapes(self, action_prefix: _rtc.ActionPrefix | None, batch_size: int) -> None:
+        """Performs static checks that remain safe while sampling is jitted.
+
+        Value bounds are validated before batching by ``rtc.validate_action_prefix``
+        at the policy/runtime boundary.
+        """
+        if action_prefix is None:
+            return
+        if self.simulated_delay is None:
+            raise ValueError("action_prefix requires a checkpoint trained with simulated_delay enabled.")
+        expected_actions = (batch_size, self.action_horizon, self.action_dim)
+        if action_prefix.actions.shape != expected_actions:
+            raise ValueError(
+                f"action_prefix.actions must have shape {expected_actions}; got {action_prefix.actions.shape}."
+            )
+        if action_prefix.delay.shape != (batch_size,) or action_prefix.prefix_length.shape != (batch_size,):
+            raise ValueError("action_prefix delay and prefix_length must both have shape [batch].")
 
     @at.typecheck
     def embed_prefix(
@@ -180,12 +215,12 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Array
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Array | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -211,7 +246,15 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            if time_emb.ndim == action_tokens.ndim - 1:
+                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            elif time_emb.shape[:-1] == action_tokens.shape[:-1]:
+                time_tokens = time_emb
+            else:
+                raise ValueError(
+                    f"timestep embedding must be per-example or per-action; got {time_emb.shape} "
+                    f"for actions {action_tokens.shape}."
+                )
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -231,8 +274,8 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"] | dict[str, at.Array]:
-        if self.predict_with_memory and observation.tokenized_causal is not None:
-            return self._compute_loss_with_memory(rng, observation, actions, train=train)
+        if self.predict_with_memory and observation.seq_step_mask is not None:
+            return self._compute_sequence_loss(rng, observation, actions, train=train)
 
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -240,12 +283,20 @@ class Pi0(_model.BaseModel):
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        rtc_loss_mask = None
+        model_time = time
+        if self.simulated_delay is None:
+            time_expanded = time[..., None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+        else:
+            # Derive the new stream without changing the existing noise/time streams.
+            delay_rng = jax.random.fold_in(rng, 0x525443)
+            delay = jax.random.randint(delay_rng, batch_shape, 0, self.simulated_delay + 1)  # inclusive maximum
+            x_t, model_time, rtc_loss_mask = _rtc.make_noisy_actions(actions, noise, time, delay=delay)
         u_t = noise - actions
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, model_time)
 
         if not self.predict_subtask:
             # one big forward pass of prefix + suffix at once
@@ -259,7 +310,8 @@ class Pi0(_model.BaseModel):
             )
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            return _rtc.renormalize_flow_loss(flow_loss, rtc_loss_mask)
 
         # Subtask + FAST co-training (knowledge insulation): the VLM backbone is trained by a
         # next-token CE on the subtask + FAST tokens (pass 1); the action expert is trained by flow
@@ -304,7 +356,8 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return {"flow": jnp.mean(jnp.square(v_t - u_t), axis=-1), "ce": ce_loss}
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return {"flow": _rtc.renormalize_flow_loss(flow_loss, rtc_loss_mask), "ce": ce_loss}
 
     @override
     def sample_actions(
@@ -314,12 +367,14 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: _rtc.ActionPrefix | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        self._check_action_prefix_shapes(action_prefix, batch_size)
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
@@ -331,8 +386,13 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            if action_prefix is None:
+                model_x_t = x_t
+                model_time = jnp.broadcast_to(time, batch_size)
+            else:
+                model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, model_x_t, model_time
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -369,7 +429,7 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        return _rtc.restore_action_prefix(x_0, action_prefix)
 
     def _decode_subtask(self, preprocessed: _model.Observation, *, stop_token: int, max_decode_steps: int):
         """Prefill + greedy AR decoding of the subtask, using the indexed KV cache.
@@ -493,6 +553,7 @@ class Pi0(_model.BaseModel):
         max_decode_steps: int = 10,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: _rtc.ActionPrefix | None = None,
     ) -> tuple[_model.Actions, _model.Observation]:
         """Fused inference: one prefill, AR subtask decoding, then flow denoising against the same
         KV cache (the actions are conditioned on the freshly decoded subtask). Returns the actions
@@ -503,6 +564,7 @@ class Pi0(_model.BaseModel):
             preprocessed, stop_token=stop_token, max_decode_steps=max_decode_steps
         )
         batch = prompt.shape[0]
+        self._check_action_prefix_shapes(action_prefix, batch)
 
         # The suffix attends to the valid prefix slots plus each sample's generated cache slots,
         # at positions continuing after them -- the same geometry as compute_loss pass 2.
@@ -517,8 +579,13 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            if action_prefix is None:
+                model_x_t = x_t
+                model_time = jnp.broadcast_to(time, batch)
+            else:
+                model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                preprocessed, x_t, jnp.broadcast_to(time, batch)
+                preprocessed, model_x_t, model_time
             )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -539,6 +606,7 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        x_0 = _rtc.restore_action_prefix(x_0, action_prefix)
         observation = observation.replace(tokenized_prompt=prompt, tokenized_prompt_mask=prompt_mask, token_ar_mask=ar)
         return x_0, observation
 
@@ -576,6 +644,7 @@ class Pi0(_model.BaseModel):
         max_decode_steps: int = 10,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: _rtc.ActionPrefix | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
 
@@ -583,14 +652,16 @@ class Pi0(_model.BaseModel):
         generated subtask | action suffix]. The prefill is identical to the baseline path and
         also yields the layer-`memory_layer` top-camera hidden states h_t. The memory is read
         with h_t and the retrieved tokens (content-gated, zero-init) are appended to the KV
-        cache; the subtask is decoded and the actions denoised against the extended cache; the
-        memory is written with h_t only after prediction. Returns (actions, new_memory_state,
-        aux) with aux carrying the generated tokens/mask and the write diagnostics.
+        cache, producing contextualized memory-token outputs c_t; the subtask is decoded and
+        the actions denoised against the extended cache. Only after prediction, the memory is
+        written with h_t (v3) or c_t (v3.1), according to ``memory_write_source``. Returns
+        (actions, new_memory_state, aux) with generated tokens/mask and write diagnostics.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
         assert max_decode_steps <= self.causal_token_len
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         batch = preprocessed.state.shape[0]
+        self._check_action_prefix_shapes(action_prefix, batch)
 
         # prefill of images + context text, identical to the baseline path, capturing the
         # per-layer hidden states in the same forward
@@ -638,6 +709,7 @@ class Pi0(_model.BaseModel):
         (mem_out, _), kv_cache = self.PaliGemma.llm(
             [mem_tokens, None], mask=mem_mask, positions=mem_positions, kv_cache=kv_cache, cache_position=prefix_len
         )
+        c_t = mem_out.astype(jnp.float32)
 
         def greedy(hidden_vec):  # [b, emb] -> [b] next token
             logits = self.PaliGemma.llm(hidden_vec[:, None], method="decode")[:, 0]
@@ -712,8 +784,13 @@ class Pi0(_model.BaseModel):
 
         def denoise_step(carry):
             x_t, time = carry
+            if action_prefix is None:
+                model_x_t = x_t
+                model_time = jnp.broadcast_to(time, batch)
+            else:
+                model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                preprocessed, x_t, jnp.broadcast_to(time, batch)
+                preprocessed, model_x_t, model_time
             )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -734,273 +811,236 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(denoise_cond, denoise_step, (noise, 1.0))
+        x_0 = _rtc.restore_action_prefix(x_0, action_prefix)
 
-        # write only after prediction, with the pass-1 hidden states
-        new_state, write_aux = self.memory.write(memory_state, h_t)
+        # Write only after prediction. Reads always use h_t; v3.1 writes the already-computed
+        # post-attention memory-token representation c_t instead of the raw layer hidden state.
+        write_source = self._select_memory_write_source(h_t, c_t)
+        new_state, write_aux = self.memory.write(memory_state, write_source)
         aux = {**write_aux, "tokens": gen_tokens, "token_mask": gen_mask}
         return x_0, new_state, aux
 
-    def _compute_loss_with_memory(
+    def _compute_sequence_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> dict[str, at.Array]:
-        """Memory co-training loss, mirroring `sample_with_memory` exactly.
+        """RoboTTT-style sequence loss: one training sample is T consecutive prediction steps
+        of one episode (one step per executed action chunk); every field of `observation` and
+        `actions` carries a leading step axis.
 
-        Layout: [images | context | memory | causal (subtask+FAST) | action suffix] with the same
-        static positions as inference. The write window is replayed into a fresh memory (detached
-        cache hiddens first, then the live window recomputed with the current VLM), the memory is
-        read with the live h_t of the current frame, and:
-          * CE (VLM + memory + gate): next-token loss over the causal segment, where the first
-            token is predicted from the last memory token's output (the inference readout);
-          * quiz probes (memory + gate + probe head; VLM at the grad positions): at every
-            `memory_grad_every`-th write position that the data marks quizzable, the memory as it
-            stands is read with that frame's hiddens and a linear head classifies the episode's
-            answer -- dense retrieval supervision inside the window;
-          * flow (action expert only, behind stop_gradient(kv)): the suffix attends to
-            [context | memory | causal minus FAST] at the static offset.
+        Per step, mirroring `sample_with_memory` exactly (same static layout
+        [images | context | memory | causal | suffix], same masks and positions):
+          1. prefill the step's frame -> live h_t;
+          2. read the memory AS IT STANDS (pre-write, the inference order), append the gated
+             memory tokens + teacher-forced causal segment to the cache -> next-token CE over
+             subtask+FAST, first token from the last memory token's output;
+          3. flow matching behind stop_gradient(kv) with per-step independent noise
+             (RoboTTT's "sequence action forcing");
+          4. write h_t (v3) or post-attention memory-token output c_t (v3.1); padding
+             steps are exact no-ops on the state;
+          5. quiz probe on the post-write state where the data marks the step quizzable.
 
-        Gradients flow through the FULL write chain (no truncation; the state recursion's
-        backward only touches the memory MLP, checkpointed every `memory_remat_chunk` writes).
-        The VLM keeps activations only for the every-`memory_grad_every`-th live frames (counted
-        from the window end); all other live frames run as explicit no-grad prefills, processed
-        in sequential groups so only one group's full layer stack is ever materialized.
+        The scan is rematerialized per step, so only ONE step's VLM activations are ever alive
+        -- GPU memory does not grow with T. Gradient blocks: `seq_block_boundary` cuts backprop
+        through the memory state at flagged steps (per-sample, data-driven; the state content
+        always flows through). Within a block, every step's prefill receives VLM gradients from
+        the block's losses; m0 learns through each sequence's first block.
         """
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        batch = actions.shape[0]
+        b, t = observation.seq_step_mask.shape
+        ah, ad = actions.shape[-2:]
+        aug_rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, actions.shape[:-2]) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        images = observation.images
+        if train:
+            images = self._augment_sequence_images(aug_rng, images)
 
-        # call 1: prefix prefill, identical to the inference path, yielding the live h_t
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache, hidden = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, return_hidden_states=True
-        )
-        num_img = prefix_mask.shape[1] - self.max_token_len
-        mem_len = num_img // len(observation.images)
-        prefix_len = prefix_mask.shape[1]
-        causal_len = observation.tokenized_causal.shape[1]
-        h_t = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
+        causal_len = observation.tokenized_causal.shape[-1]
+        quiz = self.memory_probe_weight > 0 and observation.seq_probe_mask is not None
 
-        # live-window hiddens at the given window indices: fold [b, n] into the batch and run
-        # the same prefix forward (unaugmented images -- they emulate past inference-time
-        # observations)
-        def window_hiddens(idx):
-            n = len(idx)
-            idx = np.asarray(idx)
-            w_obs = _model.Observation(
-                images={k: v[:, idx].reshape(batch * n, *v.shape[2:]) for k, v in observation.window_images.items()},
-                image_masks={k: jnp.ones(batch * n, dtype=bool) for k in observation.window_images},
-                state=jnp.zeros((batch * n, observation.state.shape[-1]), observation.state.dtype),
-                tokenized_prompt=observation.window_tokens[:, idx].reshape(batch * n, -1),
-                tokenized_prompt_mask=observation.window_token_masks[:, idx].reshape(batch * n, -1),
-            )
-            w_tokens, w_mask, w_ar = self.embed_prefix(w_obs)
-            _, _, w_hidden = self.PaliGemma.llm(
-                [w_tokens, None],
-                mask=make_attn_mask(w_mask, w_ar),
-                positions=jnp.cumsum(w_mask, axis=1) - 1,
-                return_hidden_states=True,
-            )
-            return w_hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32).reshape(batch, n, mem_len, -1)
+        def step_first(x):  # [b, t, ...] -> [t, b, ...]
+            return jnp.moveaxis(x, 1, 0)
 
-        wl = observation.window_tokens.shape[1]
-        wc = 0 if observation.memory_hiddens is None else observation.memory_hiddens.shape[1]
-        num_writes = wc + wl
-        # Static every-`memory_grad_every`-th grid, counted backward from the window end. Under
-        # start-padding the real writes form a contiguous suffix ending at the newest slot, so
-        # counting from the end keeps the grid aligned with them. These positions keep VLM
-        # activations for backward (co-adaptation) and are where the quiz probes sit.
-        grid = tuple(p for p in range(num_writes) if (num_writes - 1 - p) % self.memory_grad_every == 0)
-        grad_live = tuple(p - wc for p in grid if p >= wc)
-
-        # No-grad pass over the whole live window: sequential groups (lax.map) so only one
-        # group's full 18-layer hidden stack is ever materialized, under stop_gradient so XLA
-        # neither saves activations nor builds a backward -- this is what makes a long all-live
-        # window fit in memory. The grad positions are recomputed below WITH activations and
-        # overwrite their slots (bit-identical forward values).
-        group = self.memory_remat_chunk if wl % self.memory_remat_chunk == 0 else 1
-
-        def group_hiddens(inputs):
-            imgs, toks, tmasks = inputs
-            w_obs = _model.Observation(
-                images={k: v.reshape(batch * group, *v.shape[2:]) for k, v in imgs.items()},
-                image_masks={k: jnp.ones(batch * group, dtype=bool) for k in imgs},
-                state=jnp.zeros((batch * group, observation.state.shape[-1]), observation.state.dtype),
-                tokenized_prompt=toks.reshape(batch * group, -1),
-                tokenized_prompt_mask=tmasks.reshape(batch * group, -1),
-            )
-            w_tokens, w_mask, w_ar = self.embed_prefix(w_obs)
-            _, _, w_hidden = self.PaliGemma.llm(
-                [w_tokens, None],
-                mask=make_attn_mask(w_mask, w_ar),
-                positions=jnp.cumsum(w_mask, axis=1) - 1,
-                return_hidden_states=True,
-            )
-            return w_hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32).reshape(batch, group, mem_len, -1)
-
-        def to_groups(x):  # [b, wl, ...] -> [wl/group, b, group, ...]
-            return jnp.moveaxis(x.reshape(batch, wl // group, group, *x.shape[2:]), 0, 1)
-
-        nograd = jax.lax.stop_gradient(
-            jax.lax.map(
-                group_hiddens,
-                (
-                    {k: to_groups(v) for k, v in observation.window_images.items()},
-                    to_groups(observation.window_tokens),
-                    to_groups(observation.window_token_masks),
-                ),
-            )
-        )
-        write_live = jnp.moveaxis(nograd, 1, 0).reshape(batch, wl, mem_len, -1)
-        if grad_live:
-            write_live = write_live.at[:, np.asarray(grad_live)].set(window_hiddens(grad_live))
-        if wc > 0:
-            write_seq = jnp.concatenate(
-                [jax.lax.stop_gradient(observation.memory_hiddens.astype(jnp.float32)), write_live], axis=1
-            )
-        else:
-            write_seq = write_live  # [b, W, mem_len, emb], oldest first
-
-        # Write chain with per-sample validity (episode starts) and FULL BPTT: no stop_gradient
-        # anywhere in the state recursion (m0 receives gradient through init_state), gradient-
-        # checkpointed every `memory_remat_chunk` writes. The quiz probes run inline: reading is
-        # pure (never modifies the state), so the chain is bit-identical with probes on or off.
-        quiz = self.memory_probe_weight > 0 and observation.memory_probe_mask is not None
-        chunk = self.memory_remat_chunk if num_writes % self.memory_remat_chunk == 0 else 1
-        n_chunks = num_writes // chunk
-        grid_mask = np.zeros(num_writes, dtype=bool)
-        grid_mask[np.asarray(grid)] = True
+        xs = {
+            "images": {k: step_first(v) for k, v in images.items()},
+            "state": step_first(observation.state),
+            "tokens": step_first(observation.tokenized_prompt),
+            "token_mask": step_first(observation.tokenized_prompt_mask),
+            "causal": step_first(observation.tokenized_causal),
+            "causal_mask": step_first(observation.tokenized_causal_mask),
+            "causal_fast": step_first(observation.causal_fast_mask),
+            "actions": step_first(actions),
+            "step_valid": step_first(observation.seq_step_mask),
+            "boundary": step_first(observation.seq_block_boundary),
+            "noise": jax.random.normal(noise_rng, (t, b, ah, ad)),
+            "time": jax.random.beta(time_rng, 1.5, 1, (t, b)) * 0.999 + 0.001,
+        }
+        if self.simulated_delay is not None:
+            delay_rng = jax.random.fold_in(rng, 0x525443)
+            xs["delay"] = jax.random.randint(delay_rng, (t, b), 0, self.simulated_delay + 1)  # inclusive maximum
         if quiz:
             n_classes = self.probe_head.out_features
-            labels = jnp.clip(observation.memory_probe_labels, 0, n_classes - 1)
-            active = observation.memory_probe_mask & jnp.asarray(grid_mask)[None, :]
-            visible = observation.memory_probe_visible & active
-        else:
-            labels = jnp.zeros((batch, num_writes), dtype=jnp.int32)
-            active = jnp.zeros((batch, num_writes), dtype=bool)
-            visible = active
+            xs["probe_label"] = step_first(jnp.clip(observation.seq_probe_labels, 0, n_classes - 1))
+            xs["probe_act"] = step_first(observation.seq_probe_mask)
+            xs["probe_vis"] = step_first(observation.seq_probe_visible & observation.seq_probe_mask)
 
-        def chain_step(state, xs):
-            h, valid, label, act, vis = xs
-            new_state, _ = self.memory.write(state, h)
+        def step(state, x):
+            # gradient-block fence: cut backprop through the incoming state where flagged; the
+            # state content itself passes through unchanged (where() routes the gradient)
             state = jax.tree.map(
-                lambda n, o: jnp.where(valid.reshape(valid.shape + (1,) * (n.ndim - 1)), n, o),
-                new_state,
+                lambda s: jnp.where(x["boundary"].reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s),
                 state,
             )
-            if not quiz:
-                zero = jnp.zeros((h.shape[0],), dtype=jnp.float32)
-                return state, (zero, zero, zero, zero)
-            probe_read = self.memory.read(state, h)
-            pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
-            logits = self.probe_head(pooled).astype(jnp.float32)
-            logp = jax.nn.log_softmax(logits, axis=-1)
-            actf = act.astype(jnp.float32)
-            ce = -jnp.take_along_axis(logp, label[:, None], axis=-1)[:, 0]
-            correct = (jnp.argmax(logits, axis=-1) == label).astype(jnp.float32)
-            return state, (ce * actf, correct * actf, actf, vis.astype(jnp.float32))
 
-        def chunk_body(state, xs_chunk):
-            ys = []
-            for i in range(chunk):
-                state, y = chain_step(state, jax.tree.map(lambda x: x[i], xs_chunk))  # noqa: B023
-                ys.append(y)
-            return state, jax.tree.map(lambda *z: jnp.stack(z), *ys)
+            # 1. prefill, identical to the inference path
+            obs_k = _model.Observation(
+                images=x["images"],
+                image_masks={k: jnp.ones(b, dtype=bool) for k in x["images"]},
+                state=x["state"],
+                tokenized_prompt=x["tokens"],
+                tokenized_prompt_mask=x["token_mask"],
+            )
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(obs_k)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, kv_cache, hidden = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, return_hidden_states=True
+            )
+            num_img = prefix_mask.shape[1] - self.max_token_len
+            mem_len = num_img // len(x["images"])
+            prefix_len = prefix_mask.shape[1]
+            h_k = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
 
-        def to_chunks(x):  # [b, W, ...] -> [n_chunks, chunk, b, ...]
-            return jnp.moveaxis(x, 1, 0).reshape(n_chunks, chunk, *x.shape[:1], *x.shape[2:])
+            # 2. read the pre-write memory and run [memory | causal] as one cache extension
+            retrieved = self.memory.read(state, h_k)
+            mem_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
+            causal_emb = self.PaliGemma.llm(x["causal"], method="embed")
+            ext_tokens = jnp.concatenate([mem_tokens, causal_emb], axis=1)
+            causal_mask_k = x["causal_mask"]
+            mem_rows = make_memory_step_mask(prefix_mask, prefix_ar_mask, mem_len, causal_len)
+            tri = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))
+            causal_rows = jnp.concatenate(
+                [
+                    einops.repeat(prefix_mask, "b p -> b c p", c=causal_len),
+                    jnp.ones((b, causal_len, mem_len), dtype=bool),
+                    tri[None] & causal_mask_k[:, None, :],
+                ],
+                axis=-1,
+            )
+            ext_mask = jnp.concatenate([mem_rows, causal_rows], axis=1)
+            ext_positions = jnp.broadcast_to(
+                prefix_len + jnp.arange(mem_len + causal_len)[None], (b, mem_len + causal_len)
+            )
+            kv_cache = jax.tree.map(
+                lambda c: jnp.pad(c, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache
+            )
+            (ext_out, _), kv_cache = self.PaliGemma.llm(
+                [ext_tokens, None], mask=ext_mask, positions=ext_positions, kv_cache=kv_cache, cache_position=prefix_len
+            )
+            mem_out, causal_out = ext_out[:, :mem_len], ext_out[:, mem_len:]
+            c_k = mem_out.astype(jnp.float32)
+            ce_hidden = jnp.concatenate([mem_out[:, -1:], causal_out[:, :-1]], axis=1)
+            logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
+            token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1)[
+                ..., 0
+            ]
+            ce = -jnp.sum(token_logp * causal_mask_k, axis=-1) / jnp.clip(jnp.sum(causal_mask_k, axis=-1), 1)
 
-        chain_xs = tuple(
-            to_chunks(x) for x in (write_seq, observation.memory_write_mask, labels, active, visible)
-        )
-        memory_state, chain_ys = jax.lax.scan(
-            jax.checkpoint(chunk_body, prevent_cse=False), self.memory.init_state(batch), chain_xs
-        )
-        # per-step quiz stats back to [b, W] (ys arrive as [n_chunks, chunk, b])
-        ce_steps, cor_steps, act_steps, vis_steps = (
-            jnp.moveaxis(y.reshape(num_writes, batch), 0, 1) for y in chain_ys
-        )
+            # 3. flow matching through the action expert only, per-step independent noise
+            time_k = x["time"]
+            rtc_loss_mask = None
+            model_time = time_k
+            if self.simulated_delay is None:
+                x_t = time_k[:, None, None] * x["noise"] + (1 - time_k[:, None, None]) * x["actions"]
+            else:
+                x_t, model_time, rtc_loss_mask = _rtc.make_noisy_actions(
+                    x["actions"], x["noise"], time_k, delay=x["delay"]
+                )
+            u_t = x["noise"] - x["actions"]
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(obs_k, x_t, model_time)
+            suffix_view = jnp.concatenate(
+                [prefix_mask, jnp.ones((b, mem_len), dtype=bool), causal_mask_k & ~x["causal_fast"]], axis=1
+            )
+            full_attn_mask = jnp.concatenate(
+                [
+                    einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1]),
+                    make_attn_mask(suffix_mask, suffix_ar_mask),
+                ],
+                axis=-1,
+            )
+            suffix_positions = prefix_len + mem_len + causal_len + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=suffix_positions,
+                kv_cache=jax.lax.stop_gradient(kv_cache),
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -ah:])
+            flow_tokens = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            flow = jnp.mean(_rtc.renormalize_flow_loss(flow_tokens, rtc_loss_mask), axis=-1)
 
-        # read with the live h_t and run [memory | causal] as one extension of the cache,
-        # exactly like the inference append + teacher-forced decode
-        retrieved = self.memory.read(memory_state, h_t)
-        mem_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
-        causal_emb = self.PaliGemma.llm(observation.tokenized_causal, method="embed")
-        ext_tokens = jnp.concatenate([mem_tokens, causal_emb], axis=1)
+            # 4. write AFTER prediction (inference order); padded steps leave the state
+            # bit-identical (no decay tick)
+            write_source = self._select_memory_write_source(h_k, c_k)
+            new_state, _ = self.memory.write(state, write_source)
+            valid = x["step_valid"]
+            state = jax.tree.map(
+                lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
+            )
 
-        causal_mask = observation.tokenized_causal_mask
-        mem_rows = make_memory_step_mask(prefix_mask, prefix_ar_mask, mem_len, causal_len)
-        tri = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))
-        causal_rows = jnp.concatenate(
-            [
-                einops.repeat(prefix_mask, "b p -> b c p", c=causal_len),
-                jnp.ones((batch, causal_len, mem_len), dtype=bool),
-                tri[None] & causal_mask[:, None, :],
-            ],
-            axis=-1,
-        )
-        ext_mask = jnp.concatenate([mem_rows, causal_rows], axis=1)
-        ext_positions = jnp.broadcast_to(
-            prefix_len + jnp.arange(mem_len + causal_len)[None], (batch, mem_len + causal_len)
-        )
-        kv_cache = jax.tree.map(
-            lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache
-        )
-        (ext_out, _), kv_cache = self.PaliGemma.llm(
-            [ext_tokens, None], mask=ext_mask, positions=ext_positions, kv_cache=kv_cache, cache_position=prefix_len
-        )
-        mem_out, causal_out = ext_out[:, :mem_len], ext_out[:, mem_len:]
+            # 5. quiz probe on the post-write state (reading is pure -- the chain is
+            # bit-identical with probes on or off)
+            if quiz:
+                probe_read = self.memory.read(state, h_k)
+                pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
+                probe_logits = self.probe_head(pooled).astype(jnp.float32)
+                probe_logp = jax.nn.log_softmax(probe_logits, axis=-1)
+                actf = x["probe_act"].astype(jnp.float32)
+                probe_ce = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf
+                probe_correct = (jnp.argmax(probe_logits, axis=-1) == x["probe_label"]).astype(jnp.float32) * actf
+                probe_vis = x["probe_vis"].astype(jnp.float32)
+            else:
+                probe_ce = probe_correct = actf = probe_vis = jnp.zeros((b,), dtype=jnp.float32)
 
-        # next-token CE over the causal segment; token 0 is predicted from the memory readout
-        ce_hidden = jnp.concatenate([mem_out[:, -1:], causal_out[:, :-1]], axis=1)
-        logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
-        token_logp = jnp.take_along_axis(
-            jax.nn.log_softmax(logits, axis=-1), observation.tokenized_causal[..., None], axis=-1
-        )[..., 0]
-        ce_loss = -jnp.sum(token_logp * causal_mask, axis=-1) / jnp.clip(jnp.sum(causal_mask, axis=-1), 1)
+            validf = valid.astype(jnp.float32)
+            return state, (ce * validf, flow * validf, validf, probe_ce, probe_correct, actf, probe_vis)
 
-        # flow matching through the action expert only; the suffix sits at the static offset and
-        # sees [context | memory | causal minus the FAST branch]
-        kv_cache = jax.lax.stop_gradient(kv_cache)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        suffix_view = jnp.concatenate(
-            [prefix_mask, jnp.ones((batch, mem_len), dtype=bool), causal_mask & ~observation.causal_fast_mask],
-            axis=1,
-        )
-        prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
-        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-        suffix_positions = prefix_len + mem_len + causal_len + jnp.cumsum(suffix_mask, axis=-1) - 1
-        (_, suffix_out), _ = self.PaliGemma.llm(
-            [None, suffix_tokens],
-            mask=full_attn_mask,
-            positions=suffix_positions,
-            kv_cache=kv_cache,
-            adarms_cond=[None, adarms_cond],
-        )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        losses = {"flow": jnp.mean(jnp.square(v_t - u_t), axis=-1), "ce": ce_loss}
+        _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), self.memory.init_state(b), xs)
+        ce_steps, flow_steps, valid_steps, probe_ce, probe_cor, probe_act, probe_vis = ys  # each [t, b]
+        n_valid = jnp.clip(jnp.sum(valid_steps, axis=0), 1)
+        losses = {"flow": jnp.sum(flow_steps, axis=0) / n_valid, "ce": jnp.sum(ce_steps, axis=0) / n_valid}
         if quiz:
-            # ce/cor steps are pre-masked by `active`; `visible` is a subset of `active`. The
-            # grid slices give per-probe-position stats (position index counts from the window
-            # start; the trainer logs them per window-size bucket).
-            grid_idx = np.asarray(grid)
             losses.update(
                 {
-                    "probe_ce_sum": jnp.sum(ce_steps, axis=1),
-                    "probe_count": jnp.sum(act_steps, axis=1),
-                    "probe_correct": jnp.sum(cor_steps, axis=1),
-                    "probe_count_visible": jnp.sum(vis_steps, axis=1),
-                    "probe_correct_visible": jnp.sum(cor_steps * vis_steps, axis=1),
-                    "probe_correct_grid": cor_steps[:, grid_idx],
-                    "probe_active_grid": act_steps[:, grid_idx],
+                    "probe_ce_sum": jnp.sum(probe_ce, axis=0),
+                    "probe_count": jnp.sum(probe_act, axis=0),
+                    "probe_correct": jnp.sum(probe_cor, axis=0),
+                    "probe_count_visible": jnp.sum(probe_vis, axis=0),
+                    "probe_correct_visible": jnp.sum(probe_cor * probe_vis, axis=0),
+                    # per-STEP quiz stats (position 0 = sequence start); the trainer logs one
+                    # accuracy scalar per step index
+                    "probe_correct_grid": jnp.moveaxis(probe_cor, 0, 1),
+                    "probe_active_grid": jnp.moveaxis(probe_act, 0, 1),
                 }
             )
         return losses
+
+    def _augment_sequence_images(self, rng: at.KeyArrayLike, images: dict[str, at.Array]) -> dict[str, at.Array]:
+        """Train-time image augmentation for sequence samples: the [b, T] axes are folded and
+        every frame is augmented independently (same transform set as preprocess_observation)."""
+        out = {}
+        for key, image in images.items():
+            b, t = image.shape[:2]
+            flat = image.reshape(b * t, *image.shape[2:]) / 2.0 + 0.5
+            transforms = []
+            if "wrist" not in key:
+                height, width = flat.shape[1:3]
+                transforms += [
+                    augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+                    augmax.Resize(width, height),
+                    augmax.Rotate((-5, 5)),
+                ]
+            transforms += [augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)]
+            rng, sub_rng = jax.random.split(rng)
+            flat = jax.vmap(augmax.Chain(*transforms))(jax.random.split(sub_rng, b * t), flat)
+            out[key] = (flat * 2.0 - 1.0).reshape(image.shape)
+        return out

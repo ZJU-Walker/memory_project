@@ -110,34 +110,36 @@ class Observation(Generic[ArrayT]):
     # training-time-only CE target for the VLM and are hidden from the flow matching action expert.
     token_fast_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # pi05 memory co-training fields (Pi0Config.predict_with_memory). Training layout:
-    # [images | context (tokenized_prompt) | memory | causal | action suffix].
+    # pi05 memory co-training fields (Pi0Config.predict_with_memory). Layout per step:
+    # [images | context (tokenized_prompt) | memory | causal (subtask+FAST) | action suffix].
+    #
+    # SEQUENCE TRAINING (RoboTTT-style): a training sample is a contiguous run of T prediction
+    # steps from one episode (one step per executed action chunk). All standard fields then
+    # carry a leading step axis -- images [b, T, h, w, c], state [b, T, s],
+    # tokenized_prompt [b, T, l], tokenized_causal [b, T, cl], actions [b, T, ah, ad] -- which
+    # their `*b` shape annotations absorb. The memory starts blank at step 0, is written once
+    # per step, and the model predicts (and is graded) at every step. `seq_step_mask` present
+    # marks a sequence sample. At inference every field is single-frame as usual.
 
     # Causal subtask+FAST segment (every valid token is a CE target; left-aligned).
     tokenized_causal: at.Int[ArrayT, "*b cl"] | None = None
     tokenized_causal_mask: at.Bool[ArrayT, "*b cl"] | None = None
     # Marks the FAST branch within the causal segment (hidden from the action expert).
     causal_fast_mask: at.Bool[ArrayT, "*b cl"] | None = None
-    # Detached write-window hidden states from the trainer's cache, oldest first ([b, wc, n, emb]).
-    memory_hiddens: at.Float[ArrayT, "*b wc n emb"] | None = None
-    # Global dataset frame indices of the detached writes (used by the trainer to gather
-    # memory_hiddens from its cache before the step; unused inside the model).
-    memory_cache_indices: at.Int[ArrayT, "*b wc"] | None = None
-    # Live-window inputs for the newest writes, recomputed with the current VLM: per-camera
-    # images ([b, wl, h, w, c], float32 in [-1, 1], already resized) and the tokenized context of
-    # each past frame (its state is embedded in the tokens, pi05-style).
-    window_images: dict[str, at.Float[ArrayT, "*b wl h w c"]] | None = None
-    window_tokens: at.Int[ArrayT, "*b wl l"] | None = None
-    window_token_masks: at.Bool[ArrayT, "*b wl l"] | None = None
-    # Validity of each write in [detached..., live...] order (False before the episode start).
-    memory_write_mask: at.Bool[ArrayT, "*b nw"] | None = None
-    # Quiz-probe supervision (train-only; see Pi0Config.memory_probe_weight). Per write position:
-    # the class label of the episode's answer (banana side; -1 = unknown), whether the position
-    # is quizzable (a real write at/after the episode's reveal frame), and whether the answer is
-    # still visible on screen at that write (bins open; used only to split the accuracy logs).
-    memory_probe_labels: at.Int[ArrayT, "*b nw"] | None = None
-    memory_probe_mask: at.Bool[ArrayT, "*b nw"] | None = None
-    memory_probe_visible: at.Bool[ArrayT, "*b nw"] | None = None
+    # NOTE: in a sequence sample `*b` binds to (batch, T) via the standard fields, so the
+    # per-step masks below use their own leading axes ([T] unbatched, [batch, T] collated).
+    # True for real steps; False for padding past the episode/slice end (losses masked, writes
+    # are exact no-ops on the memory).
+    seq_step_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    # Gradient-block fence: True at steps where backprop through the memory state is cut at
+    # this step's entry (the state content itself always flows through). Never True at step 0.
+    seq_block_boundary: at.Bool[ArrayT, "*sb st"] | None = None
+    # Quiz-probe supervision per step (train-only; see Pi0Config.memory_probe_weight): answer
+    # class (-1 = unknown), quizzable (the reveal has been written into THIS sequence's memory
+    # by this step), and answer-still-on-screen (accuracy-split logging only).
+    seq_probe_labels: at.Int[ArrayT, "*sb st"] | None = None
+    seq_probe_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_probe_visible: at.Bool[ArrayT, "*sb st"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -163,15 +165,11 @@ class Observation(Generic[ArrayT]):
             tokenized_causal=data.get("tokenized_causal"),
             tokenized_causal_mask=data.get("tokenized_causal_mask"),
             causal_fast_mask=data.get("causal_fast_mask"),
-            memory_hiddens=data.get("memory_hiddens"),
-            memory_cache_indices=data.get("memory_cache_indices"),
-            window_images=data.get("window_images"),
-            window_tokens=data.get("window_tokens"),
-            window_token_masks=data.get("window_token_masks"),
-            memory_write_mask=data.get("memory_write_mask"),
-            memory_probe_labels=data.get("memory_probe_labels"),
-            memory_probe_mask=data.get("memory_probe_mask"),
-            memory_probe_visible=data.get("memory_probe_visible"),
+            seq_step_mask=data.get("seq_step_mask"),
+            seq_block_boundary=data.get("seq_block_boundary"),
+            seq_probe_labels=data.get("seq_probe_labels"),
+            seq_probe_mask=data.get("seq_probe_mask"),
+            seq_probe_visible=data.get("seq_probe_visible"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

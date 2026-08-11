@@ -1,5 +1,6 @@
 from collections.abc import Iterator, Sequence
 import dataclasses
+import functools
 import json
 import logging
 import multiprocessing
@@ -122,18 +123,25 @@ class FakeDataset(Dataset):
         action = jax.tree.map(make_from_spec, self._action_spec)
 
         # Bool specs default to all-False and int specs to large randoms, which would leave the
-        # memory plumbing untested on fake data: make the newest half of the writes valid and,
-        # when the quiz is enabled, quizzable with valid class labels.
-        if observation.memory_write_mask is not None:
-            nw = observation.memory_write_mask.shape[0]
-            observation = dataclasses.replace(observation, memory_write_mask=jnp.arange(nw) >= nw // 2)
-        if observation.memory_probe_labels is not None:
-            nw = observation.memory_probe_labels.shape[0]
+        # memory plumbing untested on fake data: make all but the last step real, put one
+        # gradient-block fence mid-sequence, and (when the quiz is enabled) quiz the newer half
+        # with valid class labels.
+        if observation.seq_step_mask is not None:
+            t = observation.seq_step_mask.shape[0]
+            step_mask = jnp.arange(t) < max(t - 1, 1)
             observation = dataclasses.replace(
                 observation,
-                memory_probe_labels=observation.memory_probe_labels % 2,
-                memory_probe_mask=observation.memory_write_mask,
-                memory_probe_visible=observation.memory_write_mask & (jnp.arange(nw) < 3 * nw // 4),
+                seq_step_mask=step_mask,
+                seq_block_boundary=(jnp.arange(t) == t // 2) & (t > 2),
+            )
+        if observation.seq_probe_labels is not None:
+            t = observation.seq_probe_labels.shape[0]
+            probe_mask = observation.seq_step_mask & (jnp.arange(t) >= t // 2)
+            observation = dataclasses.replace(
+                observation,
+                seq_probe_labels=observation.seq_probe_labels % 2,
+                seq_probe_mask=probe_mask,
+                seq_probe_visible=probe_mask & (jnp.arange(t) < 3 * t // 4),
             )
 
         return {
@@ -146,18 +154,9 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig,
-    action_horizon: int,
-    model_config: _model.BaseModelConfig,
-    *,
-    window_frames: int | None = None,
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training.
-
-    `window_frames` overrides the number of live write-window frames fetched per sample
-    (memory co-training with window-size buckets: one dataset per bucket, since lerobot's
-    delta_timestamps are fixed at creation).
-    """
+    """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -165,32 +164,62 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    delta_timestamps = {
-        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-    }
-    if data_config.subtask_from_task and data_config.subtask_lookahead > 0:
-        # Deliver the *future* task_index: the subtask label that conditions this frame's chunk.
-        delta_timestamps["task_index"] = [data_config.subtask_lookahead / dataset_meta.fps]
     use_memory = getattr(model_config, "predict_with_memory", False) and data_config.memory_stride_frames > 0
     if use_memory:
-        # Memory co-training: also fetch the newest live write-window frames, stacked oldest
-        # first with the current frame riding along at offset 0 (split by SplitMemoryWindow).
-        live = window_frames if window_frames is not None else model_config.memory_live_writes
+        # Memory sequence training: each sample is T consecutive prediction steps anchored at
+        # the sampled base frame -- per-step images/state at (base + k*stride), the flat action
+        # stream for all T chunks, and the per-step (lookahead-shifted) task_index for the
+        # subtask labels. lerobot clamps offsets past the episode end by repeating the last
+        # frame; BuildMemorySequence masks those steps out.
+        steps = model_config.memory_seq_steps
         stride = data_config.memory_stride_frames
-        offsets = [-(live - j) * stride / dataset_meta.fps for j in range(live)] + [0.0]
+        step_offsets = [k * stride / dataset_meta.fps for k in range(steps)]
+        delta_timestamps = {
+            key: [(k * stride + j) / dataset_meta.fps for k in range(steps) for j in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        }
         for key in ("image", "left_wrist_image", "right_wrist_image", "state"):
-            delta_timestamps[key] = offsets
+            delta_timestamps[key] = step_offsets
+        # NOTE: no task_index delta_timestamps -- lerobot requires a scalar task_index per item
+        # (it .item()s it); the per-step subtask labels come from MemorySequenceSubtasks below.
+    else:
+        delta_timestamps = {
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        }
+        if data_config.subtask_from_task and data_config.subtask_lookahead > 0:
+            # Deliver the *future* task_index: the subtask label that conditions this frame's chunk.
+            delta_timestamps["task_index"] = [data_config.subtask_lookahead / dataset_meta.fps]
     dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    if data_config.subtask_from_task:
+    if data_config.subtask_from_task and not use_memory:
         dataset = TransformedDataset(dataset, [_transforms.SubtaskFromLeRobotTask(dataset_meta.tasks)])
 
-    if use_memory and getattr(model_config, "memory_probe_weight", 0) > 0:
-        side, reveal, close = _episode_quiz_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
-        dataset = TransformedDataset(dataset, [_transforms.MemoryQuizInfo(side, reveal, close)])
+    if use_memory:
+        info = _episode_info_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
+        quiz = getattr(model_config, "memory_probe_weight", 0) > 0
+        seq_transforms: list[_transforms.DataTransformFn] = []
+        if data_config.subtask_from_task:
+            seq_transforms.append(
+                _transforms.MemorySequenceSubtasks(
+                    stride=data_config.memory_stride_frames,
+                    steps=model_config.memory_seq_steps,
+                    lookahead=data_config.subtask_lookahead,
+                    episode_tasks=info["episode_tasks"],
+                    tasks=dataset_meta.tasks,
+                )
+            )
+        seq_transforms.append(
+            _transforms.MemoryEpisodeInfo(
+                episode_length=info["length"],
+                episode_side=info["side"] if quiz else None,
+                episode_reveal=info["reveal"] if quiz else None,
+                episode_close=info["close"] if quiz else None,
+            )
+        )
+        dataset = TransformedDataset(dataset, seq_transforms)
 
     return dataset
 
@@ -202,29 +231,48 @@ _DEFAULT_REVEAL_FRAME = 300
 _DEFAULT_VISIBLE_SPAN = 150
 
 
-def _episode_quiz_table(
-    dataset: Dataset, dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, reveal_frames_path: str | None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-episode quiz supervision: the answer class from each episode's FINAL subtask label
-    ("open left bin" -> 0, "open right bin" -> 1, otherwise -1 = never quizzed) plus the reveal
-    and close frames from the optional json ({"<episode_index>": reveal | [reveal, close]}).
-    """
+def _unwrap_lerobot(dataset: Dataset) -> lerobot_dataset.LeRobotDataset | None:
     inner = dataset
     while isinstance(inner, TransformedDataset):
         inner = inner._dataset  # noqa: SLF001
-    cols = inner.hf_dataset.with_format(None)
+    return inner if isinstance(inner, lerobot_dataset.LeRobotDataset) else None
+
+
+def _episode_info_table(
+    dataset: Dataset, dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, reveal_frames_path: str | None
+) -> dict[str, np.ndarray]:
+    """Per-episode metadata for memory sequence training:
+    * "length": frames in the episode;
+    * "switch": the first frame whose (unshifted) task label differs from the episode's
+      opening one -- the decision moment (episode length when there is no switch);
+    * "side": the answer class from the FINAL subtask label ("open left bin" -> 0,
+      "open right bin" -> 1, otherwise -1 = never quizzed);
+    * "reveal"/"close": when the answer becomes visible / hidden again, from the optional
+      json ({"<episode_index>": reveal | [reveal, close]}), defaults otherwise.
+    """
+    cols = _unwrap_lerobot(dataset).hf_dataset.with_format(None)
     task = np.asarray(cols["task_index"], dtype=np.int64)
     episode = np.asarray(cols["episode_index"], dtype=np.int64)
 
     num_episodes = int(episode.max()) + 1
+    starts = np.nonzero(np.append(True, episode[1:] != episode[:-1]))[0]
+    ends = np.append(starts[1:], len(episode))
+    length = (ends - starts).astype(np.int32)
+
     side = np.full(num_episodes, -1, dtype=np.int32)
-    last_of_episode = np.nonzero(np.append(episode[1:] != episode[:-1], True))[0]
-    for e, last in zip(episode[last_of_episode], last_of_episode, strict=True):
-        final_task = dataset_meta.tasks[int(task[last])].lower()
+    switch = length.copy()
+    for e in range(num_episodes):
+        ep_task = task[starts[e] : ends[e]]
+        final_task = dataset_meta.tasks[int(ep_task[-1])].lower()
         if "left" in final_task:
             side[e] = 0
         elif "right" in final_task:
             side[e] = 1
+        changed = np.nonzero(ep_task != ep_task[0])[0]
+        if len(changed) > 0:
+            switch[e] = int(changed[0])
+
+    episode_tasks = tuple(task[starts[e] : ends[e]] for e in range(num_episodes))
 
     reveal = np.full(num_episodes, _DEFAULT_REVEAL_FRAME, dtype=np.int32)
     close = reveal + _DEFAULT_VISIBLE_SPAN
@@ -237,40 +285,182 @@ def _episode_quiz_table(
             reveal[e], close[e] = (value, value + _DEFAULT_VISIBLE_SPAN) if np.isscalar(value) else value
             labeled += 1
     logging.info(
-        f"quiz table: {int((side >= 0).sum())}/{num_episodes} episodes labeled "
-        f"({int((side == 0).sum())} left / {int((side == 1).sum())} right), "
+        f"episode table: {num_episodes} episodes (len {length.min()}-{length.max()}), "
+        f"{int((side >= 0).sum())} sided ({int((side == 0).sum())}L/{int((side == 1).sum())}R), "
         f"reveal frames: {labeled} from json, {num_episodes - labeled} at default {_DEFAULT_REVEAL_FRAME}"
     )
-    return side, reveal, close
+    return {
+        "length": length,
+        "switch": switch,
+        "side": side,
+        "reveal": reveal,
+        "close": close,
+        "episode_tasks": episode_tasks,
+    }
 
 
-def _decision_frame_weights(dataset: Dataset, lookahead: int, weight: float) -> np.ndarray | None:
-    """Per-frame sampling weights that oversample the subtask decision regions.
+@dataclasses.dataclass(frozen=True)
+class _SequenceSamplingInfo:
+    weights: np.ndarray
+    valid_steps: np.ndarray
 
-    A decision region is the +-lookahead frames around each within-episode task change: the
-    frames whose (lookahead-shifted) subtask label cannot be predicted from the current
-    observation alone, i.e. the only frames whose CE pressures the memory read.
+
+def _sequence_sampling_info(
+    dataset: Dataset,
+    dataset_meta: lerobot_dataset.LeRobotDatasetMetadata,
+    data_config: "_config.DataConfig",
+    max_steps: int,
+) -> _SequenceSamplingInfo | None:
+    """Per-frame weights over sequence START frames (memory sequence training).
+
+    A sample is either a FULL trajectory (start = frame 0 of an episode, probability
+    1 - memory_slice_prob) or a random contiguous SLICE (any other allowed start frame). Slice
+    starts must leave at least memory_min_slice_steps steps before the episode end and may not
+    fall in the dead zone between the reveal and the decision switch: a memory starting blank
+    there never saw the answer, yet the choice labels would still demand it -- grading that
+    teaches guessing.
     """
-    inner = dataset
-    while isinstance(inner, TransformedDataset):
-        inner = inner._dataset  # noqa: SLF001
-    if not isinstance(inner, lerobot_dataset.LeRobotDataset):
+    inner = _unwrap_lerobot(dataset)
+    if inner is None:
         return None
+    info = _episode_info_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
     cols = inner.hf_dataset.with_format(None)
-    task = np.asarray(cols["task_index"], dtype=np.int64)
     episode = np.asarray(cols["episode_index"], dtype=np.int64)
-    weights = np.ones(len(task), dtype=np.float64)
-    switches = np.nonzero((task[1:] != task[:-1]) & (episode[1:] == episode[:-1]))[0] + 1
-    if len(switches) == 0:
-        return None
-    for s in switches:
-        weights[max(s - lookahead, 0) : s + lookahead] = weight
-    region = weights > 1
+    starts = np.nonzero(np.append(True, episode[1:] != episode[:-1]))[0]
+    frame = np.arange(len(episode)) - starts[np.searchsorted(starts, np.arange(len(episode)), side="right") - 1]
+
+    length = info["length"][episode]
+    reveal = info["reveal"][episode]
+    switch = info["switch"][episode]
+    min_frames = data_config.memory_min_slice_steps * data_config.memory_stride_frames
+    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~((frame > reveal) & (frame < switch))
+
+    slice_prob = data_config.memory_slice_prob
+    weights = np.zeros(len(episode), dtype=np.float64)
+    n_full = int((frame == 0).sum())
+    weights[frame == 0] = (1.0 - slice_prob) / max(n_full, 1)
+    if slice_prob > 0 and int(slice_ok.sum()) > 0:
+        weights[slice_ok] = slice_prob / int(slice_ok.sum())
     logging.info(
-        f"decision oversampling: {len(switches)} switches, {int(region.sum())} of {len(weights)} frames "
-        f"x{weight:g} -> {weights[region].sum() / weights.sum():.0%} of samples"
+        f"sequence sampling: {n_full} full-trajectory starts (p={1 - slice_prob:g}), "
+        f"{int(slice_ok.sum())} slice starts (p={slice_prob:g}), "
+        f"{int((~slice_ok & (frame > 0)).sum())} frames excluded (dead zone / too close to end)"
     )
-    return weights
+    stride = data_config.memory_stride_frames
+    valid_steps = np.minimum((length - frame + stride - 1) // stride, max_steps).astype(np.int32)
+    return _SequenceSamplingInfo(weights=weights, valid_steps=valid_steps)
+
+
+def _validate_sequence_buckets(buckets: Sequence[int], max_steps: int) -> tuple[int, ...]:
+    buckets = tuple(int(x) for x in buckets)
+    if not buckets:
+        return ()
+    if any(x <= 0 for x in buckets) or tuple(sorted(set(buckets))) != buckets:
+        raise ValueError(f"memory_sequence_buckets must be positive and strictly increasing; got {buckets}.")
+    if buckets[-1] != max_steps:
+        raise ValueError(
+            f"the final memory_sequence_buckets entry must equal memory_seq_steps ({max_steps}); got {buckets[-1]}."
+        )
+    return buckets
+
+
+def _sequence_bucket_ids(valid_steps: np.ndarray, buckets: Sequence[int]) -> np.ndarray:
+    bucket_array = np.asarray(buckets, dtype=np.int32)
+    valid_steps = np.asarray(valid_steps, dtype=np.int32)
+    if bucket_array.ndim != 1 or len(bucket_array) == 0:
+        raise ValueError("at least one sequence bucket is required.")
+    if np.any(valid_steps <= 0):
+        raise ValueError("sequence valid lengths must be positive.")
+    bucket_ids = np.searchsorted(bucket_array, valid_steps, side="left")
+    if np.any(bucket_ids == len(bucket_array)):
+        raise ValueError(
+            f"sequence length {int(valid_steps.max())} exceeds the largest bucket {int(bucket_array[-1])}."
+        )
+    return bucket_ids.astype(np.int32)
+
+
+class SequenceBucketBatchSampler(torch.utils.data.Sampler[list[int]]):
+    """Samples homogeneous-shape batches without changing the marginal start distribution.
+
+    A bucket is drawn according to the total original sampling weight assigned to it, then all
+    indices in the batch are drawn with replacement from that bucket using their conditional
+    weights. Therefore every individual draw still has exactly the same marginal probability
+    as WeightedRandomSampler; only within-batch lengths become correlated.
+    """
+
+    def __init__(
+        self,
+        weights: np.ndarray,
+        valid_steps: np.ndarray,
+        buckets: Sequence[int],
+        batch_size: int,
+        *,
+        generator: torch.Generator,
+        num_samples: int | None = None,
+    ):
+        weights = torch.as_tensor(np.asarray(weights), dtype=torch.float64)
+        valid_steps = np.asarray(valid_steps, dtype=np.int32)
+        if weights.ndim != 1 or valid_steps.shape != tuple(weights.shape):
+            raise ValueError("weights and valid_steps must be one-dimensional arrays with matching lengths.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if torch.any(weights < 0) or not torch.isfinite(weights).all() or float(weights.sum()) <= 0:
+            raise ValueError("sampling weights must be finite, nonnegative, and have positive total mass.")
+
+        if not buckets:
+            raise ValueError("at least one sequence bucket is required.")
+        self.buckets = _validate_sequence_buckets(buckets, int(tuple(buckets)[-1]))
+        bucket_ids = _sequence_bucket_ids(valid_steps, self.buckets)
+        positive = weights > 0
+        self._indices: list[torch.Tensor] = []
+        self._conditional_weights: list[torch.Tensor] = []
+        masses = []
+        active_buckets = []
+        for bucket_id, bucket_steps in enumerate(self.buckets):
+            indices = torch.from_numpy(np.nonzero((bucket_ids == bucket_id) & np.asarray(positive))[0])
+            if len(indices) == 0:
+                continue
+            bucket_weights = weights[indices]
+            mass = bucket_weights.sum()
+            if float(mass) <= 0:
+                continue
+            active_buckets.append(bucket_steps)
+            self._indices.append(indices)
+            self._conditional_weights.append(bucket_weights)
+            masses.append(mass)
+
+        if not masses:
+            raise ValueError("no positive-weight sequence starts were assigned to a bucket.")
+        self.active_buckets = tuple(active_buckets)
+        self._bucket_masses = torch.stack(masses)
+        self._batch_size = batch_size
+        self._num_samples = len(weights) if num_samples is None else int(num_samples)
+        if self._num_samples < batch_size:
+            raise ValueError("num_samples must be at least batch_size.")
+        self._generator = generator
+
+        total_mass = float(self._bucket_masses.sum())
+        logging.info(
+            "sequence bucket sampling: "
+            + ", ".join(
+                f"T{steps}={100 * float(mass) / total_mass:.2f}%"
+                for steps, mass in zip(self.active_buckets, self._bucket_masses, strict=True)
+            )
+        )
+
+    def __iter__(self):
+        for _ in range(len(self)):
+            bucket_id = int(torch.multinomial(self._bucket_masses, 1, replacement=True, generator=self._generator))
+            local = torch.multinomial(
+                self._conditional_weights[bucket_id],
+                self._batch_size,
+                replacement=True,
+                generator=self._generator,
+            )
+            yield self._indices[bucket_id][local].tolist()
+
+    def __len__(self) -> int:
+        return self._num_samples // self._batch_size
 
 
 def create_rlds_dataset(
@@ -369,6 +559,8 @@ def create_data_loader(
     )
 
     if data_config.rlds_data_dir is not None:
+        if config.gradient_accumulation_steps != 1:
+            raise NotImplementedError("Gradient accumulation is currently supported only by the JAX TorchDataLoader.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -391,6 +583,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
 
 
@@ -407,6 +600,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    gradient_accumulation_steps: int = 1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -425,72 +619,78 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    buckets = tuple(data_config.memory_window_buckets)
-    use_buckets = (
-        len(buckets) > 0
-        and framework == "jax"
-        and shuffle
-        and getattr(model_config, "predict_with_memory", False)
-        and data_config.memory_stride_frames > 0
-    )
+    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    def build_one(window_frames: int | None, loader_seed: int, workers: int) -> "TorchDataLoader":
-        dataset = create_torch_dataset(data_config, action_horizon, model_config, window_frames=window_frames)
-        dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if framework != "jax" and gradient_accumulation_steps != 1:
+        raise NotImplementedError("Gradient accumulation is supported only by the JAX trainer.")
 
-        # Use TorchDataLoader for both frameworks
-        # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-        # For JAX, divide by process count
-        sampler = None
-        if framework == "pytorch":
-            if torch.distributed.is_initialized():
-                sampler = torch.utils.data.distributed.DistributedSampler(
-                    dataset,
-                    num_replicas=torch.distributed.get_world_size(),
-                    rank=torch.distributed.get_rank(),
-                    shuffle=shuffle,
-                    drop_last=True,
-                )
-                local_batch_size = batch_size // torch.distributed.get_world_size()
-            else:
-                local_batch_size = batch_size
+    # Use TorchDataLoader for both frameworks
+    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
+    # For JAX, divide by process count
+    sampler = None
+    batch_sampler = None
+    collate_fn = _collate_fn
+    if framework == "pytorch":
+        if torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
+            local_batch_size = batch_size // torch.distributed.get_world_size()
         else:
-            local_batch_size = batch_size // jax.process_count()
-            if shuffle and data_config.memory_decision_oversample > 1 and data_config.subtask_lookahead > 0:
-                weights = _decision_frame_weights(
-                    dataset, data_config.subtask_lookahead, data_config.memory_decision_oversample
-                )
-                if weights is not None:
-                    generator = torch.Generator()
-                    generator.manual_seed(loader_seed)
+            local_batch_size = batch_size
+    else:
+        local_batch_size = batch_size // jax.process_count()
+        use_memory = getattr(model_config, "predict_with_memory", False) and data_config.memory_stride_frames > 0
+        if shuffle and use_memory:
+            dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+            sampling = _sequence_sampling_info(dataset, dataset_meta, data_config, model_config.memory_seq_steps)
+            if sampling is not None:
+                generator = torch.Generator()
+                generator.manual_seed(seed)
+                buckets = _validate_sequence_buckets(data_config.memory_sequence_buckets, model_config.memory_seq_steps)
+                if buckets:
+                    batch_sampler = SequenceBucketBatchSampler(
+                        sampling.weights,
+                        sampling.valid_steps,
+                        buckets,
+                        local_batch_size,
+                        generator=generator,
+                    )
+                    collate_fn = functools.partial(
+                        _sequence_bucket_collate_fn,
+                        buckets=buckets,
+                        max_steps=model_config.memory_seq_steps,
+                    )
+                else:
                     sampler = torch.utils.data.WeightedRandomSampler(
-                        torch.as_tensor(weights), num_samples=len(weights), replacement=True, generator=generator
+                        torch.as_tensor(sampling.weights),
+                        num_samples=len(sampling.weights),
+                        replacement=True,
+                        generator=generator,
                     )
 
-        logging.info(f"local_batch_size: {local_batch_size}")
-        return TorchDataLoader(
-            dataset,
-            local_batch_size=local_batch_size,
-            sharding=None if framework == "pytorch" else sharding,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
-            num_batches=num_batches,
-            num_workers=workers,
-            seed=loader_seed,
-            framework=framework,
-        )
+    logging.info(f"local_batch_size: {local_batch_size}")
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=(sampler is None and batch_sampler is None and shuffle),
+        sampler=sampler,
+        batch_sampler=batch_sampler,
+        collate_fn=collate_fn,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
 
-    if not use_buckets:
-        return DataLoaderImpl(data_config, build_one(None, seed, num_workers))
-
-    # Window-size buckets: one loader per bucket (delta_timestamps are fixed at dataset
-    # creation), each yielding whole batches of its own shape; a seeded RNG picks the bucket for
-    # every batch. The worker budget is split across the buckets -- they all prefetch in
-    # parallel, so total decode throughput is what matters.
-    workers_each = num_workers // len(buckets) if num_workers > 0 else 0
-    loaders = [build_one(window, seed + 1000 * i, workers_each) for i, window in enumerate(buckets)]
-    logging.info(f"window buckets: {buckets}, {workers_each} workers each")
-    return DataLoaderImpl(data_config, BucketedTorchLoader(loaders, seed=seed))
+    return DataLoaderImpl(data_config, data_loader)
 
 
 def create_rlds_data_loader(
@@ -545,10 +745,13 @@ class TorchDataLoader:
         sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
+        batch_sampler: torch.utils.data.Sampler[list[int]] | None = None,
+        collate_fn: typing.Callable | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        gradient_accumulation_steps: int = 1,
     ):
         """Create a PyTorch data loader.
 
@@ -570,6 +773,12 @@ class TorchDataLoader:
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if gradient_accumulation_steps < 1 or local_batch_size % gradient_accumulation_steps != 0:
+            raise ValueError(
+                f"Local batch size {local_batch_size} must be divisible by positive gradient accumulation steps "
+                f"{gradient_accumulation_steps}."
+            )
+        self._gradient_accumulation_steps = gradient_accumulation_steps
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -577,7 +786,9 @@ class TorchDataLoader:
             # Use data parallel sharding by default for JAX only.
             self._sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
+                jax.sharding.PartitionSpec("B")
+                if gradient_accumulation_steps == 1
+                else jax.sharding.PartitionSpec(None, "B"),
             )
         self._num_batches = num_batches
 
@@ -587,19 +798,31 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
-        )
+        common_kwargs = {
+            "num_workers": num_workers,
+            "multiprocessing_context": mp_context,
+            "persistent_workers": num_workers > 0,
+            "collate_fn": _collate_fn if collate_fn is None else collate_fn,
+            "worker_init_fn": _worker_init_fn,
+            "generator": generator,
+        }
+        if batch_sampler is None:
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_size=local_batch_size,
+                shuffle=(sampler is None and shuffle),
+                sampler=sampler,
+                drop_last=True,
+                **common_kwargs,
+            )
+        else:
+            if sampler is not None or shuffle:
+                raise ValueError("batch_sampler is mutually exclusive with sampler and shuffle.")
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_sampler=batch_sampler,
+                **common_kwargs,
+            )
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
@@ -617,6 +840,13 @@ class TorchDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                if self._gradient_accumulation_steps > 1:
+                    accumulation_steps = self._gradient_accumulation_steps
+                    microbatch_size = next(iter(jax.tree.leaves(batch))).shape[0] // accumulation_steps
+                    batch = jax.tree.map(
+                        lambda x, steps=accumulation_steps, size=microbatch_size: x.reshape(steps, size, *x.shape[1:]),
+                        batch,
+                    )
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -624,30 +854,69 @@ class TorchDataLoader:
                     yield jax.tree.map(torch.as_tensor, batch)
 
 
-class BucketedTorchLoader:
-    """Round-robins full batches from several TorchDataLoaders (one per window-size bucket).
-
-    Every yielded batch comes entirely from one bucket, so each batch has one static shape and
-    jit compiles exactly len(loaders) variants of the train step. The bucket sequence is drawn
-    from a seeded RNG (uniform), making it reproducible.
-    """
-
-    def __init__(self, loaders: Sequence[TorchDataLoader], *, seed: int = 0):
-        self._loaders = list(loaders)
-        self._seed = seed
-
-    def __iter__(self):
-        rng = np.random.default_rng(self._seed)
-        iterators = [iter(loader) for loader in self._loaders]
-        while True:
-            yield next(iterators[rng.integers(len(iterators))])
-
-
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+
+
+_SEQUENCE_TIME_KEYS = frozenset(
+    {
+        "image",
+        "image_mask",
+        "state",
+        "actions",
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+        "token_ar_mask",
+        "token_loss_mask",
+        "token_fast_mask",
+        "tokenized_causal",
+        "tokenized_causal_mask",
+        "causal_fast_mask",
+        "seq_step_mask",
+        "seq_block_boundary",
+        "seq_probe_labels",
+        "seq_probe_mask",
+        "seq_probe_visible",
+    }
+)
+
+
+def _sequence_bucket_collate_fn(items, *, buckets: Sequence[int], max_steps: int):
+    """Trim a homogeneous bucket batch before stacking and transferring it to JAX."""
+    if not items:
+        raise ValueError("cannot collate an empty sequence batch.")
+    valid_steps = np.asarray([np.count_nonzero(np.asarray(item["seq_step_mask"])) for item in items])
+    bucket_ids = _sequence_bucket_ids(valid_steps, buckets)
+    if np.any(bucket_ids != bucket_ids[0]):
+        raise ValueError(f"sequence bucket batch is not homogeneous: valid lengths {valid_steps.tolist()}.")
+    bucket_steps = int(tuple(buckets)[int(bucket_ids[0])])
+
+    def trim_time_axis(x):
+        x = np.asarray(x)
+        if x.ndim == 0 or x.shape[0] != max_steps:
+            raise ValueError(f"expected a temporal leaf with leading length {max_steps}; got shape {x.shape}.")
+        return x[:bucket_steps]
+
+    trimmed = []
+    for item in items:
+        unknown_temporal = [
+            key
+            for key, value in item.items()
+            if key not in _SEQUENCE_TIME_KEYS
+            and any(np.asarray(x).ndim > 0 and np.asarray(x).shape[0] == max_steps for x in jax.tree.leaves(value))
+        ]
+        if unknown_temporal:
+            raise ValueError(f"unregistered temporal sequence fields: {unknown_temporal}.")
+        trimmed.append(
+            {
+                key: jax.tree.map(trim_time_axis, value) if key in _SEQUENCE_TIME_KEYS else value
+                for key, value in item.items()
+            }
+        )
+    return _collate_fn(trimmed)
 
 
 def _worker_init_fn(worker_id: int) -> None:

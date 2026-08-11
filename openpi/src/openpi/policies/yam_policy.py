@@ -22,8 +22,11 @@ def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    # single frame [c, h, w] or a step sequence [t, c, h, w] -> channels-last
+    if image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
+    elif image.ndim == 4 and image.shape[1] == 3:
+        image = einops.rearrange(image, "t c h w -> t h w c")
     return image
 
 
@@ -42,6 +45,8 @@ class YamInputs(transforms.DataTransformFn):
         right_wrist_image = _parse_image(data["observation/right_wrist_image"])
 
         # The YAM setup has all three views (one third-person + two wrist), so none are padded.
+        # Sequence samples ([T, h, w, c] images) carry a per-step mask to match the step axis.
+        mask = np.ones(base_image.shape[0], dtype=bool) if base_image.ndim == 4 else np.True_
         inputs = {
             "state": data["observation/state"],
             "image": {
@@ -50,9 +55,9 @@ class YamInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": right_wrist_image,
             },
             "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_,
+                "base_0_rgb": mask,
+                "left_wrist_0_rgb": mask,
+                "right_wrist_0_rgb": mask,
             },
         }
 
@@ -68,15 +73,13 @@ class YamInputs(transforms.DataTransformFn):
         if "subtask" in data:
             inputs["subtask"] = data["subtask"]
 
-        # Memory co-training extras (live write-window inputs + bookkeeping) pass through.
+        # Memory sequence-training extras pass through.
         for key in (
-            "window_images",
-            "window_state",
-            "memory_cache_indices",
-            "memory_write_mask",
-            "memory_probe_labels",
-            "memory_probe_mask",
-            "memory_probe_visible",
+            "seq_step_mask",
+            "seq_block_boundary",
+            "seq_probe_labels",
+            "seq_probe_mask",
+            "seq_probe_visible",
         ):
             if key in data:
                 inputs[key] = data[key]
