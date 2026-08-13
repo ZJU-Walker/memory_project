@@ -14,6 +14,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 from . import train
 from openpi.models import model as _model
+from openpi.shared import nnx_utils
 from openpi.training import config as _config
 from openpi.training import optimizer as _optimizer
 from openpi.training import utils as training_utils
@@ -22,11 +23,13 @@ from openpi.training import utils as training_utils
 class _ToyModel(_model.BaseModel):
     """Deterministic model for exact full-batch/accumulated-update comparisons."""
 
-    def __init__(self):
+    def __init__(self, *, memory_probe_weight: float = 0.5, memory_probe_diagnostic: bool = False):
         super().__init__(action_dim=1, action_horizon=1, max_token_len=1)
         self.kernel = nnx.Param(jnp.asarray([[0.7]], dtype=jnp.float32))
+        self.probe_head = nnx.Param(jnp.asarray([[0.9]], dtype=jnp.float32))
         self.ce_loss_weight = 0.3
-        self.memory_probe_weight = 0.5
+        self.memory_probe_weight = memory_probe_weight
+        self.memory_probe_diagnostic = memory_probe_diagnostic
 
     def compute_loss(self, rng, observation, actions, *, train=False):
         del rng, train
@@ -35,10 +38,16 @@ class _ToyModel(_model.BaseModel):
         flow = jnp.mean(jnp.square(prediction - target), axis=1)
         ce = jnp.mean(jnp.square(prediction + 0.25 - target), axis=1)
 
+        if self.memory_probe_weight == 0 and not self.memory_probe_diagnostic:
+            return {"flow": flow, "ce": ce}
+
+        probe_prediction = prediction * self.probe_head.value[0, 0]
+        if self.memory_probe_diagnostic:
+            probe_prediction = jax.lax.stop_gradient(probe_prediction)
         probe_mask = observation.seq_probe_mask.astype(jnp.float32)
         probe_target = observation.seq_probe_labels.astype(jnp.float32)
-        probe_ce = jnp.square(prediction - probe_target) * probe_mask
-        probe_correct = (jnp.abs(prediction - probe_target) < 0.5).astype(jnp.float32) * probe_mask
+        probe_ce = jnp.square(probe_prediction - probe_target) * probe_mask
+        probe_correct = (jnp.abs(probe_prediction - probe_target) < 0.5).astype(jnp.float32) * probe_mask
         visible = observation.seq_probe_visible.astype(jnp.float32) * probe_mask
         return {
             "flow": flow,
@@ -58,7 +67,10 @@ class _ToyModel(_model.BaseModel):
 
 
 def _toy_train_state(config: _config.TrainConfig) -> training_utils.TrainState:
-    model = _ToyModel()
+    model = _ToyModel(
+        memory_probe_weight=config.model.memory_probe_weight,
+        memory_probe_diagnostic=config.model.memory_probe_diagnostic,
+    )
     params = nnx.state(model)
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule)
     trainable_params = params.filter(config.trainable_filter)
@@ -99,21 +111,130 @@ def test_probe_grid_metrics_stack_across_sequence_buckets():
 
     reduced = train._reduce_infos(
         [
-            {"probe_correct_grid": correct20, "probe_active_grid": active20},
-            {"probe_correct_grid": correct40, "probe_active_grid": active40},
-            {"probe_correct_grid": correct60, "probe_active_grid": active60},
+            {
+                "diagnostic/probe_correct_grid": correct20,
+                "diagnostic/probe_active_grid": active20,
+            },
+            {
+                "diagnostic/probe_correct_grid": correct40,
+                "diagnostic/probe_active_grid": active40,
+            },
+            {
+                "diagnostic/probe_correct_grid": correct60,
+                "diagnostic/probe_active_grid": active60,
+            },
         ]
     )
 
-    assert set(reduced) == {"probe_acc_grid"}
-    np.testing.assert_allclose(reduced["probe_acc_grid"][:20], 9 / 16, rtol=1e-6)
-    np.testing.assert_allclose(reduced["probe_acc_grid"][20:40], 8 / 14, rtol=1e-6)
-    np.testing.assert_allclose(reduced["probe_acc_grid"][40:], 0.5, rtol=1e-6)
+    assert set(reduced) == {"diagnostic/probe_accuracy_by_step"}
+    np.testing.assert_allclose(reduced["diagnostic/probe_accuracy_by_step"][:20], 9 / 16, rtol=1e-6)
+    np.testing.assert_allclose(reduced["diagnostic/probe_accuracy_by_step"][20:40], 8 / 14, rtol=1e-6)
+    np.testing.assert_allclose(reduced["diagnostic/probe_accuracy_by_step"][40:], 0.5, rtol=1e-6)
+
+
+def test_diagnostic_probe_metrics_are_count_weighted_and_namespaced():
+    reduced = train._reduce_infos(
+        [
+            {
+                "diagnostic/probe_loss_numerator": jnp.asarray(0.0),
+                "diagnostic/probe_count": jnp.asarray(0.0),
+                "diagnostic/probe_correct": jnp.asarray(0.0),
+                "diagnostic/probe_visible_count": jnp.asarray(0.0),
+                "diagnostic/probe_visible_correct": jnp.asarray(0.0),
+            },
+            {
+                "diagnostic/probe_loss_numerator": jnp.asarray(2.0),
+                "diagnostic/probe_count": jnp.asarray(4.0),
+                "diagnostic/probe_correct": jnp.asarray(3.0),
+                "diagnostic/probe_visible_count": jnp.asarray(1.0),
+                "diagnostic/probe_visible_correct": jnp.asarray(1.0),
+            },
+        ]
+    )
+
+    assert not any(key.startswith("probe_") for key in reduced)
+    assert reduced["diagnostic/probe_count"] == 2.0  # mean live probes per optimizer step
+    assert reduced["diagnostic/probe_loss"] == 0.5
+    assert reduced["diagnostic/probe_accuracy"] == 0.75
+    assert reduced["diagnostic/probe_accuracy_visible"] == 1.0
+    assert reduced["diagnostic/probe_accuracy_hidden"] == 2 / 3
 
 
 def test_pad_probe_grids_rejects_overlong_metric():
     with pytest.raises(ValueError, match="exceeds configured maximum"):
         train._pad_probe_grids(jnp.ones(61), jnp.ones(61), 60)
+
+
+def test_detached_diagnostic_probe_does_not_change_total_loss_or_main_update():
+    debug = _config.get_config("debug_mem")
+    common_model = dataclasses.replace(debug.model, memory_probe_weight=0.0)
+    common = dataclasses.replace(
+        debug,
+        model=dataclasses.replace(common_model, memory_probe_diagnostic=False),
+        batch_size=12,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0e6),
+        ema_decay=0.9,
+    )
+    diagnostic = dataclasses.replace(
+        common,
+        model=dataclasses.replace(common.model, memory_probe_diagnostic=True),
+    )
+    batch = _toy_batch()
+
+    plain_state = _toy_train_state(common)
+    diagnostic_state = _toy_train_state(diagnostic)
+    legacy_probe_state = _toy_train_state(dataclasses.replace(common, model=debug.model))
+    assert jax.tree.structure(plain_state.opt_state) == jax.tree.structure(legacy_probe_state.opt_state)
+
+    # Simulate a resumed probe-trained checkpoint, whose saved EMA probe can legitimately differ
+    # from its raw train parameter. No-probe continuation must preserve both representations.
+    probe_filter = nnx_utils.PathRegex(r".*probe_head.*")
+
+    def offset_probe_ema(state):
+        return dataclasses.replace(
+            state,
+            ema_params=nnx_utils.state_map(
+                state.ema_params,
+                probe_filter,
+                lambda variable: variable.replace(variable.value + 0.25),
+            ),
+        )
+
+    plain_state = offset_probe_ema(plain_state)
+    diagnostic_state = offset_probe_ema(diagnostic_state)
+    plain_next, plain_info = train.train_step(common, jax.random.key(123), plain_state, batch)
+    diagnostic_next, diagnostic_info = train.train_step(diagnostic, jax.random.key(123), diagnostic_state, batch)
+
+    np.testing.assert_array_equal(plain_info["loss"], diagnostic_info["loss"])
+    np.testing.assert_array_equal(plain_info["flow_loss"], diagnostic_info["flow_loss"])
+    np.testing.assert_array_equal(plain_info["ce_loss"], diagnostic_info["ce_loss"])
+    assert not any(key.startswith("diagnostic/probe") for key in plain_info)
+    assert "diagnostic/probe_loss_numerator" in diagnostic_info
+    assert "probe_loss" not in diagnostic_info
+
+    # Identical post-update parameters/optimizer state prove that the diagnostic auxiliary
+    # outputs did not alter any gradient consumed by the main optimizer.
+    for plain, with_diagnostic in zip(
+        jax.tree.leaves(plain_next.params), jax.tree.leaves(diagnostic_next.params), strict=True
+    ):
+        np.testing.assert_array_equal(plain, with_diagnostic)
+    for plain, with_diagnostic in zip(
+        jax.tree.leaves(plain_next.opt_state), jax.tree.leaves(diagnostic_next.opt_state), strict=True
+    ):
+        np.testing.assert_array_equal(plain, with_diagnostic)
+    for plain, with_diagnostic in zip(
+        jax.tree.leaves(plain_next.ema_params), jax.tree.leaves(diagnostic_next.ema_params), strict=True
+    ):
+        np.testing.assert_array_equal(plain, with_diagnostic)
+    np.testing.assert_array_equal(plain_state.params["probe_head"].value, plain_next.params["probe_head"].value)
+    np.testing.assert_array_equal(
+        diagnostic_state.params["probe_head"].value, diagnostic_next.params["probe_head"].value
+    )
+    np.testing.assert_array_equal(plain_state.ema_params["probe_head"].value, plain_next.ema_params["probe_head"].value)
+    np.testing.assert_array_equal(
+        diagnostic_state.ema_params["probe_head"].value,
+        diagnostic_next.ema_params["probe_head"].value,
+    )
 
 
 @pytest.mark.parametrize("accumulation_steps", [3, 6])

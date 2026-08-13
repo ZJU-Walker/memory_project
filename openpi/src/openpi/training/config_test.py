@@ -16,6 +16,8 @@ def test_yam_v3_and_v31_start_from_the_same_pi05_base_parameters() -> None:
         assert isinstance(train_config.weight_loader, weight_loaders.PartialCheckpointWeightLoader)
         assert train_config.weight_loader.params_path == _PI05_BASE_PARAMS
         assert train_config.model.memory_seq_steps == 60
+        assert train_config.model.memory_probe_weight == 0.0
+        assert train_config.model.memory_probe_diagnostic is False
         assert train_config.data.base_config.memory_sequence_buckets == (20, 40, 60)
 
     # The controlled writer ablation must remain identical in every other field.

@@ -44,6 +44,13 @@ def validate_action_prefix(
             "action prefix delay and prefix_length must match the actions batch shape; "
             f"got actions={actions.shape}, delay={delay.shape}, prefix_length={prefix_length.shape}."
         )
+    if not (jnp.issubdtype(actions.dtype, jnp.integer) or jnp.issubdtype(actions.dtype, jnp.floating)):
+        raise TypeError(f"action prefix actions must have a real numeric dtype; got {actions.dtype}.")
+    if not np.all(np.isfinite(actions)):
+        raise ValueError("action prefix actions must contain only finite values.")
+    for name, value in (("delay", delay), ("prefix_length", prefix_length)):
+        if not jnp.issubdtype(value.dtype, jnp.integer):
+            raise TypeError(f"action prefix {name} must have an integer dtype; got {value.dtype}.")
     if np.any(delay < 0) or np.any(delay > prefix_length) or np.any(prefix_length > action_horizon):
         raise ValueError(
             "action prefix must satisfy 0 <= delay <= prefix_length <= action_horizon; "

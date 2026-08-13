@@ -1,3 +1,5 @@
+import dataclasses
+
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
@@ -61,7 +63,13 @@ class _TinyPi05MemorySampler(_TinyPi05Sampler):
     sample_with_memory = pi0.Pi0.sample_with_memory
     _select_memory_write_source = pi0.Pi0._select_memory_write_source  # noqa: SLF001
 
-    def __init__(self, rngs: nnx.Rngs, *, memory_write_source: pi0_config.MemoryWriteSource = "raw_hidden"):
+    def __init__(
+        self,
+        rngs: nnx.Rngs,
+        *,
+        memory_write_source: pi0_config.MemoryWriteSource = "raw_hidden",
+        memory_probe_diagnostic: bool = False,
+    ):
         super().__init__(rngs, with_image_encoder=True)
         self.predict_with_memory = True
         self.memory_layer = 0
@@ -71,6 +79,8 @@ class _TinyPi05MemorySampler(_TinyPi05Sampler):
         self.memory = memory.TitansMemory(memory_config, rngs=rngs)
         self.memory_gate = nnx.Param(jnp.ones((64,), dtype=jnp.float32))
         self.memory_probe_weight = 0.0
+        self.memory_probe_diagnostic = memory_probe_diagnostic
+        self.probe_head = nnx.Linear(memory_config.d_value, 2, rngs=rngs)
 
 
 class _TinyPi05SequenceTrainer(_TinyPi05MemorySampler):
@@ -79,7 +89,7 @@ class _TinyPi05SequenceTrainer(_TinyPi05MemorySampler):
 
 
 def _attention_write_representations(model, state, observation, causal_tokens, causal_mask):
-    """Recomputes one training-side memory extension and returns its raw/post-attention writes."""
+    """Return raw h and final c from one training extension."""
     observation = model_lib.preprocess_observation(None, observation, train=False)
     batch = observation.state.shape[0]
     prefix_tokens, prefix_mask, prefix_ar = model.embed_prefix(observation)
@@ -119,7 +129,10 @@ def _attention_write_representations(model, state, observation, causal_tokens, c
         kv_cache=kv_cache,
         cache_position=prefix_len,
     )
-    return raw_hidden, ext_out[:, :mem_len].astype(jnp.float32)
+    return (
+        raw_hidden,
+        ext_out[:, :mem_len].astype(jnp.float32),
+    )
 
 
 def _assert_trees_equal(actual, expected):
@@ -140,6 +153,57 @@ def test_memory_write_source_config_is_validated_and_defaults_to_v3():
     assert pi0_config.Pi0Config(memory_write_source="post_attention").memory_write_source == "post_attention"
     with pytest.raises(ValueError, match="memory_write_source"):
         pi0_config.Pi0Config(memory_write_source="invalid")  # type: ignore[arg-type]
+
+
+def test_detached_probe_diagnostic_config_is_explicit_and_cannot_have_loss_weight():
+    assert pi0_config.Pi0Config().memory_probe_weight == 0.0
+    assert pi0_config.Pi0Config().memory_probe_diagnostic is False
+    with pytest.raises(ValueError, match="cannot be combined"):
+        pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            memory_probe_weight=0.5,
+            memory_probe_diagnostic=True,
+        )
+
+
+def test_probe_head_parameter_tree_is_preserved_when_diagnostics_are_disabled():
+    disabled = _TinyPi05MemorySampler(nnx.Rngs(0), memory_probe_diagnostic=False)
+    diagnostic = _TinyPi05MemorySampler(nnx.Rngs(0), memory_probe_diagnostic=True)
+    disabled_state = nnx.state(disabled)
+    diagnostic_state = nnx.state(diagnostic)
+
+    disabled_paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(disabled_state)]
+    diagnostic_paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(diagnostic_state)]
+    assert disabled_paths == diagnostic_paths
+    assert any("probe_head" in path for path in disabled_paths)
+
+    # This is the strict state replacement used by checkpoint loading: toggling detached
+    # diagnostic compute changes only static graph behavior, never checkpoint keys/shapes.
+    diagnostic_state.replace_by_pure_dict(disabled_state.to_pure_dict())
+
+
+def test_probe_supervision_specs_are_only_materialized_when_probe_compute_is_enabled():
+    memory_config = memory.MemoryConfig(d_input=64, d_key=8, hidden_dims=(8,), d_value=64)
+    common = pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        predict_subtask=True,
+        predict_with_memory=True,
+        memory=memory_config,
+        memory_layer=0,
+    )
+    disabled_observation, _ = common.inputs_spec()
+    diagnostic_observation, _ = dataclasses.replace(common, memory_probe_diagnostic=True).inputs_spec()
+    legacy_observation, _ = dataclasses.replace(common, memory_probe_weight=0.5).inputs_spec()
+
+    assert disabled_observation.seq_probe_labels is None
+    assert disabled_observation.seq_probe_mask is None
+    assert disabled_observation.seq_probe_visible is None
+    assert diagnostic_observation.seq_probe_labels is not None
+    assert legacy_observation.seq_probe_labels is not None
 
 
 def test_memory_write_modes_select_the_expected_float32_tensor_and_keep_the_parameter_tree():
@@ -167,7 +231,7 @@ def test_memory_write_modes_select_the_expected_float32_tensor_and_keep_the_para
         np.testing.assert_array_equal(raw, post)
 
 
-def test_post_attention_write_is_insulated_from_teacher_forced_causal_labels():
+def test_contextual_write_is_insulated_from_teacher_forced_causal_labels():
     model = _TinyPi05SequenceTrainer(nnx.Rngs(0), memory_write_source="post_attention")
     config = pi0_config.Pi0Config(
         pi05=True,
@@ -190,8 +254,10 @@ def test_post_attention_write_is_insulated_from_teacher_forced_causal_labels():
     np.testing.assert_array_equal(post_a, post_b)
     assert not np.array_equal(np.asarray(raw_a), np.asarray(post_a))
 
-    state_a, aux_a = model.memory.write(state, model._select_memory_write_source(raw_a, post_a))  # noqa: SLF001
-    state_b, aux_b = model.memory.write(state, model._select_memory_write_source(raw_b, post_b))  # noqa: SLF001
+    write_a = model._select_memory_write_source(raw_a, post_a)  # noqa: SLF001
+    write_b = model._select_memory_write_source(raw_b, post_b)  # noqa: SLF001
+    state_a, aux_a = model.memory.write(state, write_a)
+    state_b, aux_b = model.memory.write(state, write_b)
     _assert_trees_equal(state_a, state_b)
     _assert_trees_equal(aux_a, aux_b)
 
@@ -236,6 +302,81 @@ def test_action_prefix_validation_conditioning_and_exact_restore():
     invalid = prefix.replace(delay=jnp.array([4]), prefix_length=jnp.array([3]))
     with pytest.raises(ValueError, match="0 <= delay"):
         rtc.validate_action_prefix(invalid, action_horizon=4, action_dim=2)
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        np.full((1, 4, 2), np.nan, dtype=np.float32),
+        np.full((1, 4, 2), np.inf, dtype=np.float32),
+        np.full((1, 4, 2), -np.inf, dtype=np.float32),
+    ],
+    ids=("nan", "positive_infinity", "negative_infinity"),
+)
+def test_action_prefix_validation_rejects_nonfinite_actions(actions):
+    prefix = rtc.ActionPrefix(
+        actions=actions,
+        delay=np.array([2], dtype=np.int32),
+        prefix_length=np.array([3], dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="actions must contain only finite values"):
+        rtc.validate_action_prefix(prefix, action_horizon=4, action_dim=2)
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        np.zeros((1, 4, 2), dtype=np.bool_),
+        np.full((1, 4, 2), "1", dtype=np.str_),
+        np.full((1, 4, 2), 1, dtype=object),
+        np.zeros((1, 4, 2), dtype=np.complex64),
+    ],
+    ids=("bool", "string", "object", "complex"),
+)
+def test_action_prefix_validation_rejects_non_real_numeric_action_dtypes(actions):
+    prefix = rtc.ActionPrefix(
+        actions=actions,
+        delay=np.array([2], dtype=np.int32),
+        prefix_length=np.array([3], dtype=np.int32),
+    )
+
+    with pytest.raises(TypeError, match="actions must have a real numeric dtype"):
+        rtc.validate_action_prefix(prefix, action_horizon=4, action_dim=2)
+
+
+@pytest.mark.parametrize("field", ["delay", "prefix_length"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        np.array([True], dtype=np.bool_),
+        np.array([2.0], dtype=np.float32),
+        np.array([2.0], dtype=np.float64),
+        np.array(["2"], dtype=np.str_),
+        np.array([2], dtype=object),
+    ],
+    ids=("bool", "float32_integral_value", "float64_integral_value", "string", "object"),
+)
+def test_action_prefix_validation_requires_true_integer_metadata_dtype(field, invalid_value):
+    prefix = rtc.ActionPrefix(
+        actions=np.zeros((1, 4, 2), dtype=np.float32),
+        delay=np.array([2], dtype=np.int32),
+        prefix_length=np.array([3], dtype=np.int32),
+    ).replace(**{field: invalid_value})
+
+    with pytest.raises(TypeError, match=rf"{field} must have an integer dtype"):
+        rtc.validate_action_prefix(prefix, action_horizon=4, action_dim=2)
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.int32, np.int64])
+def test_action_prefix_validation_accepts_integer_metadata_dtypes(dtype):
+    prefix = rtc.ActionPrefix(
+        actions=np.zeros((1, 4, 2), dtype=np.float32),
+        delay=np.array([2], dtype=dtype),
+        prefix_length=np.array([3], dtype=dtype),
+    )
+
+    rtc.validate_action_prefix(prefix, action_horizon=4, action_dim=2)
 
 
 def test_tokenwise_timestep_embedding_matches_repeated_scalar_embedding():
@@ -364,6 +505,66 @@ def test_pi05_jitted_memory_sampling_restores_prefix_exactly():
         np.testing.assert_array_equal(aux[key], aux_without_prefix[key])
 
 
+def test_memory_diagnostic_forcing_scores_complete_sequence_and_is_side_effect_free():
+    model = _TinyPi05MemorySampler(nnx.Rngs(0), memory_write_source="post_attention")
+    obs = pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_horizon=4,
+        action_dim=2,
+        max_token_len=4,
+    ).fake_obs(1)
+    state0 = model.memory.init_state(1)
+    forced_tokens = jnp.array([[5, 6]], dtype=jnp.int32)
+    forced_mask = jnp.array([[True, True]])
+    sample = nnx_utils.module_jit(
+        model.sample_with_memory,
+        static_argnames=("stop_token", "max_decode_steps", "num_steps", "zero_read", "allow_write"),
+    )
+
+    actions, unchanged, aux = sample(
+        jax.random.key(1),
+        obs,
+        state0,
+        stop_token=1,
+        max_decode_steps=1,
+        num_steps=2,
+        noise=jnp.zeros((1, 4, 2), dtype=jnp.float32),
+        forced_subtask_tokens=forced_tokens,
+        forced_subtask_mask=forced_mask,
+        zero_read=False,
+        allow_write=False,
+    )
+    _assert_trees_equal(unchanged, state0)
+    np.testing.assert_array_equal(aux["tokens"], forced_tokens)
+    np.testing.assert_array_equal(aux["token_mask"], forced_mask)
+    np.testing.assert_array_equal(aux["write_occurred"], [False])
+    assert aux["conditioned_subtask_logp"].shape == (1,)
+    assert aux["conditioned_subtask_mean_logp"].shape == (1,)
+    assert np.isfinite(np.asarray(aux["conditioned_subtask_logp"])).all()
+    assert np.isfinite(np.asarray(actions)).all()
+
+    _, changed, write_aux = sample(
+        jax.random.key(1),
+        obs,
+        state0,
+        stop_token=1,
+        max_decode_steps=1,
+        num_steps=2,
+        noise=jnp.zeros((1, 4, 2), dtype=jnp.float32),
+        forced_subtask_tokens=forced_tokens,
+        forced_subtask_mask=forced_mask,
+        zero_read=False,
+        allow_write=True,
+    )
+    assert any(
+        not np.array_equal(np.asarray(a), np.asarray(b))
+        for a, b in zip(jax.tree.leaves(changed), jax.tree.leaves(state0), strict=True)
+    )
+    np.testing.assert_array_equal(write_aux["write_occurred"], [True])
+
+
 def test_pi05_jitted_sequence_loss_exercises_rtc_token_times_and_is_finite():
     model = _TinyPi05SequenceTrainer(nnx.Rngs(0), memory_write_source="post_attention")
     memory_config = memory.MemoryConfig(d_input=64, d_key=8, hidden_dims=(8,), d_value=64)
@@ -388,3 +589,90 @@ def test_pi05_jitted_sequence_loss_exercises_rtc_token_times_and_is_finite():
     assert losses["flow"].shape == losses["ce"].shape == (1,)
     assert np.isfinite(np.asarray(losses["flow"])).all()
     assert np.isfinite(np.asarray(losses["ce"])).all()
+
+
+def test_detached_probe_diagnostics_leave_memory_and_vlm_gradients_numerically_identical():
+    memory_config = memory.MemoryConfig(d_input=64, d_key=8, hidden_dims=(8,), d_value=64)
+    config = pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_horizon=4,
+        action_dim=2,
+        max_token_len=4,
+        simulated_delay=2,
+        predict_subtask=True,
+        predict_with_memory=True,
+        memory=memory_config,
+        memory_layer=0,
+        causal_token_len=2,
+        memory_seq_steps=2,
+        memory_probe_weight=0.0,
+        memory_probe_diagnostic=True,
+    )
+    observation = config.fake_obs(1).replace(
+        tokenized_prompt_mask=jnp.ones((1, 2, 4), dtype=bool),
+        tokenized_causal=jnp.asarray([[[5, 6], [7, 8]]], dtype=jnp.int32),
+        tokenized_causal_mask=jnp.ones((1, 2, 2), dtype=bool),
+        causal_fast_mask=jnp.zeros((1, 2, 2), dtype=bool),
+        seq_step_mask=jnp.ones((1, 2), dtype=bool),
+        seq_block_boundary=jnp.zeros((1, 2), dtype=bool),
+        seq_probe_labels=jnp.asarray([[0, 1]], dtype=jnp.int32),
+        seq_probe_mask=jnp.ones((1, 2), dtype=bool),
+        seq_probe_visible=jnp.asarray([[True, False]]),
+    )
+    actions = config.fake_act(1)
+    plain_model = _TinyPi05SequenceTrainer(
+        nnx.Rngs(0), memory_write_source="post_attention", memory_probe_diagnostic=False
+    )
+    diagnostic_model = _TinyPi05SequenceTrainer(
+        nnx.Rngs(0), memory_write_source="post_attention", memory_probe_diagnostic=True
+    )
+
+    def loss_and_grads(model):
+        graphdef, params = nnx.split(model)
+
+        def non_probe_loss(p):
+            losses = nnx.merge(graphdef, p)._compute_sequence_loss(  # noqa: SLF001
+                jax.random.key(17), observation, actions, train=False
+            )
+            return jnp.mean(losses["flow"]) + jnp.mean(losses["ce"]), losses
+
+        return jax.value_and_grad(non_probe_loss, has_aux=True)(params)
+
+    (plain_total, plain_losses), plain_grads = loss_and_grads(plain_model)
+    (diagnostic_total, diagnostic_losses), diagnostic_grads = loss_and_grads(diagnostic_model)
+
+    np.testing.assert_array_equal(plain_total, diagnostic_total)
+    np.testing.assert_array_equal(plain_losses["flow"], diagnostic_losses["flow"])
+    np.testing.assert_array_equal(plain_losses["ce"], diagnostic_losses["ce"])
+    assert set(plain_losses) == {"flow", "ce"}
+    assert "probe_ce_sum" in diagnostic_losses
+
+    plain_by_path = {
+        jax.tree_util.keystr(path): value for path, value in jax.tree_util.tree_leaves_with_path(plain_grads)
+    }
+    diagnostic_by_path = {
+        jax.tree_util.keystr(path): value for path, value in jax.tree_util.tree_leaves_with_path(diagnostic_grads)
+    }
+    assert plain_by_path.keys() == diagnostic_by_path.keys()
+    for path, plain_grad in plain_by_path.items():
+        # On GPU, returning additional detached diagnostic arrays can change XLA fusion and
+        # therefore the final reduction order by one float32 ULP. The probe contribution is
+        # still mathematically zero; use a machine-precision comparison for the unaffected
+        # main gradients and separately require exact-zero probe-head gradients below.
+        np.testing.assert_allclose(
+            plain_grad,
+            diagnostic_by_path[path],
+            rtol=2e-6,
+            atol=2e-7,
+            err_msg=path,
+        )
+
+    # The comparison is not vacuous: the non-probe objective reaches both recurrent memory and
+    # the VLM, while the detached compatibility head receives exactly zero gradient.
+    assert sum(float(jnp.linalg.norm(g)) for path, g in plain_by_path.items() if "memory" in path) > 0
+    assert sum(float(jnp.linalg.norm(g)) for path, g in plain_by_path.items() if "PaliGemma" in path) > 0
+    probe_grads = [g for path, g in diagnostic_by_path.items() if "probe_head" in path]
+    assert probe_grads
+    assert all(bool(jnp.all(g == 0)) for g in probe_grads)

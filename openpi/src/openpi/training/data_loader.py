@@ -199,7 +199,9 @@ def create_torch_dataset(
 
     if use_memory:
         info = _episode_info_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
-        quiz = getattr(model_config, "memory_probe_weight", 0) > 0
+        quiz = getattr(model_config, "memory_probe_weight", 0) > 0 or getattr(
+            model_config, "memory_probe_diagnostic", False
+        )
         seq_transforms: list[_transforms.DataTransformFn] = []
         if data_config.subtask_from_task:
             seq_transforms.append(

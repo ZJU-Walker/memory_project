@@ -93,10 +93,38 @@ def _pad_probe_grids(correct_grid: at.Array, active_grid: at.Array, max_steps: i
 def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
     stacked_infos = common_utils.stack_forest(infos)
     reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos))
-    if "probe_correct_grid" in reduced:
-        correct_grid = reduced.pop("probe_correct_grid")
-        active_grid = reduced.pop("probe_active_grid")
-        reduced["probe_acc_grid"] = correct_grid / np.maximum(active_grid, 1)
+    probe_count_key = "diagnostic/probe_count"
+    if probe_count_key in reduced:
+        # Diagnostic accuracies are ratios over every live probe in the entire log window, not
+        # an unweighted mean of per-batch ratios (which biases sparse/zero-probe buckets).
+        count = np.sum(jax.device_get(stacked_infos[probe_count_key]), axis=0)
+        correct = np.sum(jax.device_get(stacked_infos["diagnostic/probe_correct"]), axis=0)
+        visible_count = np.sum(jax.device_get(stacked_infos["diagnostic/probe_visible_count"]), axis=0)
+        visible_correct = np.sum(jax.device_get(stacked_infos["diagnostic/probe_visible_correct"]), axis=0)
+        loss_numerator = np.sum(jax.device_get(stacked_infos["diagnostic/probe_loss_numerator"]), axis=0)
+        reduced.update(
+            {
+                "diagnostic/probe_loss": loss_numerator / np.maximum(count, 1),
+                "diagnostic/probe_accuracy": correct / np.maximum(count, 1),
+                "diagnostic/probe_accuracy_visible": visible_correct / np.maximum(visible_count, 1),
+                "diagnostic/probe_accuracy_hidden": (correct - visible_correct) / np.maximum(count - visible_count, 1),
+            }
+        )
+        for key in (
+            "diagnostic/probe_correct",
+            "diagnostic/probe_visible_count",
+            "diagnostic/probe_visible_correct",
+            "diagnostic/probe_loss_numerator",
+        ):
+            reduced.pop(key)
+
+    grid_correct_key = "diagnostic/probe_correct_grid"
+    if grid_correct_key in reduced:
+        correct_grid = np.sum(jax.device_get(stacked_infos[grid_correct_key]), axis=0)
+        active_grid = np.sum(jax.device_get(stacked_infos["diagnostic/probe_active_grid"]), axis=0)
+        reduced.pop(grid_correct_key)
+        reduced.pop("diagnostic/probe_active_grid")
+        reduced["diagnostic/probe_accuracy_by_step"] = correct_grid / np.maximum(active_grid, 1)
     return reduced
 
 
@@ -172,21 +200,23 @@ def train_step(
             loss = jnp.mean(chunked_loss["flow"]) + model.ce_loss_weight * jnp.mean(chunked_loss["ce"])
             info = {"flow_loss": jnp.mean(chunked_loss["flow"]), "ce_loss": jnp.mean(chunked_loss["ce"])}
             if "probe_ce_sum" in chunked_loss:
-                # Quiz probes: loss = sum of quiz CEs / number of live quizzes in the batch.
+                # Probe outputs are logged under an explicitly diagnostic namespace. Detached
+                # diagnostic mode has weight zero and therefore cannot affect the main loss.
                 count = jnp.sum(chunked_loss["probe_count"])
                 correct = jnp.sum(chunked_loss["probe_correct"])
                 vis_count = jnp.sum(chunked_loss["probe_count_visible"])
                 vis_correct = jnp.sum(chunked_loss["probe_correct_visible"])
-                probe_loss = jnp.sum(chunked_loss["probe_ce_sum"]) / jnp.maximum(count, 1)
-                loss += model.memory_probe_weight * probe_loss
+                probe_loss_numerator = jnp.sum(chunked_loss["probe_ce_sum"])
+                if model.memory_probe_weight > 0:
+                    loss += model.memory_probe_weight * probe_loss_numerator / jnp.maximum(count, 1)
                 info.update(
-                    probe_loss=probe_loss,
-                    probe_count=count,
-                    probe_acc=correct / jnp.maximum(count, 1),
-                    # visible = the answer was still on screen at the quiz (bins open; can be
-                    # read off vision); hidden = bins closed again, memory is the only source
-                    probe_acc_visible=vis_correct / jnp.maximum(vis_count, 1),
-                    probe_acc_hidden=(correct - vis_correct) / jnp.maximum(count - vis_count, 1),
+                    {
+                        "diagnostic/probe_loss_numerator": probe_loss_numerator,
+                        "diagnostic/probe_count": count,
+                        "diagnostic/probe_correct": correct,
+                        "diagnostic/probe_visible_count": vis_count,
+                        "diagnostic/probe_visible_correct": vis_correct,
+                    }
                 )
                 # Keep the per-position numerator and denominator separate and pad both to the
                 # configured maximum sequence length. Bucket batches have different static T;
@@ -196,8 +226,10 @@ def train_step(
                 active_grid = jnp.sum(chunked_loss["probe_active_grid"], axis=0)
                 correct_grid, active_grid = _pad_probe_grids(correct_grid, active_grid, config.model.memory_seq_steps)
                 info.update(
-                    probe_correct_grid=correct_grid,
-                    probe_active_grid=active_grid,
+                    {
+                        "diagnostic/probe_correct_grid": correct_grid,
+                        "diagnostic/probe_active_grid": active_grid,
+                    }
                 )
             if observation.seq_step_mask is not None:
                 info.update(
@@ -250,19 +282,27 @@ def train_step(
                 correct = jnp.sum(chunked_loss["probe_correct"])
                 vis_count = jnp.sum(chunked_loss["probe_count_visible"])
                 vis_correct = jnp.sum(chunked_loss["probe_correct_visible"])
-                probe_loss = jnp.sum(chunked_loss["probe_ce_sum"]) / jnp.maximum(global_probe_count, 1)
-                loss += model.memory_probe_weight * probe_loss
+                probe_loss_numerator = jnp.sum(chunked_loss["probe_ce_sum"])
+                if model.memory_probe_weight > 0:
+                    loss += model.memory_probe_weight * probe_loss_numerator / jnp.maximum(global_probe_count, 1)
                 info.update(
-                    probe_loss=probe_loss,
-                    probe_count=count,
-                    probe_correct_sum=correct,
-                    probe_visible_count=vis_count,
-                    probe_visible_correct_sum=vis_correct,
+                    {
+                        "diagnostic/probe_loss_numerator": probe_loss_numerator,
+                        "diagnostic/probe_count": count,
+                        "diagnostic/probe_correct": correct,
+                        "diagnostic/probe_visible_count": vis_count,
+                        "diagnostic/probe_visible_correct": vis_correct,
+                    }
                 )
                 correct_grid = jnp.sum(chunked_loss["probe_correct_grid"], axis=0)
                 active_grid = jnp.sum(chunked_loss["probe_active_grid"], axis=0)
                 correct_grid, active_grid = _pad_probe_grids(correct_grid, active_grid, config.model.memory_seq_steps)
-                info.update(probe_correct_grid=correct_grid, probe_active_grid=active_grid)
+                info.update(
+                    {
+                        "diagnostic/probe_correct_grid": correct_grid,
+                        "diagnostic/probe_active_grid": active_grid,
+                    }
+                )
             if micro_observation.seq_step_mask is not None:
                 info.update(
                     sequence_bucket_steps=jnp.asarray(
@@ -306,19 +346,24 @@ def train_step(
             accumulate_microbatch,
             (loss, loss_info, grads),
         )
-        if "probe_count" in loss_info:
-            count = loss_info["probe_count"]
-            correct = loss_info.pop("probe_correct_sum")
-            vis_count = loss_info.pop("probe_visible_count")
-            vis_correct = loss_info.pop("probe_visible_correct_sum")
-            loss_info.update(
-                probe_acc=correct / jnp.maximum(count, 1),
-                probe_acc_visible=vis_correct / jnp.maximum(vis_count, 1),
-                probe_acc_hidden=(correct - vis_correct) / jnp.maximum(count - vis_count, 1),
-            )
+    diagnostic_only_probe = (
+        getattr(config.model, "predict_with_memory", False) and getattr(config.model, "memory_probe_weight", 0) == 0
+    )
+    if diagnostic_only_probe:
+        # Keep the probe leaves in the optimizer tree so probe-trained checkpoints retain an
+        # identical TrainState structure, but guarantee that neither diagnostics nor stale
+        # restored moments can update the compatibility head.
+        probe_filter = nnx_utils.PathRegex(r".*probe_head.*")
+        grads = nnx_utils.state_map(
+            grads, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    if diagnostic_only_probe:
+        updates = nnx_utils.state_map(
+            updates, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
     new_params = optax.apply_updates(params, updates)
 
     # Update the model in place and return the new full state.
@@ -327,11 +372,20 @@ def train_step(
 
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
     if state.ema_decay is not None:
+        ema_params = jax.tree.map(
+            lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+        )
+        if diagnostic_only_probe:
+            # Probe-trained checkpoints can contain different raw and EMA probe values. Preserve
+            # both exactly: allowing the saved/inference EMA head to drift toward the frozen raw
+            # head would still mutate the diagnostic across resumed no-probe training.
+            ema_params = nnx.State.merge(
+                ema_params.filter(nnx.Not(probe_filter)),
+                state.ema_params.filter(probe_filter),
+            )
         new_state = dataclasses.replace(
             new_state,
-            ema_params=jax.tree.map(
-                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
-            ),
+            ema_params=ema_params,
         )
 
     # Filter out params that aren't kernels.

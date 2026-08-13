@@ -1,5 +1,27 @@
 # YAM Hidden-Bin Memory Project: Detailed v3/v3.1 Method and Evaluation Report
 
+> **2026-08-12 v3.1 diagnostics/objective addendum (current behavior).** The v3 and
+> v3.1 main configs now set `memory_probe_weight=0.0` and
+> `memory_probe_diagnostic=False`. Their optimized objective is therefore only
+> \(\mathcal{L}_{\mathrm{flow}} + 1.0\,\mathcal{L}_{\mathrm{causal\ CE}}\); the
+> binary left/right probe is no longer part of the main loss. Its module and parameter keys remain
+> present for strict checkpoint compatibility. If detached probe diagnostics are explicitly enabled,
+> probe outputs are stopped from entering the backward graph, probe optimizer/weight-decay updates are
+> masked, and both raw and EMA probe parameters remain fixed. With diagnostics disabled, probe labels
+> are not materialized and the extra probe read/classifier computation is skipped.
+>
+> The report below is a 2026-08-09 snapshot. Its claims that the v3/v3.1 probe weight is `0.5`, that
+> probe CE trains the memory/VLM/gate, and that probe supervision is part of the current recipe are
+> **historical**. This addendum supersedes those claims, including the probe statements in the executive
+> summary, Sections 8–9 and 12, the test description, and the compact method statement. It does not
+> change the documented read-before-write ordering, RTC training, TBPTT, sequence sampling, or the
+> v3.1 `post_attention` writer. An older probe-trained checkpoint remains loadable but is an engineering
+> resume/evaluation artifact, not a clean no-probe ablation; the clean comparison must start afresh from
+> the same `pi05_base` initialization. Checkpoint parameter trees do not encode static writer/cadence/
+> objective provenance, so always supply and record the intended config. The current diagnostic runner,
+> schemas, limitations, and safe CLI are documented in
+> [`openpi/docs/v31_memory_diagnostics.md`](openpi/docs/v31_memory_diagnostics.md).
+
 **Repository snapshot:** `/iris/u/kewalk/memory_project`
 **Report date:** 2026-08-09
 **Compared methods:** `pi05_yam_mem_v3` and `pi05_yam_mem_v31`

@@ -440,7 +440,10 @@ class LeRobotYamDataConfig(DataConfigFactory):
         }
         if base_config.subtask_from_task:
             structure["subtask"] = "subtask"
-        use_quiz = use_memory and getattr(model_config, "memory_probe_weight", 0) > 0
+        use_quiz = use_memory and (
+            getattr(model_config, "memory_probe_weight", 0) > 0
+            or getattr(model_config, "memory_probe_diagnostic", False)
+        )
         if use_memory:
             # sequence bookkeeping (attached by MemoryEpisodeInfo / present on raw items)
             structure["frame_index"] = "frame_index"
@@ -1114,8 +1117,8 @@ _CONFIGS = [
         # noise/time/simulated-delay draw per step), then writes the frame; per-step
         # rematerialization keeps GPU memory flat in sequence length. Gradient blocks of 25
         # steps with a random per-sample shift
-        # (seq_block_boundary); the quiz probes + carried state teach storage/retrieval across
-        # block cuts. Half the samples are full trajectories (blank memory at the true episode
+        # (seq_block_boundary); carried state teaches storage/retrieval across block cuts, with no
+        # auxiliary probe in the main objective. Half the samples are full trajectories (blank memory at the true episode
         # start), half random slices (blank memory mid-episode -- kills the step-counting
         # shortcut); slice starts avoid the reveal->decision dead zone. Starts directly from the
         # official pi05_base checkpoint. The partial loader keeps the newly added memory and
@@ -1130,7 +1133,10 @@ _CONFIGS = [
             simulated_delay=6,
             memory_seq_steps=60,
             memory_block_steps=25,
-            memory_probe_weight=0.5,
+            # Change A: no auxiliary probe contribution. The checkpoint-compatible head remains
+            # fixed by an optimizer-update mask; detached diagnostic compute is explicitly opt-in.
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
             memory_probe_classes=2,
         ),
         data=LeRobotYamDataConfig(
@@ -1193,7 +1199,10 @@ _CONFIGS = [
             simulated_delay=6,
             memory_seq_steps=60,
             memory_block_steps=25,
-            memory_probe_weight=0.5,
+            # Change A: no auxiliary probe contribution. The checkpoint-compatible head remains
+            # fixed by an optimizer-update mask; detached diagnostic compute is explicitly opt-in.
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
             memory_probe_classes=2,
         ),
         data=LeRobotYamDataConfig(

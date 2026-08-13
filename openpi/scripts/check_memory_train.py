@@ -8,7 +8,7 @@ through the training-side forward must reproduce them exactly under argmax -- pr
 per-step masks, positions, cache layout and the read-before-write order of training and
 inference are identical.
 
-Stage 2 (--real) runs a real batch through the pi05_yam_mem_v3 config on the GPU box:
+Stage 2 (--real) runs a real batch through the current pi05_yam_mem_v31 config on the GPU box:
     uv run python scripts/check_memory_train.py --real
 Use `--batch-size 12` only after the default four-sample smoke check succeeds.
 """
@@ -31,8 +31,8 @@ from openpi.models.pi0 import make_memory_step_mask
 @dataclasses.dataclass
 class Args:
     real: bool = False
-    config: str = "pi05_yam_mem_v3"
-    # Dummy/CPU diagnostics can exercise either the v3 or v3.1 write representation.
+    config: str = "pi05_yam_mem_v31"
+    # Dummy/CPU diagnostics can exercise the v3 or v3.1 write representation.
     write_source: pi0_config.MemoryWriteSource = "post_attention"
     # Real diagnostics intentionally default to a small smoke batch; set 12 for the full recipe.
     batch_size: int = 4
@@ -115,8 +115,8 @@ def _frame_obs(seq_obs, k: int):
 
 def _step_logits(model, state, frame_obs, causal, causal_len):
     """Training-side CE logits of ONE step, recomputed independently of the scan (python code
-    mirroring `_compute_sequence_loss`'s step body). Returns (logits, h_k, c_k) so the caller
-    can select and thread the configured write. Used as the equivalence oracle."""
+    mirroring `_compute_sequence_loss`'s step body). Returns the final memory-token
+    representation so the caller can thread the configured write. Used as the equivalence oracle."""
     observation = _model.preprocess_observation(None, frame_obs, train=False)
     batch = observation.state.shape[0]
     prefix_tokens, prefix_mask, prefix_ar_mask = model.embed_prefix(observation)
@@ -151,11 +151,19 @@ def _step_logits(model, state, frame_obs, causal, causal_len):
     ext_positions = jnp.broadcast_to(prefix_len + jnp.arange(mem_len + causal_len)[None], (batch, mem_len + causal_len))
     kv_cache = jax.tree.map(lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache)
     (ext_out, _), _ = model.PaliGemma.llm(
-        [ext_tokens, None], mask=ext_mask, positions=ext_positions, kv_cache=kv_cache, cache_position=prefix_len
+        [ext_tokens, None],
+        mask=ext_mask,
+        positions=ext_positions,
+        kv_cache=kv_cache,
+        cache_position=prefix_len,
     )
     mem_out, causal_out = ext_out[:, :mem_len], ext_out[:, mem_len:]
     ce_hidden = jnp.concatenate([mem_out[:, -1:], causal_out[:, :-1]], axis=1)
-    return model.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32), h_k, mem_out.astype(jnp.float32)
+    return (
+        model.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32),
+        h_k,
+        mem_out.astype(jnp.float32),
+    )
 
 
 def check_equivalence(write_source: pi0_config.MemoryWriteSource) -> None:
@@ -200,11 +208,21 @@ def check_equivalence(write_source: pi0_config.MemoryWriteSource) -> None:
         ce_ref.append(float((-jnp.sum(logp * causal[k][1], axis=-1) / jnp.clip(jnp.sum(causal[k][1], -1), 1))[0]))
         write = model._select_memory_write_source(h_k, c_k)  # noqa: SLF001
         state, _ = model.memory.write(state, write)
-        jax.tree.map(
-            lambda actual, expected: np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6),
-            state,
-            inference_states[k],
-        )
+        state_differences = []
+        for (path, actual), expected in zip(
+            jax.tree_util.tree_leaves_with_path(state),
+            jax.tree.leaves(inference_states[k]),
+            strict=True,
+        ):
+            actual_host, expected_host = np.asarray(actual), np.asarray(expected)
+            state_differences.append((jax.tree_util.keystr(path), float(np.max(np.abs(actual_host - expected_host)))))
+            # Inference evaluates the memory rows alone, whereas the training oracle evaluates
+            # the same masked rows in a wider [memory|causal] GEMM. CUDA may choose a different
+            # reduction/fusion kernel for those shapes, so state leaves can differ by a few f32
+            # ULPs even though the masks, argmax tokens and semantics are identical.
+            np.testing.assert_allclose(actual_host, expected_host, rtol=2e-5, atol=5e-6)
+        worst_path, worst_difference = max(state_differences, key=lambda item: item[1])
+        print(f"  step {k}: max state |delta|={worst_difference:.3e} at {worst_path}")
 
     # the real loss must tie out with the oracle's mean CE
     train_obs = seq.replace(
@@ -516,6 +534,11 @@ def check_real(args: Args) -> None:
     if args.batch_size < 1:
         raise ValueError("batch_size must be positive")
     config = _config.get_config(args.config)
+    if config.model.predict_with_memory and config.model.memory_probe_weight == 0:
+        config = dataclasses.replace(
+            config,
+            model=dataclasses.replace(config.model, memory_probe_diagnostic=True),
+        )
     config = dataclasses.replace(config, batch_size=args.batch_size, num_workers=0, exp_name="check")
     loader = _data_loader.create_data_loader(config, shuffle=True, num_batches=1)
     observation, actions = next(iter(loader))
@@ -562,10 +585,7 @@ def check_real(args: Args) -> None:
     def grads_of(params, observation, actions):
         def loss_of(p):
             losses = nnx.merge(graphdef, p).compute_loss(jax.random.key(1), observation, actions, train=True)
-            loss = jnp.mean(losses["flow"]) + jnp.mean(losses["ce"])
-            if "probe_ce_sum" in losses:
-                loss += 0.5 * jnp.sum(losses["probe_ce_sum"]) / jnp.maximum(jnp.sum(losses["probe_count"]), 1)
-            return loss
+            return jnp.mean(losses["flow"]) + jnp.mean(losses["ce"])
 
         return jax.grad(loss_of)(params)
 
@@ -581,15 +601,17 @@ def check_real(args: Args) -> None:
     }
     for group, match in (
         ("memory", lambda k: "memory" in k),
-        ("probe head", lambda k: "probe_head" in k),
         ("vlm attn", lambda k: "q_einsum" in k and "_1" not in k),
         ("action expert", lambda k: "_1" in k or "action_out_proj" in k),
     ):
         total = sum(v for k, v in norms.items() if match(k))
         print(f"grad norm [{group}]: {total:.4f}")
         assert total > 0, f"no gradient reaches {group}"
+    probe_total = sum(v for k, v in norms.items() if "probe_head" in k)
+    print(f"grad norm [detached diagnostic probe head]: {probe_total:.4f}")
+    assert probe_total == 0, "detached diagnostic probe leaked into the backward graph"
     assert all(np.isfinite(v) for v in norms.values())
-    print("[OK] real batch: losses finite, gradients reach memory + probe head + VLM + action expert")
+    print("[OK] real batch: losses finite; main gradients unchanged and diagnostic probe detached")
 
 
 def main(args: Args) -> None:

@@ -54,13 +54,11 @@ class Pi0Config(_model.BaseModelConfig):
     # untouched when False (the memory params are not even constructed). Requires
     # predict_subtask.
     predict_with_memory: bool = False
-    memory_layer: int = (
-        17  # gemma block whose top-camera hidden states feed the memory (last layer) #TODO change layer here
-    )
+    memory_layer: int = 17  # gemma block whose top-camera hidden states feed the memory
     # Representation used by the associative memory write. ``raw_hidden`` preserves the v3
     # behavior (write the layer-``memory_layer`` top-camera states); ``post_attention`` writes
-    # the contextualized outputs of the appended memory-token block. Reads always use the raw
-    # layer hidden states in both modes.
+    # the final-normalized outputs of the appended memory-token block (v3.1). Reads always use
+    # the raw prefix hidden states selected by ``memory_layer``.
     memory_write_source: MemoryWriteSource = "raw_hidden"
     # Slot budget reserved after the memory block for the causal text (the generated subtask at
     # inference; the subtask + FAST labels at training). The action suffix starts at the static
@@ -81,13 +79,14 @@ class Pi0Config(_model.BaseModelConfig):
     # through, only its gradient is detached -- RoboTTT's TBPTT). 0 or >= memory_seq_steps
     # means never cut.
     memory_block_steps: int = 0
-    # Quiz probes ("dense supervision"): at each step the data marks quizzable (the episode's
-    # reveal has been written into this sequence's memory), read the memory post-write,
-    # mean-pool the gated read output, and classify the episode's answer (banana side) with a
-    # small train-only linear head. Loss contribution:
-    # memory_probe_weight * (sum of quiz CEs / number of live quizzes). 0 disables the quiz
-    # entirely (the head is not constructed, keeping old checkpoints loadable).
+    # Legacy weight for the old probe-training objective. The main v3/v3.1 recipes keep this at
+    # zero: the probe must not train the VLM, policy, memory, or its own head through the main
+    # optimizer. The field remains loadable so older experiment configs are still understood.
     memory_probe_weight: float = 0.0
+    # Opt-in, detached probe metrics. This reuses the checkpoint-compatible probe head but keeps
+    # its read/logits outside the backward graph and never adds its CE to the optimized loss.
+    # False skips the probe read and classifier compute entirely.
+    memory_probe_diagnostic: bool = False
     memory_probe_classes: int = 2
 
     pytorch_compile_mode: str | None = "max-autotune"
@@ -117,8 +116,12 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError("memory_block_steps must be >= 0 (0 = never cut).")
             if self.memory_probe_weight < 0:
                 raise ValueError("memory_probe_weight must be >= 0.")
-            if self.memory_probe_weight > 0 and self.memory_probe_classes < 2:
-                raise ValueError("memory_probe_classes must be >= 2 when the quiz is enabled.")
+            if self.memory_probe_weight > 0 and self.memory_probe_diagnostic:
+                raise ValueError(
+                    "memory_probe_diagnostic is detached and cannot be combined with a nonzero memory_probe_weight."
+                )
+            if self.memory_probe_classes < 2:
+                raise ValueError("memory_probe_classes must be >= 2 for checkpoint-compatible probe heads.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -184,7 +187,7 @@ class Pi0Config(_model.BaseModelConfig):
                                 "seq_probe_mask": jax.ShapeDtypeStruct(lead, bool),
                                 "seq_probe_visible": jax.ShapeDtypeStruct(lead, bool),
                             }
-                            if self.memory_probe_weight > 0
+                            if self.memory_probe_weight > 0 or self.memory_probe_diagnostic
                             else {}
                         ),
                     }

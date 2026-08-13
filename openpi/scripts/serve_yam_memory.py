@@ -3,8 +3,8 @@
 Like scripts/serve_yam_subtask.py, but the policy runs `Pi0.sample_with_memory`: every request
 reads the memory, decodes the subtask, denoises the actions and then writes the frame's hidden
 representation into the per-episode memory state, which is threaded across requests. v3 writes
-the raw layer-8 top-camera states; v3.1 writes the existing memory-token block's post-attention
-outputs. Each response
+the raw layer-8 top-camera states; v3.1 writes the memory-token block's final-normalized output.
+Each response
 carries "subtask", "surprise" (1-ish = novel, ~0 = recalled), the write gates and the running
 write count. A request containing "reset_memory": true re-initializes the memory (send one at
 every episode start); a bare {"reset_memory": true} request (no images) just resets and returns.

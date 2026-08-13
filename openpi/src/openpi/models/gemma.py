@@ -167,6 +167,11 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # Diagnostics only. When true, the head-averaged attention distribution is returned as an
+    # extra output so a caller can inspect which key positions each query attends to. The
+    # default keeps the array out of the graph entirely, so normal training and inference are
+    # unchanged and the compiler still removes the dead output.
+    return_attn_probs: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache, cache_position=None):
@@ -240,7 +245,8 @@ class Attention(nn.Module):
         big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        probs_f32 = jax.nn.softmax(masked_logits, axis=-1)
+        probs = probs_f32.astype(dtype)
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -261,6 +267,15 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
+        if self.return_attn_probs:
+            # Keep every head separate: [B, N, T, S] with N = num_kv_heads * groups, each row a
+            # distribution over unmasked keys. Averaging heads here would be lossy in exactly the
+            # case that matters -- specialized behaviour concentrated in one head is diluted by
+            # sink heads -- so the caller decides whether to reduce.
+            # The pre-cast float32 array is used because the bfloat16 copy the model consumes
+            # rounds each row by ~4e-4, which shows up as phantom missing mass when a caller
+            # partitions a row into key blocks.
+            return out, (k, v), einops.rearrange(probs_f32, "B K G T S -> B (K G) T S")
         return out, (k, v)
 
 
@@ -303,13 +318,15 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # Diagnostics only; see Attention.return_attn_probs.
+    return_attn_probs: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, cache_position=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, name="attn", return_attn_probs=self.return_attn_probs)
 
         pre_attn = []
         gates = []
@@ -320,7 +337,11 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, cache_position)
+        attn_probs = None
+        if self.return_attn_probs:
+            post_attn, kv_cache, attn_probs = attn(pre_attn, positions, attn_mask, kv_cache, cache_position)
+        else:
+            post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, cache_position)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -347,8 +368,9 @@ class Block(nn.Module):
 
         # The block's output is also emitted as an extra scan output: nn.scan stacks it across
         # layers into per-expert [depth, b, seq, width] hidden states. When the caller does not
-        # use them, the stacked output is dead code and the compiler removes it.
-        return xs, (kv_cache, list(xs))
+        # use them, the stacked output is dead code and the compiler removes it. Attention
+        # probabilities follow the same pattern and are None unless explicitly requested.
+        return xs, (kv_cache, list(xs), attn_probs)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -364,6 +386,10 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # Diagnostics only; see Attention.return_attn_probs. Setting this changes no parameter and
+    # no numerical result -- it only keeps the per-layer attention distributions alive as an
+    # extra scan output, so a checkpoint stays loadable either way.
+    return_attn_probs: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -397,6 +423,7 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            return_attn_probs=self.return_attn_probs,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -431,13 +458,19 @@ class Module(nn.Module):
             KVCache,
             Sequence[at.Float[at.Array, "l b _t _d"] | None],
         ]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            Sequence[at.Float[at.Array, "l b _t _d"] | None],
+            at.Float[at.Array, "l b n t s"],
+        ]
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, (kv_cache, hidden_states) = self.layers(
+        embedded, (kv_cache, hidden_states, attn_probs) = self.layers(
             embedded, kv_cache, positions, mask, adarms_cond, deterministic, cache_position
         )
 
@@ -449,6 +482,9 @@ class Module(nn.Module):
         if return_hidden_states:
             # per-expert stacks of every block's output, [depth, b, seq, width]: entry [L] is the
             # output of block L, so [-1] is the final hidden state before the output norm.
+            if self.return_attn_probs:
+                # [depth, b, head, query, key] per-head attention, aligned with hidden_states.
+                return out, kv_cache, hidden_states, attn_probs
             return out, kv_cache, hidden_states
         return out, kv_cache
 

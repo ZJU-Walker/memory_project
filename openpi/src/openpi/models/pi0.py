@@ -1,3 +1,4 @@
+import contextlib
 import logging
 
 import augmax
@@ -136,15 +137,20 @@ class Pi0(_model.BaseModel):
             self.memory_write_source = config.memory_write_source
             self.causal_token_len = config.causal_token_len
             self.memory_probe_weight = config.memory_probe_weight
-            if config.memory_probe_weight > 0:
-                # train-only quiz head: classifies the episode's answer from the mean-pooled
-                # gated read output at the probe positions (never used at inference)
-                self.probe_head = nnx.Linear(config.memory.d_value, config.memory_probe_classes, rngs=rngs)
+            self.memory_probe_diagnostic = config.memory_probe_diagnostic
+            # Keep this module in every memory-model parameter tree even when probe computation
+            # is disabled. Existing probe-trained v3/v3.1 checkpoints therefore remain strictly
+            # loadable; clean no-probe recipes explicitly mask its optimizer updates.
+            self.probe_head = nnx.Linear(config.memory.d_value, config.memory_probe_classes, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
-    def _select_memory_write_source(self, raw_hidden: at.Array, post_attention: at.Array) -> at.Array:
+    def _select_memory_write_source(
+        self,
+        raw_hidden: at.Array,
+        post_attention: at.Array,
+    ) -> at.Array:
         """Selects the configured write representation while keeping all inner math float32."""
         if raw_hidden.shape != post_attention.shape:
             raise ValueError(
@@ -634,6 +640,732 @@ class Pi0(_model.BaseModel):
         tokens_per_cam = num_img_tokens // len(observation.images)
         return hidden[0][:, :, :tokens_per_cam]
 
+    def writer_contribution_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        allow_write: bool = True,
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """Run only the v3/v3.1 memory path and diagnose its 256-token write.
+
+        This is an offline diagnostic fast path.  It deliberately stops after the image/context
+        prefill, read, and memory-token attention step: it does not decode a subtask or denoise an
+        action chunk.  The selected write representation is therefore exactly the same ``h_t``
+        (v3) or final ``c18`` (v3.1) that :meth:`sample_with_memory` would write, while avoiding
+        all downstream policy compute.
+
+        Per-token errors and fast-weight gradient norms are evaluated against ``memory_state``
+        *before* the frame-level write.  ``allow_write=False`` still returns all diagnostics but
+        leaves the complete fast state unchanged.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+
+        # This intentionally mirrors sample_with_memory's prefill rather than going through
+        # embed_prefix: memory inference has a fixed [images | context text] prefix and needs the
+        # selected intermediate Gemma layer for the top-camera tokens.
+        img_tokens = []
+        img_masks = []
+        for name in preprocessed.images:
+            image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            img_tokens.append(image_tokens)
+            img_masks.append(einops.repeat(preprocessed.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+        img_tokens = jnp.concatenate(img_tokens, axis=1)
+        img_mask = jnp.concatenate(img_masks, axis=1)
+
+        prompt = preprocessed.tokenized_prompt
+        prompt_mask = preprocessed.tokenized_prompt_mask
+        ar = (
+            preprocessed.token_ar_mask
+            if preprocessed.token_ar_mask is not None
+            else jnp.zeros(prompt.shape, dtype=jnp.int32)
+        )
+        num_img = img_mask.shape[1]
+        prefix_len = num_img + prompt.shape[1]
+        mem_len = num_img // len(preprocessed.images)
+        prefix_tokens = jnp.concatenate([img_tokens, self.PaliGemma.llm(prompt, method="embed")], axis=1)
+        prefix_mask = jnp.concatenate([img_mask, prompt_mask], axis=1)
+        prefix_ar = jnp.concatenate([0 * img_mask, ar], axis=1).astype(jnp.int32)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache, hidden = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=make_attn_mask(prefix_mask, prefix_ar),
+            positions=positions,
+            return_hidden_states=True,
+        )
+        h_t = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
+
+        retrieved = self.memory.read(memory_state, h_t)
+        mem_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
+        # Keep the same cache width and masked causal tail as normal memory inference.  This is
+        # cheap relative to the VLM prefill and makes c_t numerically comparable to that path.
+        kv_cache = jax.tree.map(
+            lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, mem_len + self.causal_token_len), (0, 0), (0, 0))),
+            kv_cache,
+        )
+        mem_positions = prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))
+        (mem_out, _), _ = self.PaliGemma.llm(
+            [mem_tokens, None],
+            mask=make_memory_step_mask(prefix_mask, prefix_ar, mem_len, self.causal_token_len),
+            positions=mem_positions,
+            kv_cache=kv_cache,
+            cache_position=prefix_len,
+        )
+        c_t = mem_out.astype(jnp.float32)
+        write_source = self._select_memory_write_source(h_t, c_t)
+
+        token_aux = self.memory.token_write_diagnostics(memory_state, write_source)
+        candidate_state, write_aux = self.memory.write(memory_state, write_source)
+        new_state = candidate_state if allow_write else memory_state
+        aux = {
+            **write_aux,
+            **token_aux,
+            "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            "write_source_norm": jnp.sqrt(jnp.mean(jnp.square(write_source), axis=(1, 2))),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+            "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+        }
+        return new_state, aux
+
+    def _final_ct_from_image_embeddings(
+        self,
+        preprocessed: _model.Observation,
+        memory_state: _memory.MemoryState,
+        image_embeddings: tuple[at.Array, ...],
+        *,
+        include_zero_read: bool,
+    ) -> tuple[at.Array, at.Array | None, at.Array]:
+        """Shared exact inference primal for final-c_t diagnostics.
+
+        ``image_embeddings`` must follow ``preprocessed.images`` order.  SigLIP is kept outside
+        this helper so callers can either use its ordinary outputs or substitute patch-space
+        interventions.  The prefix is evaluated once even when the zero-read counterfactual is
+        requested.
+        """
+        batch = preprocessed.state.shape[0]
+        camera_names = tuple(preprocessed.images)
+        if len(image_embeddings) != len(camera_names):
+            raise ValueError(f"expected {len(camera_names)} camera embedding tensors; got {len(image_embeddings)}.")
+        if not image_embeddings:
+            raise ValueError("final-c_t diagnostics require at least one camera embedding tensor.")
+
+        mem_len = image_embeddings[0].shape[1]
+        for name, tokens in zip(camera_names, image_embeddings, strict=True):
+            if tokens.ndim != 3 or tokens.shape[0] != batch:
+                raise ValueError(
+                    f"camera {name} patch embeddings must have shape [batch, tokens, width]; got {tokens.shape}."
+                )
+            if tokens.shape[1] != mem_len:
+                raise ValueError("all cameras must produce the same number of SigLIP patch embeddings.")
+            if tokens.shape[-1] != self.memory.config.d_input:
+                raise ValueError(
+                    f"camera {name} patch width must equal memory d_input "
+                    f"({self.memory.config.d_input}); got {tokens.shape[-1]}."
+                )
+
+        image_mask = jnp.concatenate(
+            [
+                einops.repeat(preprocessed.image_masks[name], "b -> b s", s=tokens.shape[1])
+                for name, tokens in zip(camera_names, image_embeddings, strict=True)
+            ],
+            axis=1,
+        )
+        image_tokens = jnp.concatenate(image_embeddings, axis=1)
+        prompt = preprocessed.tokenized_prompt
+        prompt_mask = preprocessed.tokenized_prompt_mask
+        ar = (
+            preprocessed.token_ar_mask
+            if preprocessed.token_ar_mask is not None
+            else jnp.zeros(prompt.shape, dtype=jnp.int32)
+        )
+        prefix_tokens = jnp.concatenate([image_tokens, self.PaliGemma.llm(prompt, method="embed")], axis=1)
+        prefix_mask = jnp.concatenate([image_mask, prompt_mask], axis=1)
+        prefix_ar = jnp.concatenate([0 * image_mask, ar], axis=1).astype(jnp.int32)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache, hidden = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=make_attn_mask(prefix_mask, prefix_ar),
+            positions=prefix_positions,
+            return_hidden_states=True,
+        )
+        h_t = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
+        retrieved = self.memory.read(memory_state, h_t)
+
+        prefix_len = prefix_tokens.shape[1]
+        padded_cache = jax.tree.map(
+            lambda x: jnp.pad(
+                x,
+                ((0, 0), (0, 0), (0, mem_len + self.causal_token_len), (0, 0), (0, 0)),
+            ),
+            kv_cache,
+        )
+        memory_attn_mask = make_memory_step_mask(prefix_mask, prefix_ar, mem_len, self.causal_token_len)
+        memory_positions = prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))
+
+        def run_memory_tokens(retrieved_content):
+            memory_tokens = (self.memory_gate.value * retrieved_content).astype(prefix_tokens.dtype)
+            (mem_out, _), _ = self.PaliGemma.llm(
+                [memory_tokens, None],
+                mask=memory_attn_mask,
+                positions=memory_positions,
+                kv_cache=padded_cache,
+                cache_position=prefix_len,
+            )
+            # Module.__call__ returns `out`, after every transformer block and final_norms.
+            return mem_out.astype(jnp.float32)
+
+        final_ct = run_memory_tokens(retrieved)
+        zero_read_final_ct = run_memory_tokens(jnp.zeros_like(retrieved)) if include_zero_read else None
+        return final_ct, zero_read_final_ct, retrieved
+
+    def final_ct_intervention_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        allow_write: bool = False,
+        top_camera_patch_embeddings: at.Float[at.Array, "b n d"] | None = None,
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """No-gradient final-c_t forward for patch-space or image-space interventions.
+
+        With no override this is the same final-normalized v3.1 writer primal as inference.
+        ``top_camera_patch_embeddings`` can replace the exact SigLIP outputs for the first
+        camera.  To test an intervention at the transformed model-image boundary instead, put
+        the modified image in ``observation.images['base_0_rgb']`` and omit the override; this
+        runs the modified input through SigLIP normally.  Unlike
+        :meth:`final_ct_attribution_step`, this method does not build a reverse pass or compute
+        a zero-read counterfactual, making it suitable for batched occlusion sweeps.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_write_source != "post_attention":
+            raise ValueError(
+                "final_ct_intervention_step measures the actual writer only when memory_write_source='post_attention'."
+            )
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        camera_names = tuple(preprocessed.images)
+        if not camera_names or camera_names[0] != "base_0_rgb":
+            raise ValueError(
+                "final-c_t intervention requires base_0_rgb to be the first/top camera; "
+                f"got camera order {camera_names}."
+            )
+
+        image_embeddings = []
+        for index, name in enumerate(camera_names):
+            if index == 0 and top_camera_patch_embeddings is not None:
+                image_tokens = jnp.asarray(top_camera_patch_embeddings)
+            else:
+                image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            image_embeddings.append(image_tokens)
+        final_ct, _, retrieved = self._final_ct_from_image_embeddings(
+            preprocessed, memory_state, tuple(image_embeddings), include_zero_read=False
+        )
+
+        writer_loss = self.memory.surprise(memory_state, final_ct)
+        candidate_state, write_aux = self.memory.write(memory_state, final_ct)
+        new_state = candidate_state if allow_write else memory_state
+        batch = final_ct.shape[0]
+        aux = {
+            **write_aux,
+            "final_ct": final_ct,
+            "writer_loss": writer_loss,
+            "final_ct_rms": jnp.sqrt(jnp.mean(jnp.square(final_ct), axis=(1, 2))),
+            "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+            "top_camera_tokens": jnp.asarray(final_ct.shape[1], dtype=jnp.int32),
+            "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+        }
+        return new_state, aux
+
+    def writer_echo_factorial_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+    ) -> tuple[_memory.MemoryState, _memory.MemoryState, dict[str, at.Array]]:
+        """Return normal-read and zero-read v3.1 candidate writes from one pre-state.
+
+        This offline diagnostic primitive evaluates the exact final-normalized v3.1 writer
+        representation twice while sharing the complete current-observation prefix: once with
+        the ordinary retrieved memory and once with the retrieved vectors replaced by zero.
+        Both candidate states branch from ``memory_state`` and are returned without selecting or
+        committing either branch. A caller can batch different observation/state pairings to
+        form a side-effect-free O x M factorial experiment.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_write_source != "post_attention":
+            raise ValueError("writer_echo_factorial_step is defined for the v3.1 final post_attention writer.")
+
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        image_embeddings = tuple(
+            self.PaliGemma.img(preprocessed.images[name], train=False)[0] for name in preprocessed.images
+        )
+        normal_ct, zero_read_ct, retrieved = self._final_ct_from_image_embeddings(
+            preprocessed,
+            memory_state,
+            image_embeddings,
+            include_zero_read=True,
+        )
+        assert zero_read_ct is not None
+        normal_state, normal_aux = self.memory.write(memory_state, normal_ct)
+        zero_state, zero_aux = self.memory.write(memory_state, zero_read_ct)
+        aux = {
+            "normal_ct": normal_ct,
+            "zero_read_ct": zero_read_ct,
+            "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            **{f"normal_{key}": value for key, value in normal_aux.items()},
+            **{f"zero_read_{key}": value for key, value in zero_aux.items()},
+        }
+        return normal_state, zero_state, aux
+
+    def memory_swap_read_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+    ) -> dict[str, at.Array]:
+        """Return the exact v3.1 retrieved vectors and final c18 without writing.
+
+        This is a read-only offline diagnostic boundary for matched-state interventions.  A
+        caller may repeat one observation across different complete fast states and directly
+        compare the retrieved tensor that enters the memory-token block, rather than treating
+        its scalar norm as evidence of semantic content.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_write_source != "post_attention":
+            raise ValueError("memory_swap_read_step is defined for the v3.1 final post_attention writer.")
+
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        image_embeddings = tuple(
+            self.PaliGemma.img(preprocessed.images[name], train=False)[0] for name in preprocessed.images
+        )
+        final_ct, _, retrieved = self._final_ct_from_image_embeddings(
+            preprocessed,
+            memory_state,
+            image_embeddings,
+            include_zero_read=False,
+        )
+        return {
+            "retrieved": retrieved.astype(jnp.float32),
+            "final_ct": final_ct,
+        }
+
+    def writer_echo_factorial_metrics_step(
+        self,
+        observation: _model.Observation,
+        paired_state: _memory.MemoryState,
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """Reduce the paired left/right O x M writer experiment entirely on device.
+
+        ``paired_state`` is ``[left_memory, right_memory]``. ``observation`` must have batch
+        order ``[left_obs, right_obs, right_obs, left_obs]``. The corresponding memory batch is
+        constructed as ``[left_memory, left_memory, right_memory, right_memory]`` so indices
+        ``0,2`` are matched O,M and ``1,3`` are observation swaps. For every pairing this method
+        evaluates normal and zero reads, reports vector factorial effects, and commits only the
+        two matched normal branches for recurrent replay.
+        """
+        if observation.state.shape[0] != 4:
+            raise ValueError("writer echo factorial observations must have batch size 4.")
+        first_state_leaf = jax.tree.leaves(paired_state)[0]
+        if first_state_leaf.shape[0] != 2:
+            raise ValueError("writer echo factorial paired_state must have batch size 2.")
+
+        branch_indices = jnp.asarray([0, 0, 1, 1], dtype=jnp.int32)
+        state4 = jax.tree.map(lambda value: value[branch_indices], paired_state)
+        normal_state, zero_state, aux = self.writer_echo_factorial_step(observation, state4)
+
+        def scale_batch(values, scale):
+            return jax.tree.map(
+                lambda value: value * scale.reshape(scale.shape + (1,) * (value.ndim - 1)),
+                values,
+            )
+
+        def subtract(left, right):
+            return jax.tree.map(lambda x, y: x - y, left, right)
+
+        def add(left, right):
+            return jax.tree.map(lambda x, y: x + y, left, right)
+
+        normal_injection = subtract(
+            normal_state.momentum,
+            scale_batch(state4.momentum, aux["normal_eta"]),
+        )
+        zero_injection = subtract(
+            zero_state.momentum,
+            scale_batch(state4.momentum, aux["zero_read_eta"]),
+        )
+        normal_fast_update = subtract(normal_state.fast_weights, state4.fast_weights)
+        zero_fast_update = subtract(zero_state.fast_weights, state4.fast_weights)
+        normal_full_update = _memory.MemoryState(normal_fast_update, subtract(normal_state.momentum, state4.momentum))
+        zero_full_update = _memory.MemoryState(zero_fast_update, subtract(zero_state.momentum, state4.momentum))
+
+        def take(tree, index):
+            return jax.tree.map(lambda value: value[index], tree)
+
+        def tree_dot(left, right):
+            return sum(jnp.vdot(x, y).real for x, y in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+
+        def tree_norm(tree):
+            return jnp.sqrt(jnp.maximum(tree_dot(tree, tree), 0.0))
+
+        def cosine(left, right):
+            return tree_dot(left, right) / jnp.maximum(tree_norm(left) * tree_norm(right), 1e-12)
+
+        metrics: dict[str, list[at.Array]] = {}
+
+        def append_metric(name, value):
+            metrics.setdefault(name, []).append(value)
+
+        def reduce_family(name, normal_values, zero_values, original_index, swapped_index):
+            a = take(normal_values, original_index)  # A(O, M)
+            b = take(zero_values, original_index)  # A(O, 0)
+            c = take(normal_values, swapped_index)  # A(O_swap, M)
+            d = take(zero_values, swapped_index)  # A(O_swap, 0)
+            memory_effect = subtract(a, b)
+            observation_effect = subtract(a, c)
+            observation_effect_zero = subtract(b, d)
+            interaction = add(subtract(a, b), subtract(d, c))
+            memory_main = scale_batch(add(subtract(a, b), subtract(c, d)), jnp.asarray(0.5))
+            observation_main = scale_batch(add(subtract(a, c), subtract(b, d)), jnp.asarray(0.5))
+            base_norm = tree_norm(a)
+            memory_norm = tree_norm(memory_effect)
+            observation_norm = tree_norm(observation_effect)
+            interaction_norm = tree_norm(interaction)
+            append_metric(f"{name}_base_norm", base_norm)
+            append_metric(f"{name}_memory_effect_norm", memory_norm)
+            append_metric(f"{name}_observation_effect_norm", observation_norm)
+            append_metric(f"{name}_observation_effect_zero_read_norm", tree_norm(observation_effect_zero))
+            append_metric(f"{name}_interaction_norm", interaction_norm)
+            append_metric(f"{name}_memory_effect_relative", memory_norm / jnp.maximum(base_norm, 1e-12))
+            append_metric(f"{name}_observation_effect_relative", observation_norm / jnp.maximum(base_norm, 1e-12))
+            append_metric(f"{name}_interaction_relative", interaction_norm / jnp.maximum(base_norm, 1e-12))
+            append_metric(
+                f"{name}_memory_to_observation_main_ratio",
+                tree_norm(memory_main) / jnp.maximum(tree_norm(observation_main), 1e-12),
+            )
+            append_metric(f"{name}_normal_vs_zero_cosine", cosine(a, b))
+            append_metric(f"{name}_normal_vs_swapped_observation_cosine", cosine(a, c))
+
+        for original_index, swapped_index in ((0, 1), (2, 3)):
+            reduce_family("final_ct", aux["normal_ct"], aux["zero_read_ct"], original_index, swapped_index)
+            reduce_family("injection", normal_injection, zero_injection, original_index, swapped_index)
+            reduce_family("fast_update", normal_fast_update, zero_fast_update, original_index, swapped_index)
+            reduce_family("full_update", normal_full_update, zero_full_update, original_index, swapped_index)
+            for key in (
+                "retrieval_norm",
+                "normal_surprise",
+                "zero_read_surprise",
+                "normal_grad_norm",
+                "zero_read_grad_norm",
+            ):
+                append_metric(key, aux[key][original_index])
+
+        committed_indices = jnp.asarray([0, 2], dtype=jnp.int32)
+        committed_state = jax.tree.map(lambda value: value[committed_indices], normal_state)
+        return committed_state, {name: jnp.stack(values) for name, values in metrics.items()}
+
+    def final_ct_attribution_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        allow_write: bool = False,
+        top_camera_patch_embeddings: at.Float[at.Array, "b n d"] | None = None,
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """Attribute the real v3.1 writer objective to top-camera SigLIP tokens.
+
+        The differentiated inputs are the *outputs* of SigLIP for the first camera
+        (``base_0_rgb``), not pixels or an internal SigLIP layer.  Consequently the returned
+        patch map includes both Gemma passes -- the prefix pass that forms ``h_t`` and the
+        incremental memory-token pass -- including all transformer blocks and Gemma's final
+        RMSNorm, while deliberately excluding attribution through the image encoder itself.
+
+        ``final_ct`` is the exact normalized ``mem_out`` used by v3.1 inference.  The scalar
+        objective for sample ``b`` is the pre-write associative loss
+
+            memory.surprise(memory_state, final_ct)[b].
+
+        A single reverse-mode pass differentiates the sum of these independent per-sample
+        losses with respect to ``[B, N, D]`` top-camera patch embeddings.  Because neither the
+        transformer nor the memory mixes the batch dimension, the resulting ``[B, N]`` L2 map
+        is exactly the per-sample VJP, without constructing a prohibitively large Jacobian.
+
+        The zero-read counterfactual preserves the complete prefix, cache layout, memory-token
+        positions, content gate, and final norm; only the retrieved vectors are replaced with
+        zeros.  ``allow_write=False`` (the diagnostic default) computes all writer statistics
+        but returns ``memory_state`` byte-for-byte unchanged.  Supplying
+        ``top_camera_patch_embeddings`` is an optional patch-space intervention hook; omitted,
+        the embeddings are produced once by the model's normal SigLIP inference call.
+
+        This diagnostic is intentionally restricted to ``post_attention`` models.  For a v3
+        ``raw_hidden`` model, ``final_ct`` is not the configured writer input, so labelling its
+        surprise as the actual writer objective would be misleading.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_write_source != "post_attention":
+            raise ValueError(
+                "final_ct_attribution_step measures the actual writer only when memory_write_source='post_attention'."
+            )
+
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+        camera_names = tuple(preprocessed.images)
+        if not camera_names or camera_names[0] != "base_0_rgb":
+            raise ValueError(
+                "final-c_t attribution requires base_0_rgb to be the first/top camera; "
+                f"got camera order {camera_names}."
+            )
+
+        # SigLIP is intentionally outside value_and_grad: the attribution boundary is its
+        # exact output patch tensor.  Holding that tensor in float32 gives a stable gradient
+        # norm; Gemma immediately casts it to its configured embed dtype, exactly as inference
+        # does, so the primal final_c_t is numerically unchanged.
+        image_embeddings = []
+        inferred_top_embeddings = None
+        for index, name in enumerate(camera_names):
+            if index == 0 and top_camera_patch_embeddings is not None:
+                image_tokens = jnp.asarray(top_camera_patch_embeddings)
+            else:
+                image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            if index == 0:
+                inferred_top_embeddings = image_tokens
+            image_embeddings.append(image_tokens)
+
+        assert inferred_top_embeddings is not None
+        mem_len = inferred_top_embeddings.shape[1]
+        top_embeddings_f32 = inferred_top_embeddings.astype(jnp.float32)
+        other_image_embeddings = tuple(image_embeddings[1:])
+
+        def objective(top_embeddings):
+            # This is the same two-call inference path as sample_with_memory.  In particular,
+            # mem_out is Module.__call__'s `out`, after all blocks and `final_norms`; it is not
+            # hidden_states[-1], which is the last block output *before* final RMSNorm.
+            all_image_embeddings = (top_embeddings, *other_image_embeddings)
+            normal_ct, zero_read_ct, retrieved = self._final_ct_from_image_embeddings(
+                preprocessed,
+                memory_state,
+                all_image_embeddings,
+                include_zero_read=True,
+            )
+            assert zero_read_ct is not None
+            writer_loss = self.memory.surprise(memory_state, normal_ct)
+            return jnp.sum(writer_loss), (writer_loss, normal_ct, zero_read_ct, retrieved)
+
+        (_, (writer_loss, final_ct, zero_read_ct, retrieved)), top_patch_grad = jax.value_and_grad(
+            objective, has_aux=True
+        )(top_embeddings_f32)
+
+        # The write happens outside the differentiated objective.  It is the regular v3.1
+        # update against the same pre-write state and final_ct; `surprise` in write_aux is thus
+        # the same objective returned above.  No state leaf is ever mutated in place.
+        candidate_state, write_aux = self.memory.write(memory_state, final_ct)
+        new_state = candidate_state if allow_write else memory_state
+        top_patch_grad = top_patch_grad.astype(jnp.float32)
+        zero_read_delta = final_ct - zero_read_ct
+        aux = {
+            **write_aux,
+            "final_ct": final_ct,
+            "writer_loss": writer_loss,
+            "writer_loss_top_patch_grad_norm": jnp.linalg.norm(top_patch_grad, axis=-1),
+            "final_ct_zero_read_l2": jnp.linalg.norm(zero_read_delta, axis=-1),
+            "writer_loss_top_patch_grad_global_norm": jnp.linalg.norm(top_patch_grad, axis=(1, 2)),
+            "top_camera_patch_embedding_rms": jnp.sqrt(jnp.mean(jnp.square(top_embeddings_f32), axis=(1, 2))),
+            "final_ct_rms": jnp.sqrt(jnp.mean(jnp.square(final_ct), axis=(1, 2))),
+            "zero_read_final_ct_rms": jnp.sqrt(jnp.mean(jnp.square(zero_read_ct), axis=(1, 2))),
+            "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+            "top_camera_tokens": jnp.asarray(mem_len, dtype=jnp.int32),
+            "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+        }
+        return new_state, aux
+
+    @contextlib.contextmanager
+    def capture_attention(self):
+        """Temporarily make the LLM return per-layer attention distributions.
+
+        The flag is a linen dataclass attribute rather than a parameter, so toggling it changes
+        no weights and no numerics; it only keeps an extra scan output alive. It is restored on
+        exit so a diagnostic can never leave the model in a slower state.
+        """
+
+        module = self.PaliGemma.llm.module
+        previous = module.return_attn_probs
+        object.__setattr__(module, "return_attn_probs", True)
+        try:
+            yield
+        finally:
+            object.__setattr__(module, "return_attn_probs", previous)
+
+    def memory_attention_maps(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        layer: int | None = None,
+        head: int | None = None,
+        forced_subtask_tokens: at.Int[at.Array, "b cl"] | None = None,
+        forced_subtask_mask: at.Bool[at.Array, "b cl"] | None = None,
+    ) -> dict[str, at.Array]:
+        """Attention from the memory-token and subtask-token rows onto the image patches.
+
+        This is a read-only diagnostic: it performs the same prefill and memory-token extension
+        as inference, but denoises no actions, commits no write, and returns the requested
+        layer's head-averaged attention distributions.
+
+        Two query groups are returned, matching the two questions the v3.1 experiments ask:
+
+        * ``memory_to_top`` -- for each of the 256 memory-token rows, how much it attends to each
+          of the 256 top-camera patch keys. This is what forms ``c_t``, so it shows which image
+          regions the *write* is built from.
+        * ``subtask_to_top`` / ``subtask_to_memory`` -- for each teacher-forced subtask token,
+          its attention onto the top-camera patches and onto the memory block. The latter is the
+          share of attention the *decision* spends on retrieved memory rather than current
+          vision, which no image-space map alone can establish.
+
+        Rows are full softmax distributions over ALL keys, so the returned per-group maps do not
+        each sum to one; ``*_mass`` entries report how much of each row's total attention the
+        group captures, which is required to compare groups honestly.
+
+        ``head`` selects a single attention head; the default averages all of them. The average
+        is the honest summary only when heads behave alike -- a single head that routes strongly
+        to vision or memory is diluted by sink heads that dominate the mean, so a per-head sweep
+        is what distinguishes "the model barely looks at the image" from "one head does".
+        """
+
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if (forced_subtask_tokens is None) != (forced_subtask_mask is None):
+            raise ValueError("forced_subtask_tokens and forced_subtask_mask must be provided together.")
+        target_layer = self.memory_layer if layer is None else layer
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+
+        img_tokens = []
+        img_masks = []
+        for name in preprocessed.images:
+            image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            img_tokens.append(image_tokens)
+            img_masks.append(einops.repeat(preprocessed.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+        img_tokens = jnp.concatenate(img_tokens, axis=1)
+        img_mask = jnp.concatenate(img_masks, axis=1)
+        prompt = preprocessed.tokenized_prompt
+        prompt_mask = preprocessed.tokenized_prompt_mask
+        ar = (
+            preprocessed.token_ar_mask
+            if preprocessed.token_ar_mask is not None
+            else jnp.zeros(prompt.shape, dtype=jnp.int32)
+        )
+        num_img = img_mask.shape[1]
+        prefix_len = num_img + prompt.shape[1]
+        mem_len = num_img // len(preprocessed.images)
+        causal_len = self.causal_token_len
+        if not 0 <= target_layer < self.PaliGemma.llm.module.configs[0].depth:
+            raise ValueError(f"layer {target_layer} is outside the model's depth")
+
+        prefix_tokens = jnp.concatenate([img_tokens, self.PaliGemma.llm(prompt, method="embed")], axis=1)
+        prefix_mask = jnp.concatenate([img_mask, prompt_mask], axis=1)
+        prefix_ar = jnp.concatenate([0 * img_mask, ar], axis=1).astype(jnp.int32)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        # With capture enabled every hidden-state call also yields attention, so unpack the
+        # prefill positionally: the prefix's own self-attention is not one of the requested maps.
+        prefill = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=attn_mask, positions=positions, return_hidden_states=True
+        )
+        kv_cache, hidden = prefill[1], prefill[2]
+        h_t = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
+
+        mem_tokens = (self.memory_gate.value * self.memory.read(memory_state, h_t)).astype(prefix_tokens.dtype)
+        kv_cache = jax.tree.map(
+            lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache
+        )
+        mem_mask = make_memory_step_mask(prefix_mask, prefix_ar, mem_len, causal_len)
+        mem_positions = prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))
+        memory_pass = self.PaliGemma.llm(
+            [mem_tokens, None],
+            mask=mem_mask,
+            positions=mem_positions,
+            kv_cache=kv_cache,
+            cache_position=prefix_len,
+            return_hidden_states=True,
+        )
+        if len(memory_pass) != 4:
+            raise RuntimeError("memory_attention_maps requires the capture_attention() context")
+        kv_cache, mem_attn = memory_pass[1], memory_pass[3]
+
+        # The top camera occupies the first mem_len image-token slots; memory keys sit directly
+        # after the whole prefix. Slicing by these offsets keeps the map aligned with the exact
+        # 16x16 SigLIP patch grid the renderer expects.
+        num_heads = mem_attn.shape[2]
+        if head is not None and not 0 <= head < num_heads:
+            raise ValueError(f"head {head} is outside the layer's {num_heads} heads")
+        memory_rows = mem_attn[target_layer]
+        memory_rows = jnp.mean(memory_rows, axis=1) if head is None else memory_rows[:, head]
+        # Every row is one softmax over ALL keys, so the blocks below partition its total mass.
+        # Camera boundaries follow the order Observation.images was built in, so the split is
+        # exact rather than assumed; the residual named below closes the budget to 1.
+        camera_names = list(preprocessed.images)
+        result = {
+            "memory_to_top": memory_rows[:, :, :mem_len],
+            "memory_to_top_mass": jnp.sum(memory_rows[:, :, :mem_len], axis=-1),
+            "memory_to_prefix_mass": jnp.sum(memory_rows[:, :, :prefix_len], axis=-1),
+            "memory_to_memory_mass": jnp.sum(memory_rows[:, :, prefix_len : prefix_len + mem_len], axis=-1),
+            "memory_to_images_mass": jnp.sum(memory_rows[:, :, :num_img], axis=-1),
+            "memory_to_prompt_mass": jnp.sum(memory_rows[:, :, num_img:prefix_len], axis=-1),
+            "layer": jnp.asarray(target_layer),
+            "top_camera_tokens": jnp.asarray(mem_len),
+            "prefix_len": jnp.asarray(prefix_len),
+            "num_image_tokens": jnp.asarray(num_img),
+            "num_heads": jnp.asarray(num_heads),
+            "head": jnp.asarray(-1 if head is None else head),
+        }
+        for index, name in enumerate(camera_names):
+            start = index * mem_len
+            result[f"memory_to_camera_{name}_mass"] = jnp.sum(memory_rows[:, :, start : start + mem_len], axis=-1)
+
+        if forced_subtask_tokens is not None:
+            gen_tokens = forced_subtask_tokens.astype(prompt.dtype)
+            gen_mask = forced_subtask_mask.astype(bool)
+            causal_emb = self.PaliGemma.llm(gen_tokens, method="embed")
+            causal_rows = jnp.concatenate(
+                [
+                    einops.repeat(prefix_mask, "b p -> b c p", c=causal_len),
+                    jnp.ones((batch, causal_len, mem_len), dtype=bool),
+                    jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None] & gen_mask[:, None, :],
+                ],
+                axis=-1,
+            )
+            causal_positions = jnp.broadcast_to(
+                prefix_len + mem_len + jnp.arange(causal_len)[None], (batch, causal_len)
+            )
+            causal_pass = self.PaliGemma.llm(
+                [causal_emb, None],
+                mask=causal_rows,
+                positions=causal_positions,
+                kv_cache=kv_cache,
+                cache_position=prefix_len + mem_len,
+                return_hidden_states=True,
+            )
+            subtask_rows = causal_pass[3][target_layer]
+            subtask_rows = jnp.mean(subtask_rows, axis=1) if head is None else subtask_rows[:, head]
+            result.update(
+                {
+                    "subtask_to_top": subtask_rows[:, :, :mem_len],
+                    "subtask_to_top_mass": jnp.sum(subtask_rows[:, :, :mem_len], axis=-1),
+                    "subtask_to_memory": subtask_rows[:, :, prefix_len : prefix_len + mem_len],
+                    "subtask_to_memory_mass": jnp.sum(subtask_rows[:, :, prefix_len : prefix_len + mem_len], axis=-1),
+                    "subtask_to_prefix_mass": jnp.sum(subtask_rows[:, :, :prefix_len], axis=-1),
+                    "subtask_to_images_mass": jnp.sum(subtask_rows[:, :, :num_img], axis=-1),
+                    "subtask_to_prompt_mass": jnp.sum(subtask_rows[:, :, num_img:prefix_len], axis=-1),
+                    # Everything after the memory block: the subtask tokens attending to
+                    # themselves and their causal predecessors.
+                    "subtask_to_causal_mass": jnp.sum(subtask_rows[:, :, prefix_len + mem_len :], axis=-1),
+                    "subtask_token_mask": gen_mask,
+                }
+            )
+            for index, name in enumerate(camera_names):
+                start = index * mem_len
+                result[f"subtask_to_camera_{name}_mass"] = jnp.sum(subtask_rows[:, :, start : start + mem_len], axis=-1)
+        return result
+
     def sample_with_memory(
         self,
         rng: at.KeyArrayLike,
@@ -645,6 +1377,10 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         action_prefix: _rtc.ActionPrefix | None = None,
+        forced_subtask_tokens: at.Int[at.Array, "b cl"] | None = None,
+        forced_subtask_mask: at.Bool[at.Array, "b cl"] | None = None,
+        zero_read: bool = False,
+        allow_write: bool = True,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
 
@@ -654,14 +1390,31 @@ class Pi0(_model.BaseModel):
         with h_t and the retrieved tokens (content-gated, zero-init) are appended to the KV
         cache, producing contextualized memory-token outputs c_t; the subtask is decoded and
         the actions denoised against the extended cache. Only after prediction, the memory is
-        written with h_t (v3) or c_t (v3.1), according to ``memory_write_source``. Returns
+        written with h_t (v3) or final c18 (v3.1), according to ``memory_write_source``. Returns
         (actions, new_memory_state, aux) with generated tokens/mask and write diagnostics.
+
+        ``forced_subtask_tokens`` is a diagnostics-only teacher-forcing path. It must be a
+        left-aligned, causal-token-length buffer accompanied by ``forced_subtask_mask``. The
+        returned ``conditioned_subtask_logp`` is the exact summed next-token log probability of
+        that complete sequence. ``zero_read`` preserves the memory-token positions but replaces
+        retrieved content with zeros. ``allow_write=False`` still computes write diagnostics but
+        returns the input state unchanged. These controls make counterfactual evaluations
+        side-effect-free without changing normal inference defaults.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
         assert max_decode_steps <= self.causal_token_len
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         batch = preprocessed.state.shape[0]
         self._check_action_prefix_shapes(action_prefix, batch)
+        if (forced_subtask_tokens is None) != (forced_subtask_mask is None):
+            raise ValueError("forced_subtask_tokens and forced_subtask_mask must be provided together.")
+        if forced_subtask_tokens is not None:
+            expected = (batch, self.causal_token_len)
+            if forced_subtask_tokens.shape != expected or forced_subtask_mask.shape != expected:
+                raise ValueError(
+                    "forced subtask buffers must have shape "
+                    f"{expected}; got {forced_subtask_tokens.shape} and {forced_subtask_mask.shape}."
+                )
 
         # prefill of images + context text, identical to the baseline path, capturing the
         # per-layer hidden states in the same forward
@@ -700,16 +1453,107 @@ class Pi0(_model.BaseModel):
         # read M_{t-1} and append the content-gated memory tokens to the cache (their K/V land
         # in slots [prefix_len, prefix_len + mem_len)); the cache is padded once for the memory
         # block plus the whole causal window
-        mem_tokens = (self.memory_gate.value * self.memory.read(memory_state, h_t)).astype(prefix_tokens.dtype)
+        retrieved = self.memory.read(memory_state, h_t)
+        if zero_read:
+            retrieved = jnp.zeros_like(retrieved)
+        mem_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
         kv_cache = jax.tree.map(
             lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache
         )
         mem_mask = make_memory_step_mask(prefix_mask, prefix_ar, mem_len, causal_len)
         mem_positions = prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))
         (mem_out, _), kv_cache = self.PaliGemma.llm(
-            [mem_tokens, None], mask=mem_mask, positions=mem_positions, kv_cache=kv_cache, cache_position=prefix_len
+            [mem_tokens, None],
+            mask=mem_mask,
+            positions=mem_positions,
+            kv_cache=kv_cache,
+            cache_position=prefix_len,
         )
         c_t = mem_out.astype(jnp.float32)
+
+        if forced_subtask_tokens is not None:
+            # Teacher-force the complete canonical sequence in one causal extension. Position
+            # zero is predicted from the final memory-token output, exactly like free decoding.
+            gen_tokens = forced_subtask_tokens.astype(prompt.dtype)
+            gen_mask = forced_subtask_mask.astype(bool)
+            causal_emb = self.PaliGemma.llm(gen_tokens, method="embed")
+            causal_rows = jnp.concatenate(
+                [
+                    einops.repeat(prefix_mask, "b p -> b c p", c=causal_len),
+                    jnp.ones((batch, causal_len, mem_len), dtype=bool),
+                    jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None] & gen_mask[:, None, :],
+                ],
+                axis=-1,
+            )
+            causal_positions = jnp.broadcast_to(gen_base + jnp.arange(causal_len)[None], (batch, causal_len))
+            (causal_out, _), kv_cache = self.PaliGemma.llm(
+                [causal_emb, None],
+                mask=causal_rows,
+                positions=causal_positions,
+                kv_cache=kv_cache,
+                cache_position=gen_base,
+            )
+
+            # Exact full-sequence score: p(token 0) is read from the last memory output, and
+            # every later token is read from its teacher-forced predecessor.
+            score_hidden = jnp.concatenate([mem_out[:, -1:], causal_out[:, :-1]], axis=1)
+            score_logits = self.PaliGemma.llm(score_hidden, method="decode").astype(jnp.float32)
+            token_logp = jnp.take_along_axis(jax.nn.log_softmax(score_logits, axis=-1), gen_tokens[..., None], axis=-1)[
+                ..., 0
+            ]
+            conditioned_subtask_logp = jnp.sum(token_logp * gen_mask, axis=-1)
+            conditioned_subtask_mean_logp = conditioned_subtask_logp / jnp.maximum(jnp.sum(gen_mask, axis=-1), 1)
+
+            suffix_view = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), gen_mask], axis=1)
+            offset = gen_base + causal_len
+            dt = -1.0 / num_steps
+            if noise is None:
+                noise = jax.random.normal(rng, (batch, self.action_horizon, self.action_dim))
+
+            def forced_denoise_step(carry):
+                x_t, time = carry
+                if action_prefix is None:
+                    model_x_t = x_t
+                    model_time = jnp.broadcast_to(time, batch)
+                else:
+                    model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    preprocessed, model_x_t, model_time
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn_mask = einops.repeat(suffix_view, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+                suffix_positions = offset + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (_, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=suffix_positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+                return x_t + dt * v_t, time + dt
+
+            def forced_denoise_cond(carry):
+                _, time = carry
+                return time >= -dt / 2
+
+            actions, _ = jax.lax.while_loop(forced_denoise_cond, forced_denoise_step, (noise, 1.0))
+            actions = _rtc.restore_action_prefix(actions, action_prefix)
+            write_source = self._select_memory_write_source(h_t, c_t)
+            candidate_state, write_aux = self.memory.write(memory_state, write_source)
+            new_state = candidate_state if allow_write else memory_state
+            aux = {
+                **write_aux,
+                "tokens": gen_tokens,
+                "token_mask": gen_mask,
+                "conditioned_subtask_logp": conditioned_subtask_logp,
+                "conditioned_subtask_mean_logp": conditioned_subtask_mean_logp,
+                "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+                "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+                "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+            }
+            return actions, new_state, aux
 
         def greedy(hidden_vec):  # [b, emb] -> [b] next token
             logits = self.PaliGemma.llm(hidden_vec[:, None], method="decode")[:, 0]
@@ -813,11 +1657,19 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(denoise_cond, denoise_step, (noise, 1.0))
         x_0 = _rtc.restore_action_prefix(x_0, action_prefix)
 
-        # Write only after prediction. Reads always use h_t; v3.1 writes the already-computed
-        # post-attention memory-token representation c_t instead of the raw layer hidden state.
+        # Write only after prediction. Reads always use h_t; v3.1 writes the final-normalized
+        # memory-token output.
         write_source = self._select_memory_write_source(h_t, c_t)
-        new_state, write_aux = self.memory.write(memory_state, write_source)
-        aux = {**write_aux, "tokens": gen_tokens, "token_mask": gen_mask}
+        candidate_state, write_aux = self.memory.write(memory_state, write_source)
+        new_state = candidate_state if allow_write else memory_state
+        aux = {
+            **write_aux,
+            "tokens": gen_tokens,
+            "token_mask": gen_mask,
+            "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+            "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+        }
         return x_0, new_state, aux
 
     def _compute_sequence_loss(
@@ -835,9 +1687,11 @@ class Pi0(_model.BaseModel):
              subtask+FAST, first token from the last memory token's output;
           3. flow matching behind stop_gradient(kv) with per-step independent noise
              (RoboTTT's "sequence action forcing");
-          4. write h_t (v3) or post-attention memory-token output c_t (v3.1); padding
+          4. write h_t (v3) or final memory-token c18 (v3.1); padding
              steps are exact no-ops on the state;
-          5. quiz probe on the post-write state where the data marks the step quizzable.
+          5. optional detached diagnostic probe on the post-write state where the data marks the
+             step quizzable. In the legacy nonzero-weight mode only, its CE is exposed for the
+             caller to add to the objective.
 
         The scan is rematerialized per step, so only ONE step's VLM activations are ever alive
         -- GPU memory does not grow with T. Gradient blocks: `seq_block_boundary` cuts backprop
@@ -854,7 +1708,7 @@ class Pi0(_model.BaseModel):
             images = self._augment_sequence_images(aug_rng, images)
 
         causal_len = observation.tokenized_causal.shape[-1]
-        quiz = self.memory_probe_weight > 0 and observation.seq_probe_mask is not None
+        quiz = (self.memory_probe_weight > 0 or self.memory_probe_diagnostic) and observation.seq_probe_mask is not None
 
         def step_first(x):  # [b, t, ...] -> [t, b, ...]
             return jnp.moveaxis(x, 1, 0)
@@ -933,7 +1787,11 @@ class Pi0(_model.BaseModel):
                 lambda c: jnp.pad(c, ((0, 0), (0, 0), (0, mem_len + causal_len), (0, 0), (0, 0))), kv_cache
             )
             (ext_out, _), kv_cache = self.PaliGemma.llm(
-                [ext_tokens, None], mask=ext_mask, positions=ext_positions, kv_cache=kv_cache, cache_position=prefix_len
+                [ext_tokens, None],
+                mask=ext_mask,
+                positions=ext_positions,
+                kv_cache=kv_cache,
+                cache_position=prefix_len,
             )
             mem_out, causal_out = ext_out[:, :mem_len], ext_out[:, mem_len:]
             c_k = mem_out.astype(jnp.float32)
@@ -987,12 +1845,16 @@ class Pi0(_model.BaseModel):
                 lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
             )
 
-            # 5. quiz probe on the post-write state (reading is pure -- the chain is
-            # bit-identical with probes on or off)
+            # 5. optional diagnostic probe on the post-write state. Stop the complete probe
+            # computation (memory read, content gate, and classifier) so diagnostic logging
+            # cannot create a backward path into the policy/memory or the probe head itself.
+            # Reading is pure, so the recurrent state is bit-identical with diagnostics on/off.
             if quiz:
                 probe_read = self.memory.read(state, h_k)
                 pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
                 probe_logits = self.probe_head(pooled).astype(jnp.float32)
+                if self.memory_probe_diagnostic:
+                    probe_logits = jax.lax.stop_gradient(probe_logits)
                 probe_logp = jax.nn.log_softmax(probe_logits, axis=-1)
                 actf = x["probe_act"].astype(jnp.float32)
                 probe_ce = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf

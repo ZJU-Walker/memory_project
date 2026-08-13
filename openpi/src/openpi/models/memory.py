@@ -138,6 +138,80 @@ class TitansMemory(nnx.Module):
         x = h.astype(jnp.float32)
         return x, _l2_norm(jax.nn.silu(self.w_k(x))), _l2_norm(jax.nn.silu(self.w_v(x)))
 
+    def _token_error_and_grad_norm(
+        self, fast_weights: dict[str, at.Array], k: at.Array, v: at.Array
+    ) -> tuple[at.Array, at.Array]:
+        """Associative error and fast-weight gradient norm for every token.
+
+        ``fast_weights`` is one sample's unbatched pre-write state and ``k``/``v`` have a
+        leading token axis.  For token ``i`` this returns
+
+            e_i = ||M(k_i) - v_i||^2
+            s_i = ||d e_i / d fast_weights||_2.
+
+        The gradient norm is computed analytically from the MLP activations.  For a linear
+        layer with input ``a`` and output cotangent ``delta``, the per-token kernel gradient is
+        the outer product ``a delta^T``; consequently its squared Frobenius norm is
+        ``||a||^2 ||delta||^2``.  Adding the bias contribution gives
+        ``(||a||^2 + 1) ||delta||^2`` per layer.  This avoids materializing a
+        ``[num_tokens, num_fast_parameters]`` Jacobian (more than 1.2B elements for the default
+        256-token memory).
+        """
+        layer_inputs = []
+        preactivations = []
+        activation = k
+        for layer in range(self._num_layers):
+            layer_inputs.append(activation)
+            preactivation = activation @ fast_weights[f"w{layer}"] + fast_weights[f"b{layer}"]
+            preactivations.append(preactivation)
+            activation = jax.nn.silu(preactivation) if layer < self._num_layers - 1 else preactivation
+
+        residual = activation - v
+        token_error = jnp.sum(jnp.square(residual), axis=-1)
+        delta = 2.0 * residual
+        token_grad_norm_sq = jnp.zeros_like(token_error)
+        for layer in reversed(range(self._num_layers)):
+            input_norm_sq = jnp.sum(jnp.square(layer_inputs[layer]), axis=-1)
+            delta_norm_sq = jnp.sum(jnp.square(delta), axis=-1)
+            token_grad_norm_sq = token_grad_norm_sq + (input_norm_sq + 1.0) * delta_norm_sq
+            if layer > 0:
+                delta = delta @ fast_weights[f"w{layer}"].T
+                previous_preactivation = preactivations[layer - 1]
+                sigmoid = jax.nn.sigmoid(previous_preactivation)
+                silu_derivative = sigmoid * (1.0 + previous_preactivation * (1.0 - sigmoid))
+                delta = delta * silu_derivative
+
+        # Numerical round-off cannot make a sum of squares meaningfully negative, but max(0)
+        # prevents an invalid sqrt if a backend ever introduces a tiny negative fused result.
+        return token_error, jnp.sqrt(jnp.maximum(token_grad_norm_sq, 0.0))
+
+    @at.typecheck
+    def token_write_diagnostics(self, state: MemoryState, h: at.Float[at.Array, "b n d"]) -> dict[str, at.Array]:
+        """Measure the 256 individual token contributions to the next associative write.
+
+        This is an offline, read-only diagnostic evaluated against ``state`` *before* the
+        write, using exactly the same normalized keys and values as :meth:`write`.  It returns:
+
+        * ``token_error``: ``e_i = ||M(K_i)-V_i||^2``, shape ``[batch, tokens]``;
+        * ``token_grad_norm``: ``s_i = ||grad_M e_i||``, shape ``[batch, tokens]``;
+        * ``token_mean_loss_grad_norm``: ``s_i / tokens``, the norm of token ``i``'s term in
+          the frame-mean gradient used by :meth:`write` (before the common clip/gate scale).
+
+        The write learning-rate gate ``theta`` and global clipping multiply every token's
+        current-gradient contribution by the same per-frame scalar, so they do not change the
+        relative heatmap.  Momentum and forgetting act on the aggregate state rather than
+        selecting tokens.  Individual gradient norms must not be summed to recover the frame
+        ``grad_norm`` because different token-gradient vectors can align or cancel.
+        """
+        _, k, v = self._keys_values(h)
+        token_error, token_grad_norm = jax.vmap(self._token_error_and_grad_norm)(state.fast_weights, k, v)
+        num_tokens = h.shape[1]
+        return {
+            "token_error": token_error,
+            "token_grad_norm": token_grad_norm,
+            "token_mean_loss_grad_norm": token_grad_norm / num_tokens,
+        }
+
     @at.typecheck
     def write(self, state: MemoryState, h: at.Float[at.Array, "b n d"]) -> tuple[MemoryState, dict[str, at.Array]]:
         """One associative write of a frame's hidden tokens (paper eqs. 11-14).
