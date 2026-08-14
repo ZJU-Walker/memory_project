@@ -1287,7 +1287,8 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
-        save_interval=500,
+        # Keep finer-grained v3.2 recovery/evaluation points.
+        save_interval=250,
         num_workers=12,
     ),
     #

@@ -45,6 +45,7 @@ def test_yam_v32_is_a_fresh_base_initialized_dual_query_experiment() -> None:
     assert v32.model.memory_query_heads == 8
     assert v32.model.memory_probe_weight == 0.0
     assert v32.model.memory_probe_diagnostic is False
+    assert v32.save_interval == 250
     assert v32.data == v31.data
     assert v32.optimizer == v31.optimizer
     assert v32.lr_schedule == v31.lr_schedule
