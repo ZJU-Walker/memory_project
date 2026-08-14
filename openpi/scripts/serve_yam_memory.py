@@ -60,10 +60,17 @@ class Args:
 def _build_server_metadata(train_config: Any, data_config: Any, *, simulated_delay: int | None) -> dict[str, Any]:
     """Publish the training semantics needed to reject mismatched clients/checkpoints."""
     metadata: dict[str, Any] = dict(train_config.policy_metadata or {})
+    memory_architecture = str(getattr(train_config.model, "memory_architecture", "v3_v31"))
     metadata.update(
         {
             "config_name": train_config.name,
+            "memory_architecture": memory_architecture,
             "memory_write_source": str(getattr(train_config.model, "memory_write_source", "raw_hidden")),
+            "memory_query_tokens": (
+                int(getattr(train_config.model, "memory_query_tokens", 0))
+                if memory_architecture == "v32_layer8_dual_query"
+                else None
+            ),
             "action_horizon": int(train_config.model.action_horizon),
             "rtc_enabled": simulated_delay is not None,
             "rtc_max_delay": simulated_delay,
@@ -235,11 +242,13 @@ def create_policy(args: Args) -> MemoryPolicy:
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
     gate = np.asarray(model.memory_gate.value)
+    memory_architecture = str(getattr(train_config.model, "memory_architecture", "v3_v31"))
     memory_write_source = str(getattr(train_config.model, "memory_write_source", "raw_hidden"))
     logging.info(
-        "config=%s | memory_write_source=%s | memory_layer=%d | "
+        "config=%s | memory_architecture=%s | memory_write_source=%s | memory_layer=%d | "
         "memory_gate norm %.4f max|g| %.5f (0 = memory content unused)",
         train_config.name,
+        memory_architecture,
         memory_write_source,
         model.memory_layer,
         np.linalg.norm(gate),

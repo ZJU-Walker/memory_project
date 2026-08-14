@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
-MemoryWriteSource = Literal["raw_hidden", "post_attention"]
+MemoryArchitecture = Literal["v3_v31", "v32_layer8_dual_query"]
+MemoryWriteSource = Literal["raw_hidden", "post_attention", "query_compressed"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +56,12 @@ class Pi0Config(_model.BaseModelConfig):
     # predict_subtask.
     predict_with_memory: bool = False
     memory_layer: int = 17  # gemma block whose top-camera hidden states feed the memory
+    # v3/v3.1 append one retrieved token per top-camera slot after a complete prefix prefill.
+    # v3.2 instead stops after block 8, uses independent 16-query cross-attention compressors
+    # for read and write, inserts only the 16 retrieved tokens, then continues blocks 9..17.
+    memory_architecture: MemoryArchitecture = "v3_v31"
+    memory_query_tokens: int = 16
+    memory_query_heads: int = 8
     # Representation used by the associative memory write. ``raw_hidden`` preserves the v3
     # behavior (write the layer-``memory_layer`` top-camera states); ``post_attention`` writes
     # the final-normalized outputs of the appended memory-token block (v3.1). Reads always use
@@ -100,8 +107,8 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("predict_subtask is only supported for pi05.")
         if self.simulated_delay is not None and not 0 <= self.simulated_delay < self.action_horizon:
             raise ValueError("simulated_delay must be in [0, action_horizon), or None to disable RTC.")
-        if self.memory_write_source not in ("raw_hidden", "post_attention"):
-            raise ValueError("memory_write_source must be 'raw_hidden' or 'post_attention'.")
+        if self.memory_write_source not in ("raw_hidden", "post_attention", "query_compressed"):
+            raise ValueError("unsupported memory_write_source.")
         if self.predict_with_memory:
             if not self.predict_subtask:
                 raise ValueError("predict_with_memory requires predict_subtask.")
@@ -110,6 +117,20 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError(f"memory d_input/d_value must equal the PaliGemma width ({paligemma_config.width}).")
             if not 0 <= self.memory_layer < paligemma_config.depth:
                 raise ValueError(f"memory_layer must be in [0, {paligemma_config.depth}).")
+            if self.memory_architecture == "v32_layer8_dual_query":
+                if self.memory_layer != 8:
+                    raise ValueError("v3.2 requires memory_layer=8.")
+                if self.memory_write_source != "query_compressed":
+                    raise ValueError("v3.2 requires memory_write_source='query_compressed'.")
+                if self.memory_query_tokens != 16:
+                    raise ValueError("v3.2 uses exactly 16 read queries and 16 write queries.")
+                if self.memory_query_heads < 1 or paligemma_config.width % self.memory_query_heads:
+                    raise ValueError("memory_query_heads must divide the PaliGemma width.")
+            elif self.memory_architecture == "v3_v31":
+                if self.memory_write_source == "query_compressed":
+                    raise ValueError("query_compressed writes require the v3.2 architecture.")
+            else:
+                raise ValueError(f"unsupported memory_architecture: {self.memory_architecture!r}.")
             if self.memory_seq_steps < 1:
                 raise ValueError("memory_seq_steps must be >= 1.")
             if self.memory_block_steps < 0:

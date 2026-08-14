@@ -32,6 +32,24 @@ def test_yam_v3_and_v31_start_from_the_same_pi05_base_parameters() -> None:
     assert normalized_v31 == v3
 
 
+def test_yam_v32_is_a_fresh_base_initialized_dual_query_experiment() -> None:
+    v31 = _config.get_config("pi05_yam_mem_v31")
+    v32 = _config.get_config("pi05_yam_mem_v32")
+
+    assert isinstance(v32.weight_loader, weight_loaders.PartialCheckpointWeightLoader)
+    assert v32.weight_loader.params_path == _PI05_BASE_PARAMS
+    assert v32.model.memory_architecture == "v32_layer8_dual_query"
+    assert v32.model.memory_layer == 8
+    assert v32.model.memory_write_source == "query_compressed"
+    assert v32.model.memory_query_tokens == 16
+    assert v32.model.memory_query_heads == 8
+    assert v32.model.memory_probe_weight == 0.0
+    assert v32.model.memory_probe_diagnostic is False
+    assert v32.data == v31.data
+    assert v32.optimizer == v31.optimizer
+    assert v32.lr_schedule == v31.lr_schedule
+
+
 def test_gradient_accumulation_is_opt_in_and_validated() -> None:
     config = _config.get_config("pi05_yam_mem_v31")
     assert config.gradient_accumulation_steps == 1

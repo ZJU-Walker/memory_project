@@ -24,6 +24,17 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
   --batch-size 12 \
   --fsdp-devices 2 \
   --seed 42
+# Train v3.2 fresh from official pi05_base (never --resume a v3/v3.1 run):
+HF_HOME=/iris/u/kewalk/.cache/huggingface \
+OPENPI_DATA_HOME=/iris/u/kewalk/.cache/openpi \
+CUDA_VISIBLE_DEVICES=0,1 \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+.venv/bin/python scripts/train.py pi05_yam_mem_v32 \
+  --exp-name dualquery16_l8_s10_d6_t60_b20-40-60_tb25_bs12_seed42 \
+  --batch-size 12 \
+  --gradient-accumulation-steps 3 \
+  --fsdp-devices 2 \
+  --seed 42
 
 ```
 

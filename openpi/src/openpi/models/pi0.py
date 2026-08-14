@@ -86,6 +86,38 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+class MemoryQueryCompressor(nnx.Module):
+    """Learned query bank that cross-attends to the 256 layer-8 top-camera slots."""
+
+    def __init__(self, *, num_queries: int, width: int, num_heads: int, rngs: nnx.Rngs):
+        if num_queries < 1 or num_heads < 1 or width % num_heads:
+            raise ValueError("query count/heads must be positive and heads must divide width.")
+        self.num_queries = num_queries
+        self.width = width
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.query_bank = nnx.Param(
+            jax.random.normal(rngs.params(), (num_queries, width), dtype=jnp.float32) / jnp.sqrt(width)
+        )
+        self.query_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
+        self.key_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
+        self.value_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
+        self.output_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
+
+    def __call__(self, source: at.Float[at.Array, "b n d"]) -> at.Float[at.Array, "b q d"]:
+        if source.ndim != 3 or source.shape[-1] != self.width:
+            raise ValueError(f"query compressor expects [batch,tokens,{self.width}]; got {source.shape}.")
+        batch = source.shape[0]
+        queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
+        q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
+        k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
+        v = self.value_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
+        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
+        probs = jax.nn.softmax(logits * self.head_dim**-0.5, axis=-1).astype(v.dtype)
+        pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
+        return self.output_proj(pooled).astype(jnp.float32)
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -134,7 +166,9 @@ class Pi0(_model.BaseModel):
             # zero-init content gate: an untrained/empty memory injects exactly-zero token content
             self.memory_gate = nnx.Param(jnp.zeros((config.memory.d_value,), dtype=jnp.float32))
             self.memory_layer = config.memory_layer
+            self.memory_architecture = config.memory_architecture
             self.memory_write_source = config.memory_write_source
+            self.memory_query_tokens = config.memory_query_tokens
             self.causal_token_len = config.causal_token_len
             self.memory_probe_weight = config.memory_probe_weight
             self.memory_probe_diagnostic = config.memory_probe_diagnostic
@@ -142,6 +176,19 @@ class Pi0(_model.BaseModel):
             # is disabled. Existing probe-trained v3/v3.1 checkpoints therefore remain strictly
             # loadable; clean no-probe recipes explicitly mask its optimizer updates.
             self.probe_head = nnx.Linear(config.memory.d_value, config.memory_probe_classes, rngs=rngs)
+            if config.memory_architecture == "v32_layer8_dual_query":
+                self.read_query_compressor = MemoryQueryCompressor(
+                    num_queries=config.memory_query_tokens,
+                    width=paligemma_config.width,
+                    num_heads=config.memory_query_heads,
+                    rngs=rngs,
+                )
+                self.write_query_compressor = MemoryQueryCompressor(
+                    num_queries=config.memory_query_tokens,
+                    width=paligemma_config.width,
+                    num_heads=config.memory_query_heads,
+                    rngs=rngs,
+                )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -162,6 +209,129 @@ class Pi0(_model.BaseModel):
         if self.memory_write_source == "post_attention":
             return post_attention.astype(jnp.float32)
         raise ValueError(f"unsupported memory_write_source: {self.memory_write_source!r}")
+
+    def _v32_empty_cache(self, batch: int, capacity: int, dtype: jnp.dtype) -> _gemma.KVCache:
+        config = self.PaliGemma.llm.module.configs[0]
+        shape = (config.depth, batch, capacity, config.num_kv_heads, config.head_dim)
+        return jnp.zeros(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype)
+
+    def _v32_layer_mask(self, early: at.Array, late: at.Array) -> at.Array:
+        """Select early/late key visibility without changing query geometry."""
+
+        if early.shape != late.shape:
+            raise ValueError(f"early and late attention masks must match; got {early.shape} and {late.shape}.")
+        depth = self.PaliGemma.llm.module.configs[0].depth
+        use_late = (jnp.arange(depth) > self.memory_layer).reshape((depth,) + (1,) * early.ndim)
+        return jnp.where(use_late, late[None], early[None])
+
+    @staticmethod
+    def _pad_attention_columns(mask: at.Array, capacity: int) -> at.Array:
+        if mask.shape[-1] > capacity:
+            raise ValueError(f"attention mask width {mask.shape[-1]} exceeds cache capacity {capacity}.")
+        return jnp.pad(mask, ((0, 0), (0, 0), (0, capacity - mask.shape[-1])))
+
+    def _v32_prepare_memory_prefix(
+        self,
+        prefix_tokens: at.Array,
+        prefix_mask: at.Array,
+        prefix_ar: at.Array,
+        memory_state: _memory.MemoryState,
+        *,
+        top_token_count: int,
+        zero_read: bool = False,
+    ) -> dict[str, at.Array | _gemma.KVCache]:
+        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once."""
+
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("the split layer-8 prefix is only defined for v3.2.")
+        batch, prefix_len = prefix_mask.shape
+        mem_len = self.memory_query_tokens
+        capacity = prefix_len + mem_len + self.causal_token_len
+        depth = self.PaliGemma.llm.module.configs[0].depth
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        cache = self._v32_empty_cache(batch, capacity, prefix_tokens.dtype)
+
+        early_mask = self._pad_attention_columns(make_attn_mask(prefix_mask, prefix_ar), capacity)
+        early_active = jnp.arange(depth) <= self.memory_layer
+        (h8_all, _), cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=early_mask,
+            positions=positions,
+            kv_cache=cache,
+            cache_position=0,
+            active_layers=early_active,
+            apply_final_norm=False,
+        )
+        h8_top = h8_all[:, :top_token_count].astype(jnp.float32)
+        read_queries = self.read_query_compressor(h8_top)
+        write_tokens = self.write_query_compressor(h8_top)
+        retrieved = self.memory.read(memory_state, read_queries)
+        if zero_read:
+            retrieved = jnp.zeros_like(retrieved)
+        memory_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
+
+        split_tokens = jnp.concatenate([h8_all, memory_tokens], axis=1)
+        split_mask = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool)], axis=1)
+        split_ar = jnp.concatenate([prefix_ar, jnp.zeros((batch, mem_len), dtype=prefix_ar.dtype)], axis=1)
+        late_mask = self._pad_attention_columns(make_attn_mask(split_mask, split_ar), capacity)
+        split_positions = jnp.concatenate(
+            [positions, prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))], axis=1
+        )
+        late_active = jnp.arange(depth) > self.memory_layer
+        (final_prefix, _), cache = self.PaliGemma.llm(
+            [split_tokens, None],
+            mask=late_mask,
+            positions=split_positions,
+            kv_cache=cache,
+            cache_position=0,
+            active_layers=late_active,
+        )
+        return {
+            "cache": cache,
+            "final_prefix": final_prefix,
+            "h8_top": h8_top,
+            "read_queries": read_queries,
+            "write_tokens": write_tokens,
+            "retrieved": retrieved,
+            "prefix_mask": prefix_mask,
+            "prefix_ar": prefix_ar,
+            "capacity": jnp.asarray(capacity, dtype=jnp.int32),
+        }
+
+    def _v32_causal_mask(self, prefix_mask: at.Array, causal_mask: at.Array) -> at.Array:
+        batch, causal_len = causal_mask.shape
+        mem_len = self.memory_query_tokens
+        causal_self = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None] & causal_mask[:, None, :]
+        prefix_rows = einops.repeat(prefix_mask, "b p -> b c p", c=causal_len)
+        early = jnp.concatenate(
+            [prefix_rows, jnp.zeros((batch, causal_len, mem_len), dtype=bool), causal_self], axis=-1
+        )
+        late = jnp.concatenate([prefix_rows, jnp.ones((batch, causal_len, mem_len), dtype=bool), causal_self], axis=-1)
+        return self._v32_layer_mask(early, late)
+
+    def _v32_step_mask(self, prefix_mask: at.Array, generated_count: at.Array) -> at.Array:
+        batch = prefix_mask.shape[0]
+        mem_len = self.memory_query_tokens
+        gen_valid = jnp.broadcast_to(
+            jnp.arange(self.causal_token_len)[None, :] < generated_count, (batch, self.causal_token_len)
+        )
+        early = jnp.concatenate([prefix_mask, jnp.zeros((batch, mem_len), dtype=bool), gen_valid], axis=1)
+        late = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), gen_valid], axis=1)
+        return self._v32_layer_mask(early[:, None, :], late[:, None, :])
+
+    def _v32_suffix_mask(
+        self, prefix_mask: at.Array, causal_mask: at.Array, suffix_mask: at.Array, suffix_ar: at.Array
+    ) -> at.Array:
+        batch = prefix_mask.shape[0]
+        mem_len = self.memory_query_tokens
+        early_view = jnp.concatenate([prefix_mask, jnp.zeros((batch, mem_len), dtype=bool), causal_mask], axis=1)
+        late_view = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool), causal_mask], axis=1)
+        suffix_self = make_attn_mask(suffix_mask, suffix_ar)
+        early = jnp.concatenate(
+            [einops.repeat(early_view, "b p -> b s p", s=suffix_mask.shape[1]), suffix_self], axis=-1
+        )
+        late = jnp.concatenate([einops.repeat(late_view, "b p -> b s p", s=suffix_mask.shape[1]), suffix_self], axis=-1)
+        return self._v32_layer_mask(early, late)
 
     def _check_action_prefix_shapes(self, action_prefix: _rtc.ActionPrefix | None, batch_size: int) -> None:
         """Performs static checks that remain safe while sampling is jitted.
@@ -1366,6 +1536,202 @@ class Pi0(_model.BaseModel):
                 result[f"subtask_to_camera_{name}_mass"] = jnp.sum(subtask_rows[:, :, start : start + mem_len], axis=-1)
         return result
 
+    def _sample_with_memory_v32(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        stop_token: int,
+        max_decode_steps: int,
+        num_steps: int | at.Int[at.Array, ""],
+        noise: at.Float[at.Array, "b ah ad"] | None,
+        action_prefix: _rtc.ActionPrefix | None,
+        forced_subtask_tokens: at.Int[at.Array, "b cl"] | None,
+        forced_subtask_mask: at.Bool[at.Array, "b cl"] | None,
+        zero_read: bool,
+        allow_write: bool,
+    ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
+        """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens."""
+
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+        self._check_action_prefix_shapes(action_prefix, batch)
+        if (forced_subtask_tokens is None) != (forced_subtask_mask is None):
+            raise ValueError("forced_subtask_tokens and forced_subtask_mask must be provided together.")
+        if forced_subtask_tokens is not None:
+            expected = (batch, self.causal_token_len)
+            if forced_subtask_tokens.shape != expected or forced_subtask_mask.shape != expected:
+                raise ValueError(
+                    "forced subtask buffers must have shape "
+                    f"{expected}; got {forced_subtask_tokens.shape} and {forced_subtask_mask.shape}."
+                )
+
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        prefix_len = prefix_mask.shape[1]
+        num_img = prefix_len - self.max_token_len
+        top_tokens = num_img // len(preprocessed.images)
+        mem_len = self.memory_query_tokens
+        gen_base = prefix_len + mem_len
+        prepared = self._v32_prepare_memory_prefix(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=top_tokens,
+            zero_read=zero_read,
+        )
+        kv_cache = prepared["cache"]
+        final_prefix = prepared["final_prefix"]
+        write_tokens = prepared["write_tokens"]
+        retrieved = prepared["retrieved"]
+
+        def finish(actions, tokens, token_mask, *, extra=None):
+            candidate_state, write_aux = self.memory.write(memory_state, write_tokens)
+            new_state = candidate_state if allow_write else memory_state
+            aux = {
+                **write_aux,
+                "tokens": tokens,
+                "token_mask": token_mask,
+                "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+                "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+                "read_query_norm": jnp.sqrt(
+                    jnp.mean(jnp.square(prepared["read_queries"].astype(jnp.float32)), axis=(1, 2))
+                ),
+                "write_token_norm": jnp.sqrt(jnp.mean(jnp.square(write_tokens.astype(jnp.float32)), axis=(1, 2))),
+                "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+            }
+            if extra is not None:
+                aux.update(extra)
+            return _rtc.restore_action_prefix(actions, action_prefix), new_state, aux
+
+        if forced_subtask_tokens is not None:
+            gen_tokens = forced_subtask_tokens.astype(preprocessed.tokenized_prompt.dtype)
+            gen_mask = forced_subtask_mask.astype(bool)
+            causal_emb = self.PaliGemma.llm(gen_tokens, method="embed")
+            causal_positions = jnp.broadcast_to(
+                gen_base + jnp.arange(self.causal_token_len)[None], (batch, self.causal_token_len)
+            )
+            (causal_out, _), kv_cache = self.PaliGemma.llm(
+                [causal_emb, None],
+                mask=self._v32_causal_mask(prefix_mask, gen_mask),
+                positions=causal_positions,
+                kv_cache=kv_cache,
+                cache_position=gen_base,
+            )
+            score_hidden = jnp.concatenate([final_prefix[:, -1:], causal_out[:, :-1]], axis=1)
+            score_logits = self.PaliGemma.llm(score_hidden, method="decode").astype(jnp.float32)
+            token_logp = jnp.take_along_axis(jax.nn.log_softmax(score_logits, axis=-1), gen_tokens[..., None], axis=-1)[
+                ..., 0
+            ]
+            total_logp = jnp.sum(token_logp * gen_mask, axis=-1)
+            mean_logp = total_logp / jnp.maximum(jnp.sum(gen_mask, axis=-1), 1)
+
+            dt = -1.0 / num_steps
+            if noise is None:
+                noise = jax.random.normal(rng, (batch, self.action_horizon, self.action_dim))
+
+            def denoise(carry):
+                x_t, time = carry
+                if action_prefix is None:
+                    model_x_t, model_time = x_t, jnp.broadcast_to(time, batch)
+                else:
+                    model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
+                suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(
+                    preprocessed, model_x_t, model_time
+                )
+                suffix_positions = gen_base + self.causal_token_len + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (_, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=self._v32_suffix_mask(prefix_mask, gen_mask, suffix_mask, suffix_ar),
+                    positions=suffix_positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                return x_t + dt * self.action_out_proj(suffix_out[:, -self.action_horizon :]), time + dt
+
+            def keep_denoising(carry):
+                return carry[1] >= -dt / 2
+
+            actions, _ = jax.lax.while_loop(keep_denoising, denoise, (noise, 1.0))
+            return finish(
+                actions,
+                gen_tokens,
+                gen_mask,
+                extra={"conditioned_subtask_logp": total_logp, "conditioned_subtask_mean_logp": mean_logp},
+            )
+
+        def greedy(hidden_vec):
+            logits = self.PaliGemma.llm(hidden_vec[:, None], method="decode")[:, 0]
+            return jnp.argmax(logits, axis=-1).astype(preprocessed.tokenized_prompt.dtype)
+
+        token0 = greedy(final_prefix[:, -1])
+        gen_tokens = jnp.zeros((batch, self.causal_token_len), dtype=preprocessed.tokenized_prompt.dtype)
+        gen_mask = jnp.zeros((batch, self.causal_token_len), dtype=bool)
+
+        def record(tokens, mask, done, token, index):
+            tokens = tokens.at[:, index].set(jnp.where(done, tokens[:, index], token))
+            mask = mask.at[:, index].set(~done)
+            return tokens, mask, done | (token == stop_token) | (token == PALIGEMMA_EOS_TOKEN)
+
+        gen_tokens, gen_mask, done = record(gen_tokens, gen_mask, jnp.zeros(batch, dtype=bool), token0, 0)
+
+        def decode_cond(carry):
+            return (carry[-1] < max_decode_steps) & ~jnp.all(carry[2])
+
+        def decode_step(carry):
+            tokens, mask, done, previous, cache, index = carry
+            token_emb = self.PaliGemma.llm(previous[:, None], method="embed")
+            (out, _), cache = self.PaliGemma.llm(
+                [token_emb, None],
+                mask=self._v32_step_mask(prefix_mask, index),
+                positions=jnp.broadcast_to(gen_base + index - 1, (batch, 1)),
+                kv_cache=cache,
+                cache_position=gen_base + index - 1,
+            )
+            token = greedy(out[:, 0])
+            tokens, mask, done = record(tokens, mask, done, token, index)
+            return tokens, mask, done, token, cache, index + 1
+
+        carry = (gen_tokens, gen_mask, done, token0, kv_cache, jnp.asarray(1, dtype=jnp.int32))
+        gen_tokens, gen_mask, _, previous, kv_cache, generated = jax.lax.while_loop(decode_cond, decode_step, carry)
+        last_emb = self.PaliGemma.llm(previous[:, None], method="embed")
+        _, kv_cache = self.PaliGemma.llm(
+            [last_emb, None],
+            mask=self._v32_step_mask(prefix_mask, generated),
+            positions=jnp.broadcast_to(gen_base + generated - 1, (batch, 1)),
+            kv_cache=kv_cache,
+            cache_position=gen_base + generated - 1,
+        )
+
+        causal_live = jnp.arange(self.causal_token_len)[None] < jnp.sum(gen_mask, axis=-1)[:, None]
+        dt = -1.0 / num_steps
+        if noise is None:
+            noise = jax.random.normal(rng, (batch, self.action_horizon, self.action_dim))
+
+        def denoise(carry):
+            x_t, time = carry
+            if action_prefix is None:
+                model_x_t, model_time = x_t, jnp.broadcast_to(time, batch)
+            else:
+                model_x_t, model_time = _rtc.condition_action_prefix(x_t, time, action_prefix)
+            suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(preprocessed, model_x_t, model_time)
+            suffix_positions = gen_base + self.causal_token_len + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=self._v32_suffix_mask(prefix_mask, causal_live, suffix_mask, suffix_ar),
+                positions=suffix_positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            return x_t + dt * self.action_out_proj(suffix_out[:, -self.action_horizon :]), time + dt
+
+        def keep_denoising(carry):
+            return carry[1] >= -dt / 2
+
+        actions, _ = jax.lax.while_loop(keep_denoising, denoise, (noise, 1.0))
+        return finish(actions, gen_tokens, gen_mask)
+
     def sample_with_memory(
         self,
         rng: at.KeyArrayLike,
@@ -1403,6 +1769,21 @@ class Pi0(_model.BaseModel):
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
         assert max_decode_steps <= self.causal_token_len
+        if getattr(self, "memory_architecture", "v3_v31") == "v32_layer8_dual_query":
+            return self._sample_with_memory_v32(
+                rng,
+                observation,
+                memory_state,
+                stop_token=stop_token,
+                max_decode_steps=max_decode_steps,
+                num_steps=num_steps,
+                noise=noise,
+                action_prefix=action_prefix,
+                forced_subtask_tokens=forced_subtask_tokens,
+                forced_subtask_mask=forced_subtask_mask,
+                zero_read=zero_read,
+                allow_write=allow_write,
+            )
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         batch = preprocessed.state.shape[0]
         self._check_action_prefix_shapes(action_prefix, batch)
@@ -1672,6 +2053,148 @@ class Pi0(_model.BaseModel):
         }
         return x_0, new_state, aux
 
+    def _compute_sequence_loss_v32(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> dict[str, at.Array]:
+        """Sequence objective for the layer-8 dual-query v3.2 interface."""
+
+        b, t = observation.seq_step_mask.shape
+        ah, ad = actions.shape[-2:]
+        aug_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        images = self._augment_sequence_images(aug_rng, observation.images) if train else observation.images
+        causal_len = observation.tokenized_causal.shape[-1]
+        quiz = (self.memory_probe_weight > 0 or self.memory_probe_diagnostic) and observation.seq_probe_mask is not None
+
+        def step_first(x):
+            return jnp.moveaxis(x, 1, 0)
+
+        xs = {
+            "images": {k: step_first(v) for k, v in images.items()},
+            "state": step_first(observation.state),
+            "tokens": step_first(observation.tokenized_prompt),
+            "token_mask": step_first(observation.tokenized_prompt_mask),
+            "causal": step_first(observation.tokenized_causal),
+            "causal_mask": step_first(observation.tokenized_causal_mask),
+            "causal_fast": step_first(observation.causal_fast_mask),
+            "actions": step_first(actions),
+            "step_valid": step_first(observation.seq_step_mask),
+            "boundary": step_first(observation.seq_block_boundary),
+            "noise": jax.random.normal(noise_rng, (t, b, ah, ad)),
+            "time": jax.random.beta(time_rng, 1.5, 1, (t, b)) * 0.999 + 0.001,
+        }
+        if self.simulated_delay is not None:
+            delay_rng = jax.random.fold_in(rng, 0x525443)
+            xs["delay"] = jax.random.randint(delay_rng, (t, b), 0, self.simulated_delay + 1)
+        if quiz:
+            n_classes = self.probe_head.out_features
+            xs["probe_label"] = step_first(jnp.clip(observation.seq_probe_labels, 0, n_classes - 1))
+            xs["probe_act"] = step_first(observation.seq_probe_mask)
+            xs["probe_vis"] = step_first(observation.seq_probe_visible & observation.seq_probe_mask)
+
+        def step(state, x):
+            state = jax.tree.map(
+                lambda s: jnp.where(x["boundary"].reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s),
+                state,
+            )
+            obs_k = _model.Observation(
+                images=x["images"],
+                image_masks={k: jnp.ones(b, dtype=bool) for k in x["images"]},
+                state=x["state"],
+                tokenized_prompt=x["tokens"],
+                tokenized_prompt_mask=x["token_mask"],
+            )
+            prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(obs_k)
+            num_img = prefix_mask.shape[1] - self.max_token_len
+            top_tokens = num_img // len(x["images"])
+            prefix_len = prefix_mask.shape[1]
+            mem_len = self.memory_query_tokens
+            prepared = self._v32_prepare_memory_prefix(
+                prefix_tokens, prefix_mask, prefix_ar, state, top_token_count=top_tokens
+            )
+            kv_cache = prepared["cache"]
+            final_prefix = prepared["final_prefix"]
+            read_queries = prepared["read_queries"]
+            write_tokens = prepared["write_tokens"]
+
+            causal_mask_k = x["causal_mask"]
+            causal_emb = self.PaliGemma.llm(x["causal"], method="embed")
+            causal_positions = jnp.broadcast_to(prefix_len + mem_len + jnp.arange(causal_len)[None], (b, causal_len))
+            (causal_out, _), kv_cache = self.PaliGemma.llm(
+                [causal_emb, None],
+                mask=self._v32_causal_mask(prefix_mask, causal_mask_k),
+                positions=causal_positions,
+                kv_cache=kv_cache,
+                cache_position=prefix_len + mem_len,
+            )
+            ce_hidden = jnp.concatenate([final_prefix[:, -1:], causal_out[:, :-1]], axis=1)
+            logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
+            token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1)[
+                ..., 0
+            ]
+            ce = -jnp.sum(token_logp * causal_mask_k, axis=-1) / jnp.clip(jnp.sum(causal_mask_k, axis=-1), 1)
+
+            time_k = x["time"]
+            rtc_loss_mask = None
+            model_time = time_k
+            if self.simulated_delay is None:
+                x_t = time_k[:, None, None] * x["noise"] + (1 - time_k[:, None, None]) * x["actions"]
+            else:
+                x_t, model_time, rtc_loss_mask = _rtc.make_noisy_actions(
+                    x["actions"], x["noise"], time_k, delay=x["delay"]
+                )
+            u_t = x["noise"] - x["actions"]
+            suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(obs_k, x_t, model_time)
+            suffix_positions = prefix_len + mem_len + causal_len + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=self._v32_suffix_mask(prefix_mask, causal_mask_k & ~x["causal_fast"], suffix_mask, suffix_ar),
+                positions=suffix_positions,
+                kv_cache=jax.lax.stop_gradient(kv_cache),
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -ah:])
+            flow_tokens = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            flow = jnp.mean(_rtc.renormalize_flow_loss(flow_tokens, rtc_loss_mask), axis=-1)
+
+            new_state, _ = self.memory.write(state, write_tokens)
+            valid = x["step_valid"]
+            state = jax.tree.map(
+                lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
+            )
+            if quiz:
+                probe_read = self.memory.read(state, read_queries)
+                pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
+                probe_logits = self.probe_head(pooled).astype(jnp.float32)
+                if self.memory_probe_diagnostic:
+                    probe_logits = jax.lax.stop_gradient(probe_logits)
+                probe_logp = jax.nn.log_softmax(probe_logits, axis=-1)
+                actf = x["probe_act"].astype(jnp.float32)
+                probe_ce = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf
+                probe_correct = (jnp.argmax(probe_logits, axis=-1) == x["probe_label"]).astype(jnp.float32) * actf
+                probe_vis = x["probe_vis"].astype(jnp.float32)
+            else:
+                probe_ce = probe_correct = actf = probe_vis = jnp.zeros((b,), dtype=jnp.float32)
+            validf = valid.astype(jnp.float32)
+            return state, (ce * validf, flow * validf, validf, probe_ce, probe_correct, actf, probe_vis)
+
+        _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), self.memory.init_state(b), xs)
+        ce_steps, flow_steps, valid_steps, probe_ce, probe_cor, probe_act, probe_vis = ys
+        n_valid = jnp.clip(jnp.sum(valid_steps, axis=0), 1)
+        losses = {"flow": jnp.sum(flow_steps, axis=0) / n_valid, "ce": jnp.sum(ce_steps, axis=0) / n_valid}
+        if quiz:
+            losses.update(
+                {
+                    "probe_ce_sum": jnp.sum(probe_ce, axis=0),
+                    "probe_count": jnp.sum(probe_act, axis=0),
+                    "probe_correct": jnp.sum(probe_cor, axis=0),
+                    "probe_count_visible": jnp.sum(probe_vis, axis=0),
+                    "probe_correct_visible": jnp.sum(probe_cor * probe_vis, axis=0),
+                    "probe_correct_grid": jnp.moveaxis(probe_cor, 0, 1),
+                    "probe_active_grid": jnp.moveaxis(probe_act, 0, 1),
+                }
+            )
+        return losses
+
     def _compute_sequence_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> dict[str, at.Array]:
@@ -1699,6 +2222,8 @@ class Pi0(_model.BaseModel):
         always flows through). Within a block, every step's prefill receives VLM gradients from
         the block's losses; m0 learns through each sequence's first block.
         """
+        if getattr(self, "memory_architecture", "v3_v31") == "v32_layer8_dual_query":
+            return self._compute_sequence_loss_v32(rng, observation, actions, train=train)
         b, t = observation.seq_step_mask.shape
         ah, ad = actions.shape[-2:]
         aug_rng, noise_rng, time_rng = jax.random.split(rng, 3)

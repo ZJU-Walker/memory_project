@@ -125,6 +125,7 @@ def test_server_metadata_exposes_v31_config_and_write_source() -> None:
     train_config = types.SimpleNamespace(
         name="pi05_yam_mem_v31",
         model=types.SimpleNamespace(
+            memory_architecture="v3_v31",
             memory_write_source="post_attention",
             action_horizon=50,
         ),
@@ -137,7 +138,9 @@ def test_server_metadata_exposes_v31_config_and_write_source() -> None:
 
     assert metadata == {
         "config_name": "pi05_yam_mem_v31",
+        "memory_architecture": "v3_v31",
         "memory_write_source": "post_attention",
+        "memory_query_tokens": None,
         "action_horizon": 50,
         "rtc_enabled": True,
         "rtc_max_delay": 6,
@@ -158,8 +161,31 @@ def test_server_metadata_marks_legacy_write_source_and_disabled_rtc() -> None:
     metadata = serve_yam_memory._build_server_metadata(train_config, data_config, simulated_delay=None)
 
     assert metadata["memory_write_source"] == "raw_hidden"
+    assert metadata["memory_architecture"] == "v3_v31"
     assert metadata["rtc_enabled"] is False
     assert metadata["rtc_max_delay"] is None
+
+
+def test_server_metadata_exposes_v32_dual_query_contract() -> None:
+    train_config = types.SimpleNamespace(
+        name="pi05_yam_mem_v32",
+        model=types.SimpleNamespace(
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            action_horizon=50,
+        ),
+        policy_metadata=None,
+    )
+    metadata = serve_yam_memory._build_server_metadata(
+        train_config, types.SimpleNamespace(memory_stride_frames=10), simulated_delay=6
+    )
+
+    assert metadata["memory_architecture"] == "v32_layer8_dual_query"
+    assert metadata["memory_write_source"] == "query_compressed"
+    assert metadata["memory_query_tokens"] == 16
+    assert metadata["rtc_enabled"] is True
+    assert metadata["rtc_max_delay"] == 6
 
 
 def test_prepare_action_prefix_transforms_and_batches_without_mutating_request() -> None:

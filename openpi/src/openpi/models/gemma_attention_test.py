@@ -80,3 +80,47 @@ def test_disabled_capture_returns_no_probability_array():
 def test_capture_supports_any_depth(depth):
     (_, _, _, probs), _ = _run(return_attn_probs=True, depth=depth)
     assert np.asarray(probs).shape[0] == depth
+
+
+def test_partial_early_then_late_stack_is_exactly_one_full_forward():
+    config = gemma.get_config("dummy")
+    config.depth = 4
+    module = gemma.Module(configs=[config], embed_dtype="float32")
+    tokens = jax.random.normal(jax.random.key(9), (1, 6, config.width)) * 0.1
+    positions = jnp.arange(6)[None]
+    mask = jnp.ones((1, 6, 6), dtype=bool)
+
+    def call(mod, *args, **kwargs):
+        return mod(*args, **kwargs)
+
+    variables = nn.init(call, module)(jax.random.key(0), [tokens], positions, mask)
+    full, _ = nn.apply(call, module)(variables, [tokens], positions, mask)
+    empty_cache = (
+        jnp.zeros((4, 1, 6, config.num_kv_heads, config.head_dim), dtype=tokens.dtype),
+        jnp.zeros((4, 1, 6, config.num_kv_heads, config.head_dim), dtype=tokens.dtype),
+    )
+    early, early_cache = nn.apply(call, module)(
+        variables,
+        [tokens],
+        positions,
+        mask,
+        kv_cache=empty_cache,
+        cache_position=0,
+        active_layers=jnp.asarray([True, True, False, False]),
+        apply_final_norm=False,
+    )
+    split, split_cache = nn.apply(call, module)(
+        variables,
+        early,
+        positions,
+        mask,
+        kv_cache=early_cache,
+        cache_position=0,
+        active_layers=jnp.asarray([False, False, True, True]),
+    )
+
+    np.testing.assert_array_equal(full[0], split[0])
+    assert np.max(np.abs(np.asarray(early_cache[0][:2]))) > 0
+    np.testing.assert_array_equal(early_cache[0][2:], 0)
+    np.testing.assert_array_equal(split_cache[0][:2], early_cache[0][:2])
+    assert np.max(np.abs(np.asarray(split_cache[0][2:]))) > 0

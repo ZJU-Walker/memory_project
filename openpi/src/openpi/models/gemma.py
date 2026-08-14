@@ -322,7 +322,7 @@ class Block(nn.Module):
     return_attn_probs: bool = False
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, cache_position=None):  # noqa: FBT002
+    def run_block(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, cache_position=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -372,6 +372,56 @@ class Block(nn.Module):
         # probabilities follow the same pattern and are None unless explicitly requested.
         return xs, (kv_cache, list(xs), attn_probs)
 
+    def __call__(
+        self,
+        xs,
+        kv_cache,
+        positions,
+        attn_mask,
+        adarms_cond,
+        layer_active=True,  # noqa: FBT002
+        partial_layers=False,  # noqa: FBT002
+        deterministic=True,  # noqa: FBT002
+        cache_position=None,
+    ):
+        """Run one scanned block, or preserve its carry in a partial-stack pass.
+
+        The normal path is deliberately identical to the original implementation. v3.2 uses
+        ``partial_layers=True`` with an explicit fixed-size KV cache to execute blocks 0..8,
+        insert its memory interface, then execute blocks 9..17 without replaying either half.
+        """
+
+        if not partial_layers:
+            return self.run_block(xs, kv_cache, positions, attn_mask, adarms_cond, deterministic, cache_position)
+        if kv_cache is None:
+            raise ValueError("partial layer execution requires an explicit KV cache.")
+
+        def run(mdl, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic, cache_position):
+            return mdl.run_block(xs, kv_cache, positions, attn_mask, adarms_cond, deterministic, cache_position)
+
+        def skip(_mdl, xs, kv_cache, _positions, attn_mask, _adarms_cond, _deterministic, _cache_position):
+            attn_probs = None
+            if self.return_attn_probs:
+                attn_probs = jnp.zeros(
+                    (attn_mask.shape[0], self.configs[0].num_heads, attn_mask.shape[-2], attn_mask.shape[-1]),
+                    dtype=jnp.float32,
+                )
+            return xs, (kv_cache, list(xs), attn_probs)
+
+        return nn.cond(
+            layer_active,
+            run,
+            skip,
+            self,
+            xs,
+            kv_cache,
+            positions,
+            attn_mask,
+            adarms_cond,
+            deterministic,
+            cache_position,
+        )
+
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
 
@@ -403,7 +453,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(6, 7),  # partial_layers and deterministic (excluding self)
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -413,11 +463,15 @@ class Module(nn.Module):
             in_axes=(
                 0,
                 nn.broadcast,
+                0,
+                nn.broadcast,
+                0,
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-                nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=cache_position
+            ),
+            # kv_cache and attention mask are stacked by layer. Ordinary callers receive a
+            # broadcast copy of their mask; v3.2 supplies different early/late visibility.
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -442,7 +496,7 @@ class Module(nn.Module):
         # list of token arrays, one for each expert, or None if that expert should not be run
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
-        mask: at.Bool[at.Array, "b t s"],
+        mask: at.Array,
         # Each expert may use either per-example [b, d] or per-token [b, t, d]
         # AdaRMS conditioning. The latter is used by train-time RTC.
         adarms_cond: Sequence[at.Array | None] | None = None,
@@ -451,6 +505,8 @@ class Module(nn.Module):
         deterministic: bool = True,
         cache_position: at.Int[at.Array, ""] | int | None = None,
         return_hidden_states: bool = False,
+        active_layers: at.Array | None = None,
+        apply_final_norm: bool = True,
     ) -> (
         tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
         | tuple[
@@ -466,19 +522,51 @@ class Module(nn.Module):
         ]
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
-        mask = jnp.asarray(mask)[:, None, :, :]
+        mask = jnp.asarray(mask)
+        depth = self.configs[0].depth
+        if mask.ndim == 3:
+            mask = jnp.broadcast_to(mask[None, :, None, :, :], (depth, *mask.shape[:1], 1, *mask.shape[1:]))
+        elif mask.ndim == 4:
+            if mask.shape[0] != depth:
+                raise ValueError(f"layer-wise mask must start with depth {depth}; got {mask.shape}.")
+            mask = mask[:, :, None, :, :]
+        else:
+            raise ValueError(f"mask must have shape [b,t,s] or [layers,b,t,s]; got {mask.shape}.")
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
+        partial_layers = active_layers is not None
+        if active_layers is None:
+            active_layers = jnp.ones((depth,), dtype=bool)
+        else:
+            active_layers = jnp.asarray(active_layers, dtype=bool)
+            if active_layers.shape != (depth,):
+                raise ValueError(f"active_layers must have shape ({depth},); got {active_layers.shape}.")
+            if kv_cache is None:
+                raise ValueError("active_layers requires an explicit KV cache.")
+
         embedded, (kv_cache, hidden_states, attn_probs) = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic, cache_position
+            embedded,
+            kv_cache,
+            positions,
+            mask,
+            adarms_cond,
+            active_layers,
+            partial_layers,
+            deterministic,
+            cache_position,
         )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        out = [
-            f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ]
+        out = (
+            [
+                f(e, a)[0] if e is not None else e
+                for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
+            ]
+            if apply_final_norm
+            else embedded
+        )
         if return_hidden_states:
             # per-expert stacks of every block's output, [depth, b, seq, width]: entry [L] is the
             # output of block L, so [-1] is the final hidden state before the output norm.

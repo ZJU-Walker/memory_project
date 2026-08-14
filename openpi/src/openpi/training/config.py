@@ -1239,6 +1239,57 @@ _CONFIGS = [
         save_interval=500,
         num_workers=12,
     ),
+    TrainConfig(
+        # v3.2: stop the VLM after block 8, compress the 256 top-camera slots with two
+        # independent learned 16-query cross-attention banks, read old memory with q_t, insert
+        # the 16 retrieved tokens for blocks 9..17, predict, and only then write z_t. This is a
+        # fresh experiment from official pi05_base -- never resume a v3/v3.1 checkpoint.
+        name="pi05_yam_mem_v32",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            memory_layer=8,
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            memory_query_heads=8,
+            simulated_delay=6,
+            memory_seq_steps=60,
+            memory_block_steps=25,
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
+            memory_probe_classes=2,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_banana_subtask",
+            default_prompt="find the bin with banana",
+            assets=AssetsConfig(assets_dir="./assets/pi05_yam"),
+            base_config=DataConfig(
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=10,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=20,
+                memory_sequence_buckets=(20, 40, 60),
+                memory_reveal_frames_path="./assets/pi05_yam/reveal_frames.json",
+            ),
+        ),
+        freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
+        batch_size=12,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=500,
+        num_workers=12,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
