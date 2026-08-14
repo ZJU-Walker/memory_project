@@ -110,6 +110,35 @@ def _prepare(model, observation, state, *, zero_read=False):
     )
 
 
+def test_query_compressor_bfloat16_compute_keeps_fp32_master_and_output():
+    compressor = pi0.MemoryQueryCompressor(
+        num_queries=4,
+        width=64,
+        num_heads=8,
+        compute_dtype=jnp.bfloat16,
+        rngs=nnx.Rngs(123),
+    )
+    source = jax.random.normal(jax.random.key(1), (2, 16, 64), dtype=jnp.float32)
+    output = jax.jit(compressor)(source)
+
+    assert compressor.key_proj.kernel.value.dtype == jnp.float32
+    assert compressor.value_proj.kernel.value.dtype == jnp.float32
+    assert output.dtype == jnp.float32
+    assert output.shape == (2, 4, 64)
+    assert np.all(np.isfinite(np.asarray(output)))
+
+    graphdef, params = nnx.split(compressor)
+
+    def loss(p):
+        return jnp.mean(jnp.square(nnx.merge(graphdef, p)(source)))
+
+    grads = jax.grad(loss)(params)
+    leaves = jax.tree.leaves(grads)
+    assert leaves
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
+    assert any(np.any(np.asarray(leaf) != 0) for leaf in leaves)
+
+
 def _sequence_observation():
     observation = _single_observation()
     steps = 2
@@ -273,6 +302,7 @@ def test_end_to_end_sequence_ce_reaches_queries_and_slow_memory(tiny_model):
     # recurrence. Titans' read projection, writer K/V projections, and learned initial state
     # must all receive outer-task gradients as required by the architecture contract.
     for fragment in (
+        "['PaliGemma']['img']",
         "read_query_compressor",
         "write_query_compressor",
         "['memory']['w_q']",

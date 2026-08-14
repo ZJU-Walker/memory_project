@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import logging
 
 import augmax
@@ -89,20 +90,41 @@ def posemb_sincos(
 class MemoryQueryCompressor(nnx.Module):
     """Learned query bank that cross-attends to the 256 layer-8 top-camera slots."""
 
-    def __init__(self, *, num_queries: int, width: int, num_heads: int, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        *,
+        num_queries: int,
+        width: int,
+        num_heads: int,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
         if num_queries < 1 or num_heads < 1 or width % num_heads:
             raise ValueError("query count/heads must be positive and heads must divide width.")
         self.num_queries = num_queries
         self.width = width
         self.num_heads = num_heads
         self.head_dim = width // num_heads
+        self.compute_dtype = jnp.dtype(compute_dtype)
         self.query_bank = nnx.Param(
             jax.random.normal(rngs.params(), (num_queries, width), dtype=jnp.float32) / jnp.sqrt(width)
         )
-        self.query_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
-        self.key_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
-        self.value_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
-        self.output_proj = nnx.Linear(width, width, use_bias=False, rngs=rngs)
+        # Keep FP32 master parameters/optimizer state, but use the configured activation dtype
+        # for the four large matrix multiplications. Production pi0.5 uses BF16 here so these
+        # projections run on tensor cores; the output is promoted back to FP32 before entering
+        # TitansMemory, whose recurrent state and inner update intentionally remain FP32.
+        linear = functools.partial(
+            nnx.Linear,
+            width,
+            width,
+            use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
+        )
+        self.query_proj = linear(rngs=rngs)
+        self.key_proj = linear(rngs=rngs)
+        self.value_proj = linear(rngs=rngs)
+        self.output_proj = linear(rngs=rngs)
 
     def __call__(self, source: at.Float[at.Array, "b n d"]) -> at.Float[at.Array, "b q d"]:
         if source.ndim != 3 or source.shape[-1] != self.width:
@@ -132,6 +154,7 @@ class Pi0(_model.BaseModel):
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
+                decode_dtype=config.dtype if config.bf16_vocab_projection else None,
                 adarms=config.pi05,
             )
         )
@@ -181,12 +204,14 @@ class Pi0(_model.BaseModel):
                     num_queries=config.memory_query_tokens,
                     width=paligemma_config.width,
                     num_heads=config.memory_query_heads,
+                    compute_dtype=jnp.dtype(config.dtype),
                     rngs=rngs,
                 )
                 self.write_query_compressor = MemoryQueryCompressor(
                     num_queries=config.memory_query_tokens,
                     width=paligemma_config.width,
                     num_heads=config.memory_query_heads,
+                    compute_dtype=jnp.dtype(config.dtype),
                     rngs=rngs,
                 )
 

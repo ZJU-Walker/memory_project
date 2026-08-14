@@ -71,6 +71,10 @@ class Pi0Config(_model.BaseModelConfig):
     # inference; the subtask + FAST labels at training). The action suffix starts at the static
     # position num_img_tokens + max_token_len + num_memory_tokens + causal_token_len.
     causal_token_len: int = 150
+    # Opt-in tensor-core projection for the tied 257k-way vocabulary head. The embedding table
+    # remains an FP32 parameter; only decode operands use `dtype`, with FP32 accumulation.
+    # Default-off keeps every existing pi0/pi0.5 configuration numerically unchanged.
+    bf16_vocab_projection: bool = False
     memory: _memory.MemoryConfig = dataclasses.field(default_factory=_memory.MemoryConfig)
     # Sequence training (RoboTTT-style): a training sample is `memory_seq_steps` consecutive
     # prediction steps from one episode, one step per policy replan

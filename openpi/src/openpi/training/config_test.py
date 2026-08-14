@@ -33,7 +33,6 @@ def test_yam_v3_and_v31_start_from_the_same_pi05_base_parameters() -> None:
 
 
 def test_yam_v32_is_a_fresh_base_initialized_dual_query_experiment() -> None:
-    v31 = _config.get_config("pi05_yam_mem_v31")
     v32 = _config.get_config("pi05_yam_mem_v32")
 
     assert isinstance(v32.weight_loader, weight_loaders.PartialCheckpointWeightLoader)
@@ -43,12 +42,27 @@ def test_yam_v32_is_a_fresh_base_initialized_dual_query_experiment() -> None:
     assert v32.model.memory_write_source == "query_compressed"
     assert v32.model.memory_query_tokens == 16
     assert v32.model.memory_query_heads == 8
+    assert v32.model.max_token_len == 80
+    assert v32.model.causal_token_len == 128
+    assert v32.model.bf16_vocab_projection is True
+    assert v32.model.memory_seq_steps == 40
     assert v32.model.memory_probe_weight == 0.0
     assert v32.model.memory_probe_diagnostic is False
+    assert v32.gradient_accumulation_steps == 1
     assert v32.save_interval == 250
-    assert v32.data == v31.data
-    assert v32.optimizer == v31.optimizer
-    assert v32.lr_schedule == v31.lr_schedule
+    assert v32.data.base_config.memory_stride_frames == 15
+    assert v32.data.base_config.memory_min_slice_steps == 14
+    assert v32.data.base_config.memory_sequence_buckets == (14, 27, 40)
+    last_observation_frame = (v32.model.memory_seq_steps - 1) * v32.data.base_config.memory_stride_frames
+    assert last_observation_frame == 585
+    assert last_observation_frame + v32.model.action_horizon - 1 == 634
+    assert not v32.freeze_filter(("PaliGemma", "img", "encoder", "kernel"), object())
+    assert v32.freeze_filter(("memory", "gate", "kernel"), object())
+    assert not v32.freeze_filter(("read_query_compressor", "key_proj", "kernel"), object())
+
+    for config_name in ("pi05_yam_mem_v3", "pi05_yam_mem_v31"):
+        assert _config.get_config(config_name).model.bf16_vocab_projection is False
+    assert _config.get_config("pi05_yam_mem_v2").model.max_token_len == 200
 
 
 def test_gradient_accumulation_is_opt_in_and_validated() -> None:

@@ -158,8 +158,18 @@ class Embedder(nn.Module):
         x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
         return x
 
-    def decode(self, x):
-        return jnp.dot(x, self.input_embedding_table.T)
+    def decode(self, x, *, compute_dtype=None):
+        if compute_dtype is None:
+            return jnp.dot(x, self.input_embedding_table.T)
+        # The tied embedding remains an FP32 trainable/master parameter. Casting only the
+        # operands enables BF16 tensor-core execution for the very large 257k-way projection,
+        # while FP32 accumulation/output keeps log-softmax numerically stable.
+        compute_dtype = jnp.dtype(compute_dtype)
+        return jnp.dot(
+            x.astype(compute_dtype),
+            self.input_embedding_table.T.astype(compute_dtype),
+            preferred_element_type=jnp.float32,
+        )
 
 
 @at.typecheck
@@ -432,6 +442,7 @@ class Module(nn.Module):
 
     configs: Sequence[Config]  # list of configs, one for each expert
     embed_dtype: str
+    decode_dtype: str | None = None
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
@@ -488,7 +499,7 @@ class Module(nn.Module):
     @at.typecheck
     def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
         """Projects hidden states to token logits with the tied input embedding table."""
-        return self.embedder.decode(x)
+        return self.embedder.decode(x, compute_dtype=self.decode_dtype)
 
     @at.typecheck
     def __call__(

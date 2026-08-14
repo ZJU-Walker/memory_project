@@ -66,6 +66,15 @@ def _assert_tree_exact(actual, expected):
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
 
 
+def _assert_tree_close(actual, expected, *, rtol=1e-6, atol=5e-10):
+    """Compare equivalent branches that may use different BF16 batch kernels."""
+    actual_leaves = jax.tree.leaves(actual)
+    expected_leaves = jax.tree.leaves(expected)
+    assert len(actual_leaves) == len(expected_leaves)
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves, strict=True):
+        np.testing.assert_allclose(actual_leaf, expected_leaf, rtol=rtol, atol=atol)
+
+
 @pytest.fixture(scope="module")
 def fixture():
     model = _TinyFinalCtModel(nnx.Rngs(0), memory_write_source="post_attention")
@@ -152,7 +161,10 @@ def test_writer_echo_factorial_reduces_branches_and_commits_only_matched_normal_
     direct = nnx_utils.module_jit(model.writer_echo_factorial_step)
     normal_state, _, _ = direct(observation4, state4)
     expected = jax.tree.map(lambda value: value[jnp.asarray([0, 2])], normal_state)
-    _assert_tree_exact(committed, expected)
+    # The metrics path evaluates four BF16 branches together while the direct path uses a
+    # separate batch shape. Tensor-core reduction order can differ by a few FP32 ulps even
+    # though the selected branches and resulting states are numerically identical.
+    _assert_tree_close(committed, expected)
 
 
 def test_memory_swap_read_step_is_read_only_and_returns_full_vectors():

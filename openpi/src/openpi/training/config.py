@@ -1249,13 +1249,23 @@ _CONFIGS = [
             pi05=True,
             predict_subtask=True,
             predict_with_memory=True,
+            # Exhaustive audit over all 22,705 current dataset frames found a maximum context
+            # length of 69. Eighty keeps eleven spare positions without truncation.
+            max_token_len=80,
             memory_layer=8,
             memory_architecture="v32_layer8_dual_query",
             memory_write_source="query_compressed",
             memory_query_tokens=16,
             memory_query_heads=8,
+            # The same exhaustive transform-faithful audit found a maximum causal length of
+            # 123 (subtask + FAST actions). Five spare positions retain every target.
+            causal_token_len=128,
+            bf16_vocab_projection=True,
             simulated_delay=6,
-            memory_seq_steps=60,
+            # T40/S15 covers observation starts through frame 585 and action targets through
+            # frame 634, essentially the same physical horizon as T60/S10 (590/639) with one
+            # third fewer recurrent writes.
+            memory_seq_steps=40,
             memory_block_steps=25,
             memory_probe_weight=0.0,
             memory_probe_diagnostic=False,
@@ -1268,15 +1278,20 @@ _CONFIGS = [
             base_config=DataConfig(
                 subtask_from_task=True,
                 subtask_lookahead=15,
-                memory_stride_frames=10,
+                memory_stride_frames=15,
                 memory_slice_prob=0.5,
-                memory_min_slice_steps=20,
-                memory_sequence_buckets=(20, 40, 60),
+                # Preserve the old ~200-frame minimum slice and ~200/400/600-frame bucket
+                # boundaries after changing cadence from 10 to 15 raw frames.
+                memory_min_slice_steps=14,
+                memory_sequence_buckets=(14, 27, 40),
                 memory_reveal_frames_path="./assets/pi05_yam/reveal_frames.json",
             ),
         ),
+        # Keep SigLIP trainable. Only the Titans write gates stay frozen at their measured
+        # stable operating point; the sequence loss still updates all vision parameters.
         freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
         batch_size=12,
+        gradient_accumulation_steps=1,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=200,
             peak_lr=5e-5,

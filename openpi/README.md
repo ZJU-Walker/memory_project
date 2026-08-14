@@ -30,9 +30,9 @@ OPENPI_DATA_HOME=/iris/u/kewalk/.cache/openpi \
 CUDA_VISIBLE_DEVICES=0,1 \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
 .venv/bin/python scripts/train.py pi05_yam_mem_v32 \
-  --exp-name dualquery16_l8_s10_d6_t60_b20-40-60_tb25_bs12_seed42 \
+  --exp-name dualquery16_l8_s15_d6_t40_b14-27-40_tb25_bs12_bf16fast_save250_seed42 \
   --batch-size 12 \
-  --gradient-accumulation-steps 3 \
+  --gradient-accumulation-steps 1 \
   --fsdp-devices 2 \
   --seed 42
 

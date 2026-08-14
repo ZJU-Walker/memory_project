@@ -132,6 +132,36 @@ def test_probe_grid_metrics_stack_across_sequence_buckets():
     np.testing.assert_allclose(reduced["diagnostic/probe_accuracy_by_step"][40:], 0.5, rtol=1e-6)
 
 
+def test_expensive_norm_metrics_are_count_weighted_across_log_window():
+    reduced = train._reduce_infos(
+        [
+            {
+                "loss": jnp.asarray(1.0),
+                "grad_norm": jnp.asarray(9.0),
+                "param_norm": jnp.asarray(12.0),
+                "_expensive_norm_count": jnp.asarray(1.0),
+            },
+            {
+                "loss": jnp.asarray(3.0),
+                "grad_norm": jnp.asarray(0.0),
+                "param_norm": jnp.asarray(0.0),
+                "_expensive_norm_count": jnp.asarray(0.0),
+            },
+            {
+                "loss": jnp.asarray(5.0),
+                "grad_norm": jnp.asarray(0.0),
+                "param_norm": jnp.asarray(0.0),
+                "_expensive_norm_count": jnp.asarray(0.0),
+            },
+        ]
+    )
+
+    assert reduced["loss"] == pytest.approx(3.0)
+    assert reduced["grad_norm"] == pytest.approx(9.0)
+    assert reduced["param_norm"] == pytest.approx(12.0)
+    assert "_expensive_norm_count" not in reduced
+
+
 def test_diagnostic_probe_metrics_are_count_weighted_and_namespaced():
     reduced = train._reduce_infos(
         [

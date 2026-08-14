@@ -93,6 +93,15 @@ def _pad_probe_grids(correct_grid: at.Array, active_grid: at.Array, max_steps: i
 def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
     stacked_infos = common_utils.stack_forest(infos)
     reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos))
+    norm_count_key = "_expensive_norm_count"
+    if norm_count_key in reduced:
+        # Parameter/gradient norms traverse the multi-billion-parameter tree. They are sampled
+        # once per logging window inside train_step, so reduce them by their explicit count
+        # rather than diluting the single sample by the number of updates in the window.
+        count = np.sum(jax.device_get(stacked_infos[norm_count_key]), axis=0)
+        for key in ("grad_norm", "param_norm"):
+            reduced[key] = np.sum(jax.device_get(stacked_infos[key]), axis=0) / np.maximum(count, 1)
+        reduced.pop(norm_count_key)
     probe_count_key = "diagnostic/probe_count"
     if probe_count_key in reduced:
         # Diagnostic accuracies are ratios over every live probe in the entire log window, not
@@ -388,20 +397,33 @@ def train_step(
             ema_params=ema_params,
         )
 
-    # Filter out params that aren't kernels.
-    kernel_params = nnx.state(
-        model,
-        nnx.All(
-            nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            lambda _, x: x.value.ndim > 1,
-        ),
+    # These full-tree diagnostics do not affect optimization and are only consumed every
+    # log_interval steps. Avoid paying their bandwidth/collective cost on the other updates.
+    expensive_norm_active = jnp.equal(jnp.mod(state.step, config.log_interval), 0)
+
+    def compute_expensive_norms(_):
+        kernel_params = nnx.state(
+            model,
+            nnx.All(
+                nnx.Param,
+                nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+                lambda _, x: x.value.ndim > 1,
+            ),
+        )
+        return optax.global_norm(grads), optax.global_norm(kernel_params)
+
+    grad_norm, param_norm = jax.lax.cond(
+        expensive_norm_active,
+        compute_expensive_norms,
+        lambda _: (jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32)),
+        operand=None,
     )
     info = {
         "loss": loss,
         **loss_info,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
+        "grad_norm": grad_norm,
+        "param_norm": param_norm,
+        "_expensive_norm_count": expensive_norm_active.astype(jnp.float32),
     }
     return new_state, info
 
