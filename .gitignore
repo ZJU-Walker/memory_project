@@ -8,3 +8,9 @@ data/
 *.mp4
 eval/
 openpi/scripts/eval_results/
+# Local outputs and scratch (v3.x diagnostics, training logs)
+openpi/diagnostic_outputs/
+openpi/training_logs/
+openpi/writer_contribution_results/
+.ssh_known_hosts
+*.pdf
