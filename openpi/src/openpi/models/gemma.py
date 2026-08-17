@@ -451,6 +451,12 @@ class Module(nn.Module):
     # no numerical result -- it only keeps the per-layer attention distributions alive as an
     # extra scan output, so a checkpoint stays loadable either way.
     return_attn_probs: bool = False
+    # Rematerialization policy for the scanned blocks, by jax.checkpoint_policies name.
+    # "nothing_saveable" recomputes each block's forward during backward (minimum memory);
+    # "dots_saveable" keeps matmul outputs so the backward pass skips that recompute. The
+    # memory-sequence losses wrap every timestep in an outer jax.checkpoint, so on large-memory
+    # GPUs only one step's saved activations are ever alive and the extra memory is affordable.
+    remat_policy: str = "nothing_saveable"
 
     def setup(self):
         # all experts must have the same depth
@@ -461,11 +467,13 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )
+        if not hasattr(jax.checkpoint_policies, self.remat_policy):
+            raise ValueError(f"unknown remat_policy: {self.remat_policy!r}")
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
             static_argnums=(6, 7),  # partial_layers and deterministic (excluding self)
-            policy=jax.checkpoint_policies.nothing_saveable,
+            policy=getattr(jax.checkpoint_policies, self.remat_policy),
         )
         self.layers = nn.scan(
             block_cls,

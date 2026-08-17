@@ -139,6 +139,22 @@ class MemoryQueryCompressor(nnx.Module):
         pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
         return self.output_proj(pooled).astype(jnp.float32)
 
+    def attention_probs(self, source: at.Float[at.Array, "b n d"]) -> at.Float[at.Array, "b h q n"]:
+        """Offline diagnostic view of the query->source attention distribution.
+
+        Recomputes exactly the q/k path of :meth:`__call__` and returns the per-head FP32
+        softmax weights before they are cast to the value dtype, so map mass sums to one per
+        query slot regardless of the configured compute dtype.
+        """
+        if source.ndim != 3 or source.shape[-1] != self.width:
+            raise ValueError(f"query compressor expects [batch,tokens,{self.width}]; got {source.shape}.")
+        batch = source.shape[0]
+        queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
+        q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
+        k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
+        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
+        return jax.nn.softmax(logits * self.head_dim**-0.5, axis=-1)
+
 
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
@@ -156,6 +172,7 @@ class Pi0(_model.BaseModel):
                 embed_dtype=config.dtype,
                 decode_dtype=config.dtype if config.bf16_vocab_projection else None,
                 adarms=config.pi05,
+                remat_policy=config.remat_policy,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -166,6 +183,7 @@ class Pi0(_model.BaseModel):
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
+                remat_policy=config.remat_policy,
             )
         )
         fake_image = next(iter(config.fake_obs().images.values()))
@@ -1500,6 +1518,7 @@ class Pi0(_model.BaseModel):
         camera_names = list(preprocessed.images)
         result = {
             "memory_to_top": memory_rows[:, :, :mem_len],
+            "memory_to_memory": memory_rows[:, :, prefix_len : prefix_len + mem_len],
             "memory_to_top_mass": jnp.sum(memory_rows[:, :, :mem_len], axis=-1),
             "memory_to_prefix_mass": jnp.sum(memory_rows[:, :, :prefix_len], axis=-1),
             "memory_to_memory_mass": jnp.sum(memory_rows[:, :, prefix_len : prefix_len + mem_len], axis=-1),
@@ -1560,6 +1579,182 @@ class Pi0(_model.BaseModel):
                 start = index * mem_len
                 result[f"subtask_to_camera_{name}_mass"] = jnp.sum(subtask_rows[:, :, start : start + mem_len], axis=-1)
         return result
+
+    def retrieved_token_ablation_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        token_indices: at.Array,
+    ) -> dict[str, at.Array]:
+        """Causally ablate retrieved-token slots and measure the v3.1 writer change.
+
+        The caller supplies a fixed-size vector of token indices. Index ``-1`` is an exact
+        unmodified control; non-negative index ``j`` zeros retrieved row ``j`` before the
+        memory gate. The observation prefix and ordinary retrieval are computed once at batch
+        size one, then the memory-token pass and associative write are evaluated for every
+        intervention from the identical pre-write state. No branch is committed.
+
+        Returned effects are relative to branch zero, which must be the ``-1`` control. This
+        same-batch baseline removes batch-shape/BF16 kernel floors while avoiding transfer of
+        the multi-million-parameter candidate states to the host.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_write_source != "post_attention":
+            raise ValueError("retrieved-token ablation is defined for the v3.1 post_attention writer.")
+        if observation.state.shape[0] != 1:
+            raise ValueError("retrieved-token ablation requires one fixed observation.")
+        first_state_leaf = jax.tree.leaves(memory_state)[0]
+        if first_state_leaf.shape[0] != 1:
+            raise ValueError("retrieved-token ablation requires one fixed pre-write state.")
+        token_indices = jnp.asarray(token_indices, dtype=jnp.int32)
+        if token_indices.ndim != 1 or token_indices.shape[0] < 2:
+            raise ValueError("token_indices must be a rank-1 array containing a control and interventions.")
+
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = token_indices.shape[0]
+        image_embeddings = []
+        image_masks = []
+        for name in preprocessed.images:
+            image_tokens, _ = self.PaliGemma.img(preprocessed.images[name], train=False)
+            image_embeddings.append(image_tokens)
+            image_masks.append(einops.repeat(preprocessed.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+        mem_len = image_embeddings[0].shape[1]
+        image_tokens = jnp.concatenate(image_embeddings, axis=1)
+        image_mask = jnp.concatenate(image_masks, axis=1)
+        prompt = preprocessed.tokenized_prompt
+        prompt_mask = preprocessed.tokenized_prompt_mask
+        ar = (
+            preprocessed.token_ar_mask
+            if preprocessed.token_ar_mask is not None
+            else jnp.zeros(prompt.shape, dtype=jnp.int32)
+        )
+        prefix_tokens = jnp.concatenate([image_tokens, self.PaliGemma.llm(prompt, method="embed")], axis=1)
+        prefix_mask = jnp.concatenate([image_mask, prompt_mask], axis=1)
+        prefix_ar = jnp.concatenate([0 * image_mask, ar], axis=1).astype(jnp.int32)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache, hidden = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=make_attn_mask(prefix_mask, prefix_ar),
+            positions=prefix_positions,
+            return_hidden_states=True,
+        )
+        h_t = hidden[0][self.memory_layer][:, :mem_len].astype(jnp.float32)
+        retrieved = self.memory.read(memory_state, h_t)
+
+        slots = jnp.arange(mem_len)[None, :]
+        ablated = (token_indices[:, None] >= 0) & (slots == token_indices[:, None])
+        retrieved_batch = jnp.broadcast_to(retrieved, (batch, *retrieved.shape[1:]))
+        retrieved_batch = jnp.where(ablated[:, :, None], 0.0, retrieved_batch)
+        memory_tokens = (self.memory_gate.value * retrieved_batch).astype(prefix_tokens.dtype)
+
+        prefix_len = prefix_tokens.shape[1]
+        padded_cache = jax.tree.map(
+            lambda x: jnp.broadcast_to(
+                jnp.pad(
+                    x,
+                    ((0, 0), (0, 0), (0, mem_len + self.causal_token_len), (0, 0), (0, 0)),
+                ),
+                (x.shape[0], batch, x.shape[2] + mem_len + self.causal_token_len, *x.shape[3:]),
+            ),
+            kv_cache,
+        )
+        memory_mask = jnp.broadcast_to(
+            make_memory_step_mask(prefix_mask, prefix_ar, mem_len, self.causal_token_len),
+            (batch, mem_len, prefix_len + mem_len + self.causal_token_len),
+        )
+        memory_positions = jnp.broadcast_to(prefix_len + jnp.arange(mem_len)[None], (batch, mem_len))
+        (final_ct, _), _ = self.PaliGemma.llm(
+            [memory_tokens, None],
+            mask=memory_mask,
+            positions=memory_positions,
+            kv_cache=padded_cache,
+            cache_position=prefix_len,
+        )
+        final_ct = final_ct.astype(jnp.float32)
+
+        repeated_state = jax.tree.map(lambda value: jnp.broadcast_to(value, (batch, *value.shape[1:])), memory_state)
+        candidate_state, write_aux = self.memory.write(repeated_state, final_ct)
+        eta = write_aux["eta"]
+        injection = jax.tree.map(
+            lambda new, old: new - old * eta.reshape((batch,) + (1,) * (old.ndim - 1)),
+            candidate_state.momentum,
+            repeated_state.momentum,
+        )
+
+        def tree_batch_dot(left, right):
+            return sum(
+                jnp.sum(x * y, axis=tuple(range(1, x.ndim)))
+                for x, y in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True)
+            )
+
+        def tree_batch_effect(tree):
+            reference = jax.tree.map(lambda value: value[:1], tree)
+            difference = jax.tree.map(lambda value, base: value - base, tree, reference)
+            effect = jnp.sqrt(jnp.maximum(tree_batch_dot(difference, difference), 0.0))
+            norm = jnp.sqrt(jnp.maximum(tree_batch_dot(tree, tree), 0.0))
+            reference_norm = norm[0]
+            cosine = tree_batch_dot(tree, reference) / jnp.maximum(norm * reference_norm, 1e-12)
+            return effect, effect / jnp.maximum(reference_norm, 1e-12), cosine
+
+        ct_effect, ct_relative, ct_cosine = tree_batch_effect(final_ct)
+        injection_effect, injection_relative, injection_cosine = tree_batch_effect(injection)
+        return {
+            "token_indices": token_indices,
+            "retrieved_token_norm": jnp.linalg.norm(retrieved[0], axis=-1),
+            "final_ct_effect_l2": ct_effect,
+            "final_ct_effect_relative": ct_relative,
+            "final_ct_cosine": ct_cosine,
+            "injection_effect_l2": injection_effect,
+            "injection_effect_relative": injection_relative,
+            "injection_cosine": injection_cosine,
+            "baseline_final_ct_norm": jnp.linalg.norm(final_ct[0]),
+            "baseline_injection_norm": jnp.sqrt(jnp.maximum(tree_batch_dot(injection, injection)[0], 0.0)),
+            "retrieval_rms": jnp.sqrt(jnp.mean(jnp.square(retrieved))),
+        }
+
+    def v32_query_attention_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+    ) -> dict[str, at.Array]:
+        """Offline v3.2 diagnostic: dual-query attention maps and read/write tensors for one frame.
+
+        Runs the same split prefix as inference (blocks 0..memory_layer, dual-query read, gated
+        inject, blocks memory_layer+1..end) against the *pre-write* ``memory_state`` and returns
+        the FP32 query->patch attention maps of both banks together with the tensors the frame
+        would read and write.  Nothing is committed: the caller advances state through
+        :meth:`sample_with_memory`, whose write consumes exactly the ``write_tokens`` returned
+        here (same ``h8_top`` source).
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("query-attention diagnostics are only defined for the v3.2 architecture.")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        num_img = prefix_mask.shape[1] - self.max_token_len
+        prepared = self._v32_prepare_memory_prefix(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=num_img // len(preprocessed.images),
+        )
+        h8_top = prepared["h8_top"]
+        write_tokens = prepared["write_tokens"]
+        retrieved = prepared["retrieved"]
+        slot_aux = self.memory.token_write_diagnostics(memory_state, write_tokens)
+        return {
+            "read_attention": self.read_query_compressor.attention_probs(h8_top),
+            "write_attention": self.write_query_compressor.attention_probs(h8_top),
+            "read_queries": prepared["read_queries"],
+            "write_tokens": write_tokens,
+            "retrieved": retrieved,
+            "retrieved_slot_norm": jnp.linalg.norm(retrieved.astype(jnp.float32), axis=-1),
+            "write_slot_norm": jnp.linalg.norm(write_tokens.astype(jnp.float32), axis=-1),
+            "h8_top_norm": jnp.linalg.norm(h8_top, axis=-1),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (h8_top.shape[0],)),
+            **{f"write_slot_{key}": value for key, value in slot_aux.items()},
+        }
 
     def _sample_with_memory_v32(
         self,

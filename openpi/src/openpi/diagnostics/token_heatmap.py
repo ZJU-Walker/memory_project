@@ -1020,6 +1020,7 @@ def export_heatmap_video(
     video_encoder: Literal["auto", "imageio", "opencv"] = "auto",
     scale_mode: ScaleMode = "video",
     zscore_range: float = 3.0,
+    metric_semantics: str = "non-negative per-token associative error or fast-weight gradient norm",
 ) -> dict[str, object]:
     """Write PNG/NPZ for every measured write plus one annotated MP4 and manifest."""
 
@@ -1038,6 +1039,8 @@ def export_heatmap_video(
         raise ValueError(f"unsupported scale_mode {scale_mode!r}; choose one of {SCALE_MODES}")
     if not math.isfinite(zscore_range) or zscore_range <= 0:
         raise ValueError("zscore_range must be finite and positive")
+    if not isinstance(metric_semantics, str) or not metric_semantics.strip():
+        raise ValueError("metric_semantics must be a non-empty string")
     raw_presence = {frame.raw_image_rgb is not None for frame in frames}
     if len(raw_presence) != 1:
         raise ValueError("every frame in one video must consistently provide raw_image_rgb or consistently omit it")
@@ -1139,7 +1142,7 @@ def export_heatmap_video(
     manifest: dict[str, object] = {
         "schema_version": "openpi.v31.token_heatmap.v1",
         "metric_name": metric_name,
-        "metric_semantics": "non-negative per-token associative error or fast-weight gradient norm",
+        "metric_semantics": metric_semantics,
         "frame_count": len(frames),
         "fps": float(fps),
         "model_image_size": [MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE],

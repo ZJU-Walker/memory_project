@@ -27,6 +27,7 @@ class _TinyFinalCtModel(_TinyPi05SequenceTrainer):
     writer_echo_factorial_step = pi0.Pi0.writer_echo_factorial_step
     writer_echo_factorial_metrics_step = pi0.Pi0.writer_echo_factorial_metrics_step
     memory_swap_read_step = pi0.Pi0.memory_swap_read_step
+    retrieved_token_ablation_step = pi0.Pi0.retrieved_token_ablation_step
 
 
 def _observation(batch_size=1):
@@ -179,6 +180,33 @@ def test_memory_swap_read_step_is_read_only_and_returns_full_vectors():
     assert output["final_ct"].shape == output["retrieved"].shape
     assert np.isfinite(np.asarray(output["retrieved"])).all()
     assert np.isfinite(np.asarray(output["final_ct"])).all()
+    _assert_tree_exact(state, before)
+
+
+def test_retrieved_token_ablation_has_exact_same_batch_control_and_is_read_only():
+    model = _TinyFinalCtModel(nnx.Rngs(0), memory_write_source="post_attention")
+    observation = _observation()
+    state = _written_state(model)
+    before = jax.tree.map(jnp.copy, state)
+    run = nnx_utils.module_jit(model.retrieved_token_ablation_step)
+    output = run(observation, state, jnp.asarray([-1, -1, 0], dtype=jnp.int32))
+
+    assert output["token_indices"].shape == (3,)
+    assert output["retrieved_token_norm"].shape == (1,)
+    for name in (
+        "final_ct_effect_l2",
+        "final_ct_effect_relative",
+        "final_ct_cosine",
+        "injection_effect_l2",
+        "injection_effect_relative",
+        "injection_cosine",
+    ):
+        assert output[name].shape == (3,)
+        assert np.isfinite(np.asarray(output[name])).all()
+    np.testing.assert_array_equal(output["final_ct_effect_l2"][:2], 0.0)
+    np.testing.assert_array_equal(output["injection_effect_l2"][:2], 0.0)
+    np.testing.assert_allclose(output["final_ct_cosine"][:2], 1.0, rtol=2e-7, atol=2e-7)
+    np.testing.assert_allclose(output["injection_cosine"][:2], 1.0, rtol=2e-7, atol=2e-7)
     _assert_tree_exact(state, before)
 
 

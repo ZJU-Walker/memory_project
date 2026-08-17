@@ -72,15 +72,16 @@ def test_maps_have_patch_grid_shape_and_are_valid_distributions(fixture):
     assert np.all(np.asarray(maps["memory_to_prefix_mass"]) >= mass - 1e-6), (
         "top-camera attention is a subset of prefix attention"
     )
+    memory_to_memory = np.asarray(maps["memory_to_memory"])
+    assert memory_to_memory.shape == (1, top_tokens, top_tokens)
+    np.testing.assert_allclose(memory_to_memory.sum(axis=-1), maps["memory_to_memory_mass"], atol=1e-6)
 
 
 def test_attention_budget_blocks_partition_the_full_softmax(fixture):
     config, model, observation, state = fixture
     tokens, mask = _forced_subtask(config)
     with model.capture_attention():
-        maps = model.memory_attention_maps(
-            observation, state, forced_subtask_tokens=tokens, forced_subtask_mask=mask
-        )
+        maps = model.memory_attention_maps(observation, state, forced_subtask_tokens=tokens, forced_subtask_mask=mask)
     cameras = list(observation.images)
 
     # Memory rows see the prefix plus the memory block and nothing after it.
@@ -166,9 +167,7 @@ def test_subtask_rows_report_memory_versus_vision_share(fixture):
     config, model, observation, state = fixture
     tokens, mask = _forced_subtask(config)
     with model.capture_attention():
-        maps = model.memory_attention_maps(
-            observation, state, forced_subtask_tokens=tokens, forced_subtask_mask=mask
-        )
+        maps = model.memory_attention_maps(observation, state, forced_subtask_tokens=tokens, forced_subtask_mask=mask)
     live = np.asarray(maps["subtask_token_mask"])[0]
     memory_share = np.asarray(maps["subtask_to_memory_mass"])[0][live]
     top_share = np.asarray(maps["subtask_to_top_mass"])[0][live]

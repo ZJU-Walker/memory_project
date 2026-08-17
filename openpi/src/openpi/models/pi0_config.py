@@ -75,6 +75,12 @@ class Pi0Config(_model.BaseModelConfig):
     # remains an FP32 parameter; only decode operands use `dtype`, with FP32 accumulation.
     # Default-off keeps every existing pi0/pi0.5 configuration numerically unchanged.
     bf16_vocab_projection: bool = False
+    # jax.checkpoint_policies name applied to the scanned Gemma and SigLIP blocks. The default
+    # fully recomputes each block's forward during backward (minimum memory). "dots_saveable"
+    # keeps matmul outputs alive instead, trading one step's activation memory for skipping
+    # that recompute -- profitable on large-memory GPUs (H200) under the per-step outer
+    # jax.checkpoint of the memory-sequence losses, which bounds what is alive to one step.
+    remat_policy: str = "nothing_saveable"
     memory: _memory.MemoryConfig = dataclasses.field(default_factory=_memory.MemoryConfig)
     # Sequence training (RoboTTT-style): a training sample is `memory_seq_steps` consecutive
     # prediction steps from one episode, one step per policy replan
