@@ -67,6 +67,30 @@ def test_pathway_scalars_reports_both_norms():
     assert scalars["memory_gate_norm"] == pytest.approx(np.sqrt(16 * 8 * 9.0))
 
 
+def test_slot_grid_frame_places_each_slot_tile():
+    """16 per-slot tiles in a 4x4 grid under a header bar; a slot's hot patch must light up
+    inside that slot's tile and nowhere else in its row/column neighborhood."""
+    image = np.zeros((224, 224, 3), dtype=np.uint8)
+    maps = np.zeros((16, 256))
+    maps[:, 0] = 1e-6  # keep every slot's scale finite
+    maps[5, 137] = 1.0  # slot 5 (grid row 1, column 1), patch (8, 9)
+    scales = wa._slot_scales(maps[None])
+    frame = wa.slot_grid_frame(image, maps, scales, "label")
+    assert frame.shape == (wa._SLOT_GRID_HEADER + 4 * 224, 4 * 224, 3)
+    assert frame.dtype == np.uint8
+
+    def tile(row, column):
+        top = wa._SLOT_GRID_HEADER + row * 224
+        return frame[top : top + 224, column * 224 : (column + 1) * 224]
+
+    # patch (8, 9) of slot 5's tile: pixels [8*14:9*14, 9*14:10*14]
+    hot = tile(1, 1)[8 * 14 : 9 * 14, 9 * 14 : 10 * 14]
+    cold = tile(1, 2)[8 * 14 : 9 * 14, 9 * 14 : 10 * 14]
+    assert hot.astype(int).sum() > cold.astype(int).sum()
+    with pytest.raises(ValueError, match="per-frame slot maps"):
+        wa.slot_grid_frame(image, maps[:4], scales, "label")
+
+
 class _PhaseConfig:
     evidence_subtasks = ("inspect both bins",)
     memory_required_subtasks = ("wait; target bin is left", "wait; target bin is right")

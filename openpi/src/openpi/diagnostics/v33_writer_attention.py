@@ -22,11 +22,17 @@ color scales), an NPZ with the head-averaged per-slot maps, and per-frame metric
 run-level JSON summary (per-phase aggregates are also printed as a table).
 """
 
-# ruff: noqa: SLF001 - this diagnostic deliberately reuses the private v3.1/v3.2 replay
+# ruff: noqa: SLF001, I001 - this diagnostic deliberately reuses the private v3.1/v3.2 replay
 # machinery (episode sources, inline-image decode, checkpoint alignment); those helpers ARE the
-# shared implementation, re-exporting them publicly for one consumer would be churn.
+# shared implementation, re-exporting them publicly for one consumer would be churn. And the
+# import ORDER is load-bearing: pyarrow.parquet must load before any openpi module -- with the
+# openpi stack (jax/flax/sentencepiece/...) resident first, every parquet read of this
+# dataset's inline-image files segfaults on iris workstations (exit 139, no traceback), the
+# same environment-quirk class as the pinned torch-before-tensorflow order in data_loader.
 
 from __future__ import annotations
+
+import pyarrow.parquet as pq
 
 import dataclasses
 import json
@@ -175,8 +181,6 @@ def _episode_phases(task_ids: np.ndarray, tasks: dict[int, str], data_config: An
 
 
 def _plan_episodes(options: Options, data_config: Any) -> list[_EpisodePlan]:
-    import pyarrow.parquet as pq
-
     tasks = _read_tasks(options.dataset_root)
     prompts = _read_prompts(options.dataset_root)
     first, second = sorted(set(prompts.values()))
@@ -216,6 +220,111 @@ def _plan_episodes(options: Options, data_config: Any) -> list[_EpisodePlan]:
     if not plans:
         raise ValueError("no usable episodes found")
     return plans
+
+
+def _slot_scales(slot_maps: np.ndarray) -> list[token_heatmap.ColorScale]:
+    """One video-level color scale per slot. Every slot's attention row is a softmax
+    distribution (total mass 1 by construction), so per-slot normalization is the honest
+    display: slots differ in SHAPE, not in total mass."""
+    maps = np.asarray(slot_maps, dtype=np.float64)
+    if maps.ndim != 3 or maps.shape[1:] != (16, 256):
+        raise ValueError(f"slot maps must be [frames, 16, 256], got {maps.shape}")
+    scales = []
+    for slot in range(16):
+        vmax = float(np.percentile(maps[:, slot], 99.0))
+        scales.append(
+            token_heatmap.ColorScale(
+                vmin=0.0,
+                vmax=max(vmax, float(_EPS)),
+                lower_percentile=0.0,
+                upper_percentile=99.0,
+                anchor_zero=True,
+            )
+        )
+    return scales
+
+
+_SLOT_GRID_HEADER = 28
+
+
+def slot_grid_frame(
+    image: np.ndarray,
+    slot_maps: np.ndarray,
+    scales: list[token_heatmap.ColorScale],
+    label: str,
+) -> np.ndarray:
+    """Compose one 4x4 grid frame (16 write slots) over the same camera image: a header bar
+    plus 16 individually scaled 224x224 overlays, slot index stamped in each tile."""
+    maps = np.asarray(slot_maps, dtype=np.float64)
+    if maps.shape != (16, 256):
+        raise ValueError(f"per-frame slot maps must be [16, 256], got {maps.shape}")
+    if len(scales) != 16:
+        raise ValueError(f"need one color scale per slot, got {len(scales)}")
+    rows = []
+    for row_index in range(4):
+        tiles = []
+        for column in range(4):
+            slot = 4 * row_index + column
+            overlay, _ = token_heatmap.heatmap_overlay(
+                image, maps[slot], scales[slot], scale_mode="video", draw_grid=False
+            )
+            cv2.putText(overlay, f"s{slot}", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            tiles.append(overlay)
+        rows.append(np.concatenate(tiles, axis=1))
+    grid = np.concatenate(rows, axis=0)
+    bar = np.zeros((_SLOT_GRID_HEADER, grid.shape[1], 3), dtype=np.uint8)
+    cv2.putText(bar, label, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return np.concatenate([bar, grid], axis=0)
+
+
+def render_slot_grid(
+    images: list[np.ndarray],
+    slot_maps: np.ndarray,
+    labels: list[str],
+    path: Path,
+    *,
+    fps: float = 4.0,
+) -> str:
+    """Encode the per-slot 4x4 grid video; returns the encoder identifier."""
+    maps = np.asarray(slot_maps, dtype=np.float64)
+    if len(images) != maps.shape[0] or len(labels) != maps.shape[0]:
+        raise ValueError(f"images/labels/maps disagree: {len(images)}/{len(labels)}/{maps.shape[0]}")
+    scales = _slot_scales(maps)
+    frames = [slot_grid_frame(image, maps[index], scales, labels[index]) for index, image in enumerate(images)]
+    return token_heatmap.encode_mp4(frames, path, fps)
+
+
+def slot_grid_from_npz(
+    npz_path: Path,
+    dataset_root: Path,
+    episode: int,
+    output_path: Path,
+    *,
+    variant: str = "true",
+    fps: float = 4.0,
+) -> str:
+    """Re-render the per-slot grid from a saved maps NPZ -- CPU only, no model or GPU.
+
+    The camera frames are re-decoded from the dataset and letterboxed with the shared
+    ``raw_top_camera_to_model_rgb`` geometry, so tiles align with the training-time patches.
+    """
+    data = np.load(npz_path)
+    if variant not in data:
+        raise KeyError(f"{npz_path} has no variant {variant!r}; available: {sorted(data.keys())}")
+    frame_indices = np.asarray(data["frames"], dtype=np.int64)
+    maps = np.asarray(data[variant], dtype=np.float64)
+    tasks = _read_tasks(dataset_root)
+    source = _wc._load_lerobot_sources(dataset_root, [episode])[0]
+    rows = pq.read_table(source.path, columns=["image", "frame_index", "task_index"]).to_pylist()
+    by_frame = {int(row["frame_index"]): row for row in rows}
+    images, labels = [], []
+    for frame in frame_indices:
+        row = by_frame[int(frame)]
+        raw = _wc.WriterContributionRunner._decode_inline_image(row["image"], field="image", raw_frame=int(frame))
+        model_rgb, _ = token_heatmap.raw_top_camera_to_model_rgb(raw)
+        images.append(model_rgb)
+        labels.append(f"ep{episode} f{int(frame)} {variant.upper()} | {tasks[int(row['task_index'])]}"[:70])
+    return render_slot_grid(images, maps, labels, output_path, fps=fps)
 
 
 class V33WriterAttentionRunner:
@@ -287,8 +396,6 @@ class V33WriterAttentionRunner:
         return _model.Observation.from_dict(batched), model_image
 
     def _replay(self, plan: _EpisodePlan, tasks: dict[int, str]) -> dict[str, Any]:
-        import pyarrow.parquet as pq
-
         source = _wc._load_lerobot_sources(self.options.dataset_root, [plan.episode])[0]
         columns = ["image", "left_wrist_image", "right_wrist_image", "state", "frame_index", "task_index"]
         rows = pq.read_table(source.path, columns=columns).to_pylist()
@@ -447,6 +554,17 @@ class V33WriterAttentionRunner:
             replay = self._replay(plan, tasks)
             stem = f"episode_{plan.episode:03d}"
             encoder = self._render(replay, self.options.output_dir / f"{stem}.mp4")
+            slot_labels = [
+                f"ep{plan.episode} f{frame['frame']} {frame['phase']} | TRUE: {plan.prompt}"
+                for frame in replay["frames"]
+            ]
+            slot_encoder = render_slot_grid(
+                replay["images"],
+                np.stack(replay["maps"]["true"]).astype(np.float64),
+                slot_labels,
+                self.options.output_dir / f"{stem}_slots.mp4",
+                fps=self.options.video_fps,
+            )
             np.savez_compressed(
                 self.options.output_dir / f"{stem}_maps.npz",
                 frames=np.asarray([f["frame"] for f in replay["frames"]], dtype=np.int32),
@@ -461,6 +579,7 @@ class V33WriterAttentionRunner:
                     "evidence": list(plan.evidence),
                     "memory": list(plan.memory),
                     "video_encoder": encoder,
+                    "slot_video_encoder": slot_encoder,
                     "phase_table": self._phase_table(replay["frames"]),
                     "frames": replay["frames"],
                 }
