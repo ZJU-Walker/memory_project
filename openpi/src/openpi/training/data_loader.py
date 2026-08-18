@@ -341,8 +341,11 @@ def _episode_info_table(
                 f"none of memory_required_subtasks={data_config.memory_required_subtasks} or "
                 f"evidence_subtasks={data_config.evidence_subtasks} match the dataset's task strings."
             )
-        bounds = {k: np.full(num_episodes, -1, dtype=np.int32) for k in
-                  ("evidence_start", "evidence_end", "memory_lo", "memory_hi")}
+        bounds = {
+            k: np.full(num_episodes, -1, dtype=np.int32)
+            for k in ("evidence_start", "evidence_end", "memory_lo", "memory_hi")
+        }
+        memory_contiguous = np.ones(num_episodes, dtype=bool)
         for e in range(num_episodes):
             for name, ids in (("evidence", evidence_ids), ("memory", memory_ids)):
                 hit = np.nonzero(np.isin(episode_tasks[e], ids))[0]
@@ -351,10 +354,20 @@ def _episode_info_table(
                     hi_key = "evidence_end" if name == "evidence" else "memory_hi"
                     bounds[lo_key][e] = int(hit[0])
                     bounds[hi_key][e] = int(hit[-1])
+                    if name == "memory" and int(hit[-1]) - int(hit[0]) + 1 != len(hit):
+                        # A stray waiting label (e.g. mid-execute) would stretch [lo, hi] over
+                        # frames where the answer is visible; endpoints landing there would
+                        # grade "memory" the images plainly show. Exclude the episode.
+                        memory_contiguous[e] = False
+                        logging.warning(
+                            f"episode {e}: memory-required labels are not contiguous "
+                            f"(span {int(hit[0])}-{int(hit[-1])}, {len(hit)} frames); excluded."
+                        )
         usable = (
             (bounds["evidence_start"] >= 0)
             & (bounds["memory_lo"] >= 0)
             & (bounds["evidence_end"] < bounds["memory_lo"])
+            & memory_contiguous
         )
         for key, value in bounds.items():
             info[key] = np.where(usable, value, -1).astype(np.int32)
@@ -400,7 +413,8 @@ def _sequence_sampling_info(
     memory_slice_prob as before. Slice starts must leave at least memory_min_slice_steps steps
     before the episode end and may not fall in the dead zone where a blank memory never saw
     the answer yet the labels ahead still demand it -- grading that teaches guessing. With
-    phases the dead zone is (evidence_end, memory_hi]; without, the legacy (reveal, switch)
+    phases the dead zone is (evidence_start, memory_hi] (from the FIRST evidence frame:
+    partial evidence is as ungradable as none); without, the legacy (reveal, switch)
     rule applies. Memory-critical mass is balanced equally over (instruction, side) cells so
     no task or side dominates the waiting supervision.
     """
@@ -423,7 +437,10 @@ def _sequence_sampling_info(
         usable = info["evidence_start"][episode] >= 0
         memory_lo = info["memory_lo"][episode]
         memory_hi = info["memory_hi"][episode]
-        dead = usable & (frame > info["evidence_end"][episode]) & (frame <= memory_hi)
+        # Dead from the first evidence frame on: a slice starting mid-inspection may already
+        # have missed the revealing glimpse, yet the waiting labels ahead still grade the side
+        # -- partial evidence teaches guessing just like no evidence.
+        dead = usable & (frame > info["evidence_start"][episode]) & (frame <= memory_hi)
         in_window = usable & (frame >= window[:, 0][episode]) & (frame <= window[:, 1][episode])
         # the waiting phase must be reachable within the sequence budget
         mc_ok = in_window & (memory_lo - frame <= (max_steps - 1) * stride)
@@ -1059,6 +1076,11 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # Fork inherits one numpy RNG state into every worker; without reseeding, transforms that
+    # draw from np.random (e.g. the TBPTT fence shift) produce the SAME stream in all workers.
+    # torch.initial_seed() is already per-worker (base_seed + worker_id) and derives from the
+    # loader's torch.Generator, so numpy stays reproducible under a fixed training seed.
+    np.random.seed(torch.initial_seed() % 2**32)
 
 
 class RLDSDataLoader:

@@ -86,13 +86,19 @@ a phase are excluded from the branch with a warning.
 
 **`data_loader._sequence_sampling_info`** builds three-branch weights:
 - full trajectories: `(1 − slice − mc)` mass on frame-0 starts (unchanged);
-- slices: `slice` mass, allowed starts now exclude the new dead zone `(evidence_end,
-  action_start)` and the memory-critical window;
+- slices: `slice` mass, allowed starts now exclude the new dead zone `(evidence_start,
+  memory_hi]` and the memory-critical window. The dead zone starts at the FIRST evidence
+  frame (adversarial-review fix): a slice starting mid-inspection may already have missed
+  the revealing glimpse, yet the waiting labels ahead still grade the side — partial
+  evidence teaches guessing exactly like none. Episodes whose memory-required labels are
+  not contiguous (stray label mid-execute) are excluded entirely, since a stretched
+  window would let endpoints grade "memory" on visible evidence;
 - memory-critical: `mc` mass split **equally over the 4 (task, side) cells**, then equally
   over episodes in the cell, then uniformly over starts in
   `[max(1, evidence_start − pad), evidence_start]`.
-  `valid_steps` for these starts = steps to `min(memory_hi, start + T·stride)` (conservative
-  bucket; endpoint truncation happens per draw).
+  `valid_steps` for these starts = `memory_critical_endpoint(start) + 1` — the endpoint is
+  DETERMINISTIC per start frame (shared helper with `BuildMemorySequence`), so bucket
+  assignment is exact; endpoint diversity comes from the uniformly drawn start.
 - Mixture for v3.3: full 0.25 / slice 0.25 / memory-critical 0.50.
 
 **`transforms.MemoryEpisodeInfo`** attaches the per-episode phase bounds;

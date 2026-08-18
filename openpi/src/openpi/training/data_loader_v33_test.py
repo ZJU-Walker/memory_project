@@ -128,9 +128,10 @@ def test_sampler_branch_masses_dead_zone_and_cell_balance(four_cell_dataset):
     for e in range(4):
         assert weights[e, in_window].sum() == pytest.approx(0.125)
 
-    # the dead zone (evidence_end, memory_hi] never starts a sequence: a blank memory there
-    # would be graded on side labels it can never answer
-    assert weights[:, 90:160].sum() == 0.0
+    # the dead zone (evidence_start, memory_hi] never starts a sequence: a slice starting
+    # mid-inspection (or later) may have missed the reveal, yet the side labels ahead still
+    # grade it -- partial evidence teaches guessing just like none
+    assert weights[:, 61:160].sum() == 0.0
     # execution starts are ordinary slices again
     assert weights[:, 160:170].sum() > 0.0
 
@@ -141,27 +142,29 @@ def test_sampler_branch_masses_dead_zone_and_cell_balance(four_cell_dataset):
     assert steps[0, 0] == np.ceil(200 / 15)  # full trajectories still run to the episode end
 
 
-def test_sampler_and_transform_agree_on_every_memory_critical_length(four_cell_dataset):
-    """THE bucket-homogeneity invariant behind the collate error seen at launch: for every
-    window start, the sampler's valid_steps must equal the steps BuildMemorySequence actually
-    leaves after truncation -- otherwise a truncated sample lands in a longer bucket's batch
-    and _sequence_bucket_collate_fn raises 'sequence bucket batch is not homogeneous'."""
-    config = _data_config()
-    sampling = _data_loader._sequence_sampling_info(four_cell_dataset, _StubMeta(), config, max_steps=40)
-    info = _data_loader._episode_info_table(four_cell_dataset, _StubMeta(), config)
+def _assert_sampler_transform_agreement(stub, config, *, require_weight=True):
+    """Walk EVERY memory-critical window start of every episode and assert the sampler's
+    valid_steps equals the steps BuildMemorySequence actually leaves after truncation."""
+    sampling = _data_loader._sequence_sampling_info(stub, _StubMeta(), config, max_steps=40)
+    info = _data_loader._episode_info_table(stub, _StubMeta(), config)
     windows = _data_loader._memory_critical_windows(info, config)
+    lengths = info["length"]
+    num_ep = len(lengths)
     build = _transforms.BuildMemorySequence(
         stride=15, action_horizon=3, block_steps=4, subtask_lookahead=config.subtask_lookahead
     )
-    steps = sampling.valid_steps.reshape(4, 200)
-    weights = sampling.weights.reshape(4, 200)
-    for e in range(4):
+    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+    walked = 0
+    for e in range(num_ep):
+        if windows[e, 0] < 0:
+            continue
         for f in range(int(windows[e, 0]), int(windows[e, 1]) + 1):
-            assert weights[e, f] > 0
+            if require_weight:
+                assert sampling.weights[offsets[e] + f] > 0
             item = {
                 "frame_index": np.int64(f),
                 "index": np.int64(0),
-                "episode_length": np.int32(200),
+                "episode_length": np.int32(lengths[e]),
                 "memory_window": windows[e],
                 "observation/image": np.zeros((40, 2, 2, 3), dtype=np.uint8),
                 "observation/left_wrist_image": np.zeros((40, 2, 2, 3), dtype=np.uint8),
@@ -170,7 +173,86 @@ def test_sampler_and_transform_agree_on_every_memory_critical_length(four_cell_d
                 "actions": np.zeros((40, 3 * 14), dtype=np.float32),
             }
             out = build(item)
-            assert int(out["seq_step_mask"].sum()) == steps[e, f], (e, f, steps[e, f])
+            got = int(out["seq_step_mask"].sum())
+            want = int(sampling.valid_steps[offsets[e] + f])
+            assert got == want, (e, f, got, want)
+            walked += 1
+    return walked
+
+
+def test_sampler_and_transform_agree_on_every_memory_critical_length(four_cell_dataset):
+    """THE bucket-homogeneity invariant behind the collate error seen at launch: for every
+    window start, the sampler's valid_steps must equal the steps BuildMemorySequence actually
+    leaves after truncation -- otherwise a truncated sample lands in a longer bucket's batch
+    and _sequence_bucket_collate_fn raises 'sequence bucket batch is not homogeneous'."""
+    assert _assert_sampler_transform_agreement(four_cell_dataset, _data_config()) == 4 * 31
+
+
+def _custom_episode(phases: list[tuple[str, int]]) -> list[int]:
+    tasks: list[int] = []
+    for label, span in phases:
+        tasks.extend([_IDS[label]] * span)
+    return tasks
+
+
+def test_agreement_when_wait_is_shorter_than_stride(tmp_path, monkeypatch):
+    """A 7-frame wait can fall entirely between two grid steps (stride 15), driving the
+    endpoint into tier 2 (in-wait but within the lookahead of its end) or tier 3 (the last
+    grid step before the wait). Both real cases in the 0816 data (wait span min = 13)."""
+    episodes = [
+        _custom_episode([(OPEN, 60), (INSPECT, 30), (CLOSE, 55), (WAIT_L, 7), (EXEC_L, 48)]),
+        _custom_episode([(OPEN, 61), (INSPECT, 30), (CLOSE, 55), (WAIT_R, 7), (EXEC_R, 47)]),
+    ]
+    stub = _StubLeRobot(episodes, tmp_path)
+    monkeypatch.setattr(_data_loader, "_unwrap_lerobot", lambda _d: stub)
+    assert _assert_sampler_transform_agreement(stub, _data_config()) > 0
+
+
+def test_agreement_when_episode_ends_inside_wait(tmp_path, monkeypatch):
+    """One 0816 episode has no execute phase at all -- the wait runs to the last frame. The
+    endpoint must stay strictly inside the episode and the side still parses from the final
+    (wait) label."""
+    episodes = [_custom_episode([(OPEN, 60), (INSPECT, 30), (CLOSE, 50), (WAIT_R, 60)])]
+    stub = _StubLeRobot(episodes, tmp_path)
+    monkeypatch.setattr(_data_loader, "_unwrap_lerobot", lambda _d: stub)
+    info = _data_loader._episode_info_table(stub, _StubMeta(), _data_config())
+    assert info["memory_hi"][0] == 199  # last frame
+    assert info["side"][0] == 1  # "wait; target bin is RIGHT" is the final label
+    assert _assert_sampler_transform_agreement(stub, _data_config()) > 0
+
+
+def test_agreement_when_evidence_starts_before_the_pad(tmp_path, monkeypatch):
+    """evidence_start < memory_critical_start_pad clips start_lo to 1 (never 0 or negative:
+    frame 0 is the full-trajectory branch, and a negative sentinel would disable the
+    transform's window gate while the sampler still weighted the starts -- the exact
+    sampler/transform split that produced the launch crash)."""
+    episodes = [_custom_episode([(OPEN, 20), (INSPECT, 30), (CLOSE, 50), (WAIT_L, 20), (EXEC_L, 80)])]
+    stub = _StubLeRobot(episodes, tmp_path)
+    monkeypatch.setattr(_data_loader, "_unwrap_lerobot", lambda _d: stub)
+    config = _data_config()
+    windows = _data_loader._memory_critical_windows(_data_loader._episode_info_table(stub, _StubMeta(), config), config)
+    np.testing.assert_array_equal(windows[0], [1, 20, 100, 119])
+    assert _assert_sampler_transform_agreement(stub, config) == 20
+
+
+def test_noncontiguous_wait_labels_exclude_the_episode(tmp_path, monkeypatch, caplog):
+    """A stray waiting label inside the execute phase would stretch [memory_lo, memory_hi]
+    over frames where the answer is visible; such an episode must drop out of the
+    memory-critical branch instead of grading 'memory' on visible evidence."""
+    broken = _episode("left")
+    broken[180] = _IDS[WAIT_L]  # stray label mid-execute
+    stub = _StubLeRobot([_episode("right"), broken], tmp_path)
+    monkeypatch.setattr(_data_loader, "_unwrap_lerobot", lambda _d: stub)
+    config = _data_config()
+    with caplog.at_level("WARNING"):
+        info = _data_loader._episode_info_table(stub, _StubMeta(), config)
+    assert "not contiguous" in caplog.text
+    assert info["evidence_start"][1] == -1  # fully unusable, all bounds -1
+    windows = _data_loader._memory_critical_windows(info, config)
+    assert (windows[1] == -1).all()
+    assert (windows[0] >= 0).all()  # the clean episode keeps its window
+    sampling = _data_loader._sequence_sampling_info(stub, _StubMeta(), config, max_steps=40)
+    assert sampling.weights.sum() == pytest.approx(1.0)
 
 
 def test_sampler_without_phase_config_keeps_legacy_behavior(four_cell_dataset):

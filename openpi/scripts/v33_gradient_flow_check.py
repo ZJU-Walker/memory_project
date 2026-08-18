@@ -32,6 +32,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.config as _config
 from openpi.diagnostics.v32_checkpoint import _align_params  # shared checkpoint-loading shim
 from openpi.models import model as _model
+from openpi.training import weight_loaders
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,9 +52,9 @@ def _memory_critical_batch(config: _config.TrainConfig, batch_size: int, seed: i
     dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     dataset = _data_loader.transform_dataset(dataset, data_config)
 
-    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset  # heavy import, keep local
-
-    meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+    # the constructed dataset already carries its metadata; a fresh LeRobotDatasetMetadata
+    # would touch the hugging-face hub again (fails on offline compute nodes)
+    meta = _data_loader._unwrap_lerobot(dataset).meta  # noqa: SLF001
     info = _data_loader._episode_info_table(dataset, meta, data_config)  # noqa: SLF001
     windows = _data_loader._memory_critical_windows(info, data_config)  # noqa: SLF001
     if windows is None:
@@ -66,7 +67,8 @@ def _memory_critical_batch(config: _config.TrainConfig, batch_size: int, seed: i
     if len(chosen) < batch_size:
         raise ValueError(f"only {len(chosen)} episodes have usable phases; lower --batch_size.")
 
-    np.random.seed(seed)  # BuildMemorySequence draws the waiting endpoint from the global stream
+    # (endpoints are deterministic per start frame and memory-critical samples carry no TBPTT
+    # fence, so nothing below consumes global np.random state)
     items, bookkeeping = [], []
     for e in chosen:
         start = int(rng.integers(windows[e, 0], windows[e, 1] + 1))
@@ -93,7 +95,16 @@ def main(options: Options):
 
     raw_params = _model.restore_params(options.checkpoint / "params", dtype=jnp.float32)
     abstract_state = nnx.state(nnx.eval_shape(config.model.create, jax.random.key(0))).to_pure_dict()
-    model = config.model.load(_align_params(abstract_state, raw_params), remove_extra_params=False)
+    aligned = _align_params(abstract_state, raw_params)
+    # _align_params restores structure (orbax drops flax None-bias slots) but not MISSING
+    # subsystems: probing straight from a pre-memory base checkpoint (pi05_base) needs the
+    # memory/compressor/conditioner params at their fresh initialization, exactly like
+    # PartialCheckpointWeightLoader at training start.
+    init_params = nnx.state(config.model.create(jax.random.key(0))).to_pure_dict()
+    model = config.model.load(
+        weight_loaders._merge_params(aligned, init_params, missing_regex=".*"),  # noqa: SLF001
+        remove_extra_params=False,
+    )
     model.eval()
 
     result = model.v33_endpoint_gradient_step(observation, gate_override=options.gate_override)
@@ -114,10 +125,15 @@ def main(options: Options):
         sample = {**book, "valid_steps": t_valid, "g_tau": grad[i, :t_valid].tolist(), "phase_stats": {}}
         for name, mask in phases.items():
             g = grad[i, :t_valid][mask]
-            sample["phase_stats"][name] = {"steps": int(mask.sum()), "mean": float(g.mean()) if len(g) else 0.0,
-                                           "max": float(g.max()) if len(g) else 0.0}
-            print(f"{i:>6} {name:>12} {int(mask.sum()):>6} "
-                  f"{sample['phase_stats'][name]['mean']:>12.3e} {sample['phase_stats'][name]['max']:>12.3e}")
+            sample["phase_stats"][name] = {
+                "steps": int(mask.sum()),
+                "mean": float(g.mean()) if len(g) else 0.0,
+                "max": float(g.max()) if len(g) else 0.0,
+            }
+            print(
+                f"{i:>6} {name:>12} {int(mask.sum()):>6} "
+                f"{sample['phase_stats'][name]['mean']:>12.3e} {sample['phase_stats'][name]['max']:>12.3e}"
+            )
         report["samples"].append(sample)
 
     evidence_max = max(s["phase_stats"]["evidence"]["max"] for s in report["samples"])
@@ -126,8 +142,10 @@ def main(options: Options):
     report["endpoint_is_zero"] = endpoint_zero  # causal order sanity: the endpoint's own write gets no gradient
     verdict = "PASS" if evidence_max > 0 else "FAIL"
     print(f"\nendpoint g == 0 (causal-order sanity): {endpoint_zero}")
-    print(f"evidence-phase max g_tau: {evidence_max:.3e} -> {verdict}: "
-          f"{'the waiting CE reaches the evidence-phase writes' if evidence_max > 0 else 'NO credit reaches the evidence phase'}")
+    print(
+        f"evidence-phase max g_tau: {evidence_max:.3e} -> {verdict}: "
+        f"{'the waiting CE reaches the evidence-phase writes' if evidence_max > 0 else 'NO credit reaches the evidence phase'}"
+    )
 
     options.output_dir.mkdir(parents=True, exist_ok=True)
     out = options.output_dir / "gradient_flow.json"
