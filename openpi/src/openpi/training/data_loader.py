@@ -194,11 +194,19 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
+    if data_config.prompt_from_episode_meta:
+        prompts = _load_episode_prompts(dataset)
+        if prompts is None:
+            raise ValueError(
+                f"prompt_from_episode_meta is set but {data_config.repo_id} has no meta/episode_prompts.json."
+            )
+        dataset = TransformedDataset(dataset, [_transforms.InjectPromptFromEpisode(prompts)])
+
     if data_config.subtask_from_task and not use_memory:
         dataset = TransformedDataset(dataset, [_transforms.SubtaskFromLeRobotTask(dataset_meta.tasks)])
 
     if use_memory:
-        info = _episode_info_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
+        info = _episode_info_table(dataset, dataset_meta, data_config)
         quiz = getattr(model_config, "memory_probe_weight", 0) > 0 or getattr(
             model_config, "memory_probe_diagnostic", False
         )
@@ -219,6 +227,7 @@ def create_torch_dataset(
                 episode_side=info["side"] if quiz else None,
                 episode_reveal=info["reveal"] if quiz else None,
                 episode_close=info["close"] if quiz else None,
+                episode_memory_window=_memory_critical_windows(info, data_config),
             )
         )
         dataset = TransformedDataset(dataset, seq_transforms)
@@ -240,8 +249,27 @@ def _unwrap_lerobot(dataset: Dataset) -> lerobot_dataset.LeRobotDataset | None:
     return inner if isinstance(inner, lerobot_dataset.LeRobotDataset) else None
 
 
+def _load_episode_prompts(dataset: Dataset) -> tuple[str, ...] | None:
+    """Per-episode instructions from the dataset's meta/episode_prompts.json, or None.
+
+    The sidecar ({"<episode_index>": "<instruction>"}) is written by the converter for
+    multi-task datasets. Episodes without an entry get "" (InjectPromptFromEpisode then lets
+    `default_prompt` fill them).
+    """
+    inner = _unwrap_lerobot(dataset)
+    if inner is None:
+        return None
+    path = pathlib.Path(inner.root) / "meta" / "episode_prompts.json"
+    if not path.exists():
+        return None
+    entries = {int(k): str(v) for k, v in json.loads(path.read_text()).items()}
+    prompts = tuple(entries.get(e, "") for e in range(max(entries) + 1))
+    logging.info(f"episode prompts: {len(entries)} entries, {len(set(entries.values()))} distinct instructions")
+    return prompts
+
+
 def _episode_info_table(
-    dataset: Dataset, dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, reveal_frames_path: str | None
+    dataset: Dataset, dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, data_config: "_config.DataConfig"
 ) -> dict[str, np.ndarray]:
     """Per-episode metadata for memory sequence training:
     * "length": frames in the episode;
@@ -250,7 +278,11 @@ def _episode_info_table(
     * "side": the answer class from the FINAL subtask label ("open left bin" -> 0,
       "open right bin" -> 1, otherwise -1 = never quizzed);
     * "reveal"/"close": when the answer becomes visible / hidden again, from the optional
-      json ({"<episode_index>": reveal | [reveal, close]}), defaults otherwise.
+      json ({"<episode_index>": reveal | [reveal, close]}), defaults otherwise;
+    * label-derived phase bounds (all -1 when the episode lacks a phase, only computed when
+      the config names the vocabularies): "evidence_start"/"evidence_end" (first/last frame
+      whose label is in `evidence_subtasks`) and "memory_lo"/"memory_hi" (first/last frame
+      whose label is in `memory_required_subtasks`).
     """
     cols = _unwrap_lerobot(dataset).hf_dataset.with_format(None)
     task = np.asarray(cols["task_index"], dtype=np.int64)
@@ -279,6 +311,7 @@ def _episode_info_table(
     reveal = np.full(num_episodes, _DEFAULT_REVEAL_FRAME, dtype=np.int32)
     close = reveal + _DEFAULT_VISIBLE_SPAN
     labeled = 0
+    reveal_frames_path = data_config.memory_reveal_frames_path
     if reveal_frames_path is not None and pathlib.Path(reveal_frames_path).exists():
         for key, value in json.loads(pathlib.Path(reveal_frames_path).read_text()).items():
             e = int(key)
@@ -291,7 +324,7 @@ def _episode_info_table(
         f"{int((side >= 0).sum())} sided ({int((side == 0).sum())}L/{int((side == 1).sum())}R), "
         f"reveal frames: {labeled} from json, {num_episodes - labeled} at default {_DEFAULT_REVEAL_FRAME}"
     )
-    return {
+    info = {
         "length": length,
         "switch": switch,
         "side": side,
@@ -299,6 +332,51 @@ def _episode_info_table(
         "close": close,
         "episode_tasks": episode_tasks,
     }
+
+    if data_config.memory_required_subtasks and data_config.evidence_subtasks:
+        memory_ids = [i for i, s in dataset_meta.tasks.items() if s in data_config.memory_required_subtasks]
+        evidence_ids = [i for i, s in dataset_meta.tasks.items() if s in data_config.evidence_subtasks]
+        if not memory_ids or not evidence_ids:
+            raise ValueError(
+                f"none of memory_required_subtasks={data_config.memory_required_subtasks} or "
+                f"evidence_subtasks={data_config.evidence_subtasks} match the dataset's task strings."
+            )
+        bounds = {k: np.full(num_episodes, -1, dtype=np.int32) for k in
+                  ("evidence_start", "evidence_end", "memory_lo", "memory_hi")}
+        for e in range(num_episodes):
+            for name, ids in (("evidence", evidence_ids), ("memory", memory_ids)):
+                hit = np.nonzero(np.isin(episode_tasks[e], ids))[0]
+                if len(hit) > 0:
+                    lo_key = "evidence_start" if name == "evidence" else "memory_lo"
+                    hi_key = "evidence_end" if name == "evidence" else "memory_hi"
+                    bounds[lo_key][e] = int(hit[0])
+                    bounds[hi_key][e] = int(hit[-1])
+        usable = (
+            (bounds["evidence_start"] >= 0)
+            & (bounds["memory_lo"] >= 0)
+            & (bounds["evidence_end"] < bounds["memory_lo"])
+        )
+        for key, value in bounds.items():
+            info[key] = np.where(usable, value, -1).astype(np.int32)
+        if not usable.all():
+            logging.warning(
+                f"memory-critical phases missing/malformed in {int((~usable).sum())}/{num_episodes} "
+                "episodes; they are excluded from the memory-critical branch."
+            )
+    return info
+
+
+def _memory_critical_windows(info: dict[str, np.ndarray], data_config: "_config.DataConfig") -> np.ndarray | None:
+    """[num_episodes, 4] int32 rows [start_lo, start_hi, memory_lo, memory_hi] for the
+    memory-critical branch (see BuildMemorySequence), or None when phases are not configured.
+    Rows of -1 disable the branch for that episode."""
+    if "evidence_start" not in info:
+        return None
+    evidence_start = info["evidence_start"]
+    start_lo = np.maximum(1, evidence_start - data_config.memory_critical_start_pad)
+    window = np.stack([start_lo, evidence_start, info["memory_lo"], info["memory_hi"]], axis=1)
+    window[evidence_start < 0] = -1
+    return window.astype(np.int32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,41 +393,81 @@ def _sequence_sampling_info(
 ) -> _SequenceSamplingInfo | None:
     """Per-frame weights over sequence START frames (memory sequence training).
 
-    A sample is either a FULL trajectory (start = frame 0 of an episode, probability
-    1 - memory_slice_prob) or a random contiguous SLICE (any other allowed start frame). Slice
-    starts must leave at least memory_min_slice_steps steps before the episode end and may not
-    fall in the dead zone between the reveal and the decision switch: a memory starting blank
-    there never saw the answer, yet the choice labels would still demand it -- grading that
-    teaches guessing.
+    A sample is a FULL trajectory (start = frame 0), a random contiguous SLICE, or -- when the
+    config provides the label-derived phases -- a MEMORY-CRITICAL sample (start shortly before
+    the evidence phase; BuildMemorySequence truncates it inside the memory-required phase).
+    Branch masses: memory_critical_prob for the memory-critical branch, the rest split by
+    memory_slice_prob as before. Slice starts must leave at least memory_min_slice_steps steps
+    before the episode end and may not fall in the dead zone where a blank memory never saw
+    the answer yet the labels ahead still demand it -- grading that teaches guessing. With
+    phases the dead zone is (evidence_end, memory_hi]; without, the legacy (reveal, switch)
+    rule applies. Memory-critical mass is balanced equally over (instruction, side) cells so
+    no task or side dominates the waiting supervision.
     """
     inner = _unwrap_lerobot(dataset)
     if inner is None:
         return None
-    info = _episode_info_table(dataset, dataset_meta, data_config.memory_reveal_frames_path)
+    info = _episode_info_table(dataset, dataset_meta, data_config)
     cols = inner.hf_dataset.with_format(None)
     episode = np.asarray(cols["episode_index"], dtype=np.int64)
     starts = np.nonzero(np.append(True, episode[1:] != episode[:-1]))[0]
     frame = np.arange(len(episode)) - starts[np.searchsorted(starts, np.arange(len(episode)), side="right") - 1]
 
+    stride = data_config.memory_stride_frames
     length = info["length"][episode]
-    reveal = info["reveal"][episode]
-    switch = info["switch"][episode]
-    min_frames = data_config.memory_min_slice_steps * data_config.memory_stride_frames
-    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~((frame > reveal) & (frame < switch))
+    valid_steps = np.minimum((length - frame + stride - 1) // stride, max_steps).astype(np.int32)
+
+    phases = "evidence_start" in info
+    window = _memory_critical_windows(info, data_config)
+    if phases:
+        usable = info["evidence_start"][episode] >= 0
+        memory_lo = info["memory_lo"][episode]
+        memory_hi = info["memory_hi"][episode]
+        dead = usable & (frame > info["evidence_end"][episode]) & (frame <= memory_hi)
+        in_window = usable & (frame >= window[:, 0][episode]) & (frame <= window[:, 1][episode])
+        # the whole memory-required phase must be reachable within the sequence budget
+        mc_ok = in_window & (memory_lo - frame <= (max_steps - 1) * stride)
+        # memory-critical starts get a conservative bucket: steps up to the latest endpoint
+        cap = np.minimum(memory_hi, frame + (max_steps - 1) * stride)
+        valid_steps = np.where(mc_ok, ((cap - frame) // stride + 1).astype(np.int32), valid_steps)
+    else:
+        dead = (frame > info["reveal"][episode]) & (frame < info["switch"][episode])
+        mc_ok = np.zeros(len(episode), dtype=bool)
+
+    mc_prob = data_config.memory_critical_prob if int(mc_ok.sum()) > 0 else 0.0
+    if data_config.memory_critical_prob > 0 and mc_prob == 0.0:
+        logging.warning("memory_critical_prob > 0 but no eligible memory-critical starts; branch disabled.")
+
+    min_frames = data_config.memory_min_slice_steps * stride
+    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~dead & ~mc_ok
 
     slice_prob = data_config.memory_slice_prob
     weights = np.zeros(len(episode), dtype=np.float64)
     n_full = int((frame == 0).sum())
-    weights[frame == 0] = (1.0 - slice_prob) / max(n_full, 1)
+    weights[frame == 0] = (1.0 - mc_prob) * (1.0 - slice_prob) / max(n_full, 1)
     if slice_prob > 0 and int(slice_ok.sum()) > 0:
-        weights[slice_ok] = slice_prob / int(slice_ok.sum())
+        weights[slice_ok] = (1.0 - mc_prob) * slice_prob / int(slice_ok.sum())
+
+    n_cells = 0
+    if mc_prob > 0:
+        prompts = _load_episode_prompts(dataset) or ()
+        mc_episodes = np.unique(episode[mc_ok])
+        cells: dict[tuple[str, int], list[int]] = {}
+        for e in mc_episodes:
+            key = (prompts[e] if e < len(prompts) else "", int(info["side"][e]))
+            cells.setdefault(key, []).append(int(e))
+        n_cells = len(cells)
+        for members in cells.values():
+            for e in members:
+                idx = np.nonzero(mc_ok & (episode == e))[0]
+                weights[idx] = mc_prob / n_cells / len(members) / len(idx)
+
     logging.info(
-        f"sequence sampling: {n_full} full-trajectory starts (p={1 - slice_prob:g}), "
-        f"{int(slice_ok.sum())} slice starts (p={slice_prob:g}), "
-        f"{int((~slice_ok & (frame > 0)).sum())} frames excluded (dead zone / too close to end)"
+        f"sequence sampling: {n_full} full starts (p={(1 - mc_prob) * (1 - slice_prob):.3g}), "
+        f"{int(slice_ok.sum())} slice starts (p={(1 - mc_prob) * slice_prob:.3g}), "
+        f"{int(mc_ok.sum())} memory-critical starts (p={mc_prob:g}, {n_cells} balance cells), "
+        f"{int((~slice_ok & ~mc_ok & (frame > 0)).sum())} frames excluded (dead zone / too close to end)"
     )
-    stride = data_config.memory_stride_frames
-    valid_steps = np.minimum((length - frame + stride - 1) // stride, max_steps).astype(np.int32)
     return _SequenceSamplingInfo(weights=weights, valid_steps=valid_steps)
 
 

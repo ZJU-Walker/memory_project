@@ -112,6 +112,25 @@ class InjectDefaultPrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class InjectPromptFromEpisode(DataTransformFn):
+    """Injects each raw item's per-episode high-level prompt (multi-task datasets).
+
+    Runs on raw LeRobot items (needs "episode_index"). `episode_prompts` is indexed by
+    episode. A dataset opting into per-episode prompts must cover every episode -- a missing
+    or empty entry is a data bug, not a fallback case.
+    """
+
+    episode_prompts: tuple[str, ...]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        episode = int(np.asarray(data["episode_index"]).item())
+        prompt = self.episode_prompts[episode] if episode < len(self.episode_prompts) else ""
+        if not prompt:
+            raise ValueError(f"episode {episode} has no entry in meta/episode_prompts.json.")
+        return {**data, "prompt": np.asarray(prompt)}
+
+
+@dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
@@ -330,13 +349,18 @@ def _as_uint8_hwc(image: np.ndarray) -> np.ndarray:
 class MemoryEpisodeInfo(DataTransformFn):
     """Attaches per-episode metadata to each raw LeRobot item (before repack, while
     "episode_index" is still present): "episode_length" always, plus the quiz supervision
-    ("quiz_side" / "reveal_frame" / "close_frame") when the side labels are provided. Consumed
-    by BuildMemorySequence. Built by `data_loader._episode_info_table`."""
+    ("quiz_side" / "reveal_frame" / "close_frame") when the side labels are provided, plus the
+    memory-critical window ("memory_window" = [start_lo, start_hi, memory_lo, memory_hi], all
+    -1 when the episode has no usable phases) when phase tables are provided. Consumed by
+    BuildMemorySequence. Built by `data_loader._episode_info_table`."""
 
     episode_length: np.ndarray
     episode_side: np.ndarray | None = None
     episode_reveal: np.ndarray | None = None
     episode_close: np.ndarray | None = None
+    # [num_episodes, 4] int32: memory-critical start window [lo, hi] and the memory-required
+    # phase [memory_lo, memory_hi] (frames, inclusive); a row of -1 disables the branch.
+    episode_memory_window: np.ndarray | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         episode = int(np.asarray(data["episode_index"]).item())
@@ -345,6 +369,8 @@ class MemoryEpisodeInfo(DataTransformFn):
             out["quiz_side"] = np.int32(self.episode_side[episode])
             out["reveal_frame"] = np.int32(self.episode_reveal[episode])
             out["close_frame"] = np.int32(self.episode_close[episode])
+        if self.episode_memory_window is not None:
+            out["memory_window"] = self.episode_memory_window[episode].astype(np.int32)
         return out
 
 
@@ -384,8 +410,17 @@ class BuildMemorySequence(DataTransformFn):
       * reshapes actions to [T, action_horizon, dim],
       * emits "seq_step_mask" (False for steps past the episode end -- lerobot pads by
         repeating the last frame; those steps are loss-masked and their writes are no-ops),
+      * MEMORY-CRITICAL samples (start inside the episode's "memory_window", attached by
+        MemoryEpisodeInfo): additionally truncates the mask at a per-draw random step whose
+        observation still lies in the memory-required (waiting) phase, so the endpoint's
+        subtask CE can only be solved from memory; the endpoint avoids the last
+        `subtask_lookahead` waiting frames so its (lookahead-shifted) target stays a
+        memory-required label,
       * emits "seq_block_boundary": the gradient-block fence, True every `block_steps` steps
-        with a fresh random shift per sample (never at step 0),
+        with a fresh random shift per sample (never at step 0). Memory-critical samples get NO
+        fence: their entire point is end-to-end credit from the waiting-endpoint CE back to
+        the evidence-phase writes, and at <= ~27 valid steps their differentiated chain is no
+        longer than a normal sample's 25-step block anyway,
       * emits the per-step quiz supervision when the quiz metadata is present: quizzable =
         a real step at/after the reveal frame AND the reveal happened inside this sequence
         (a slice starting after the reveal never wrote it, so quizzing would teach guessing).
@@ -397,6 +432,7 @@ class BuildMemorySequence(DataTransformFn):
     stride: int
     action_horizon: int
     block_steps: int
+    subtask_lookahead: int = 0
 
     def __call__(self, data: DataDict) -> DataDict:
         if "frame_index" not in data:
@@ -404,6 +440,7 @@ class BuildMemorySequence(DataTransformFn):
         frame_index = int(np.asarray(data.pop("frame_index")).item())
         data.pop("index", None)
         episode_length = int(np.asarray(data.pop("episode_length")).item())
+        window = np.asarray(data.pop("memory_window")) if "memory_window" in data else None
 
         for key in ("observation/image", "observation/left_wrist_image", "observation/right_wrist_image"):
             data[key] = np.stack([_as_uint8_hwc(frame) for frame in np.asarray(data[key])])
@@ -417,8 +454,24 @@ class BuildMemorySequence(DataTransformFn):
         step_frames = frame_index + np.arange(num_steps) * self.stride
         data["seq_step_mask"] = step_frames < episode_length
 
+        memory_critical = window is not None and window[0] >= 0 and window[0] <= frame_index <= window[1]
+        if memory_critical:
+            memory_lo, memory_hi = int(window[2]), int(window[3])
+            in_wait = (step_frames >= memory_lo) & (step_frames <= memory_hi)
+            eligible = in_wait & (step_frames <= memory_hi - self.subtask_lookahead)
+            if not eligible.any():
+                eligible = in_wait  # waiting phase shorter than the lookahead
+            if not eligible.any():
+                # The stride grid straddles a very short waiting phase entirely. End at the
+                # last step before it: the observation is still neutral (close/reset) and its
+                # lookahead-shifted target is already a memory-required label.
+                eligible = np.zeros(num_steps, dtype=bool)
+                eligible[np.nonzero(step_frames < memory_lo)[0][-1]] = True
+            t_q = np.random.choice(np.nonzero(eligible)[0])
+            data["seq_step_mask"] = data["seq_step_mask"] & (np.arange(num_steps) <= t_q)
+
         boundary = np.zeros(num_steps, dtype=bool)
-        if self.block_steps > 0:
+        if self.block_steps > 0 and not memory_critical:
             shift = np.random.randint(self.block_steps)
             boundary = (np.arange(num_steps) > 0) & ((np.arange(num_steps) - shift) % self.block_steps == 0)
         data["seq_block_boundary"] = boundary

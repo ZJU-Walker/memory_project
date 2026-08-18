@@ -21,12 +21,22 @@ We build:
     image / left_wrist_image / right_wrist_image = top / left / right cameras
 
 The per-frame LeRobot `task` field carries the *subtask* (stored as task_index + meta/tasks.jsonl).
-The constant high-level prompt is injected at training time (InjectDefaultPrompt), not stored here.
+The high-level prompt is NOT stored per frame: single-source datasets get a constant prompt at
+training time (InjectDefaultPrompt); multi-source datasets store one instruction per episode in
+a `meta/episode_prompts.json` sidecar ({"<episode_index>": "<instruction>"}), read at training
+time by the data loader when `prompt_from_episode_meta` is set.
 Demos without a complete subtask_labels.json are skipped.
 
-Usage:
+Usage (single source, constant prompt injected at training time):
     uv run examples/yam/convert_yam_data_to_lerobot.py \
         --data_dir /iris/u/kewalk/memory_project/data/bin_memory_banana
+
+Usage (multiple sources with per-source instructions, one combined dataset):
+    uv run examples/yam/convert_yam_data_to_lerobot.py \
+        --data_dirs /iris/u/kewalk/memory_project/data/0816_banana \
+                    /iris/u/kewalk/memory_project/data/0816_grey_box \
+        --instructions "find the banana" "find the grey pepper box" \
+        --repo_name yam/bin_memory_0816_subtask
 
 The resulting dataset is written to $HF_LEROBOT_HOME/<REPO_NAME>.
 """
@@ -88,10 +98,21 @@ def _load_frame_subtasks(demo: pathlib.Path, num_frames: int) -> list[str] | Non
 def main(
     data_dir: str = "/iris/u/kewalk/memory_project/data/bin_memory_banana",
     *,
+    data_dirs: list[str] | None = None,
+    instructions: list[str] | None = None,
     repo_name: str = REPO_NAME,
     push_to_hub: bool = False,
 ):
-    data_path = pathlib.Path(data_dir)
+    """Convert one or more raw demo folders into a single LeRobot dataset.
+
+    `data_dirs` (with optional matching `instructions`) overrides `data_dir`. Sources are
+    converted in the given order, so episode indices are contiguous per source. When
+    `instructions` is provided, meta/episode_prompts.json records each episode's high-level
+    instruction for per-episode prompt injection at training time.
+    """
+    source_paths = [pathlib.Path(d) for d in (data_dirs if data_dirs else [data_dir])]
+    if instructions is not None and len(instructions) != len(source_paths):
+        raise ValueError(f"got {len(instructions)} instructions for {len(source_paths)} data dirs.")
 
     # Clean up any existing dataset in the output directory.
     output_path = HF_LEROBOT_HOME / repo_name
@@ -133,53 +154,62 @@ def main(
         image_writer_processes=5,
     )
 
-    demo_dirs = sorted(
-        (p for p in data_path.iterdir() if p.is_dir() and p.name.startswith("demo")),
-        key=_natural_demo_key,
-    )
-    print(f"Found {len(demo_dirs)} demos in {data_path}")
+    episode_prompts: dict[str, str] = {}
+    for source_index, data_path in enumerate(source_paths):
+        demo_dirs = sorted(
+            (p for p in data_path.iterdir() if p.is_dir() and p.name.startswith("demo")),
+            key=_natural_demo_key,
+        )
+        print(f"Found {len(demo_dirs)} demos in {data_path}")
 
-    for demo in demo_dirs:
-        if not (demo / "subtask_labels.json").exists():
-            print(f"  skipping {demo.name}: no subtask_labels.json")
-            continue
+        for demo in demo_dirs:
+            if not (demo / "subtask_labels.json").exists():
+                print(f"  skipping {demo.name}: no subtask_labels.json")
+                continue
 
-        left_jp = np.load(demo / "left_joint_positions.npy")
-        right_jp = np.load(demo / "right_joint_positions.npy")
-        left_ctl = np.load(demo / "left_control.npy")
-        right_ctl = np.load(demo / "right_control.npy")
+            left_jp = np.load(demo / "left_joint_positions.npy")
+            right_jp = np.load(demo / "right_joint_positions.npy")
+            left_ctl = np.load(demo / "left_control.npy")
+            right_ctl = np.load(demo / "right_control.npy")
 
-        state = np.concatenate([left_jp, right_jp], axis=1).astype(np.float32)  # (T, 14)
-        actions = np.concatenate([left_ctl, right_ctl], axis=1).astype(np.float32)  # (T, 14)
+            state = np.concatenate([left_jp, right_jp], axis=1).astype(np.float32)  # (T, 14)
+            actions = np.concatenate([left_ctl, right_ctl], axis=1).astype(np.float32)  # (T, 14)
 
-        top = _read_video_frames(demo / "top_camera_rgb.mp4")
-        left = _read_video_frames(demo / "left_camera_rgb.mp4")
-        right = _read_video_frames(demo / "right_camera_rgb.mp4")
+            top = _read_video_frames(demo / "top_camera_rgb.mp4")
+            left = _read_video_frames(demo / "left_camera_rgb.mp4")
+            right = _read_video_frames(demo / "right_camera_rgb.mp4")
 
-        # Guard against off-by-one between proprio and video frame counts.
-        num_frames = min(len(state), len(actions), len(top), len(left), len(right))
-        if num_frames == 0:
-            print(f"  skipping {demo.name}: no frames")
-            continue
+            # Guard against off-by-one between proprio and video frame counts.
+            num_frames = min(len(state), len(actions), len(top), len(left), len(right))
+            if num_frames == 0:
+                print(f"  skipping {demo.name}: no frames")
+                continue
 
-        subtasks = _load_frame_subtasks(demo, num_frames)
-        if subtasks is None:
-            print(f"  skipping {demo.name}: incomplete subtask_labels.json")
-            continue
-        print(f"  {demo.name}: {num_frames} frames, {len(set(subtasks))} subtasks")
+            subtasks = _load_frame_subtasks(demo, num_frames)
+            if subtasks is None:
+                print(f"  skipping {demo.name}: incomplete subtask_labels.json")
+                continue
+            print(f"  {demo.name}: {num_frames} frames, {len(set(subtasks))} subtasks", flush=True)
 
-        for t in range(num_frames):
-            dataset.add_frame(
-                {
-                    "image": top[t],
-                    "left_wrist_image": left[t],
-                    "right_wrist_image": right[t],
-                    "state": state[t],
-                    "actions": actions[t],
-                    "task": subtasks[t],
-                }
-            )
-        dataset.save_episode()
+            for t in range(num_frames):
+                dataset.add_frame(
+                    {
+                        "image": top[t],
+                        "left_wrist_image": left[t],
+                        "right_wrist_image": right[t],
+                        "state": state[t],
+                        "actions": actions[t],
+                        "task": subtasks[t],
+                    }
+                )
+            if instructions is not None:
+                episode_prompts[str(dataset.num_episodes)] = instructions[source_index]
+            dataset.save_episode()
+
+    if instructions is not None:
+        prompts_file = output_path / "meta" / "episode_prompts.json"
+        prompts_file.write_text(json.dumps(episode_prompts, indent=2))
+        print(f"wrote {len(episode_prompts)} episode prompts to {prompts_file}")
 
     if push_to_hub:
         dataset.push_to_hub(

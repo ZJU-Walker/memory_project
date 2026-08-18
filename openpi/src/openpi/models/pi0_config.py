@@ -96,6 +96,11 @@ class Pi0Config(_model.BaseModelConfig):
     # through, only its gradient is detached -- RoboTTT's TBPTT). 0 or >= memory_seq_steps
     # means never cut.
     memory_block_steps: int = 0
+    # v3.3: condition the 16 write queries on the layer-8 hidden states of the non-image
+    # (instruction + state) prefix tokens through a zero-init cross-attention residual, so the
+    # writer can select task-relevant content ("given my task, what is worth remembering?").
+    # Zero-init means an initialized v3.3 model computes exactly the unconditioned v3.2 write.
+    memory_task_conditioned_write: bool = False
     # Legacy weight for the old probe-training objective. The main v3/v3.1 recipes keep this at
     # zero: the probe must not train the VLM, policy, memory, or its own head through the main
     # optimizer. The field remains loadable so older experiment configs are still understood.
@@ -141,6 +146,8 @@ class Pi0Config(_model.BaseModelConfig):
                     raise ValueError("query_compressed writes require the v3.2 architecture.")
             else:
                 raise ValueError(f"unsupported memory_architecture: {self.memory_architecture!r}.")
+            if self.memory_task_conditioned_write and self.memory_architecture != "v32_layer8_dual_query":
+                raise ValueError("memory_task_conditioned_write requires the v3.2 dual-query architecture.")
             if self.memory_seq_steps < 1:
                 raise ValueError("memory_seq_steps must be >= 1.")
             if self.memory_block_steps < 0:

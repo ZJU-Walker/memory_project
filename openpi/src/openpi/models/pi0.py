@@ -126,11 +126,22 @@ class MemoryQueryCompressor(nnx.Module):
         self.value_proj = linear(rngs=rngs)
         self.output_proj = linear(rngs=rngs)
 
-    def __call__(self, source: at.Float[at.Array, "b n d"]) -> at.Float[at.Array, "b q d"]:
+    def __call__(
+        self,
+        source: at.Float[at.Array, "b n d"],
+        queries: at.Float[at.Array, "b q d"] | None = None,
+    ) -> at.Float[at.Array, "b q d"]:
+        """Compress `source` into `num_queries` slots. `queries` overrides the learned bank
+        (v3.3 task-conditioned writes); None keeps the unconditioned broadcast bank."""
         if source.ndim != 3 or source.shape[-1] != self.width:
             raise ValueError(f"query compressor expects [batch,tokens,{self.width}]; got {source.shape}.")
         batch = source.shape[0]
-        queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
+        if queries is None:
+            queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
+        elif queries.shape != (batch, self.num_queries, self.width):
+            raise ValueError(
+                f"queries must have shape {(batch, self.num_queries, self.width)}; got {queries.shape}."
+            )
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
         v = self.value_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
@@ -139,21 +150,92 @@ class MemoryQueryCompressor(nnx.Module):
         pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
         return self.output_proj(pooled).astype(jnp.float32)
 
-    def attention_probs(self, source: at.Float[at.Array, "b n d"]) -> at.Float[at.Array, "b h q n"]:
+    def attention_probs(
+        self,
+        source: at.Float[at.Array, "b n d"],
+        queries: at.Float[at.Array, "b q d"] | None = None,
+    ) -> at.Float[at.Array, "b h q n"]:
         """Offline diagnostic view of the query->source attention distribution.
 
-        Recomputes exactly the q/k path of :meth:`__call__` and returns the per-head FP32
-        softmax weights before they are cast to the value dtype, so map mass sums to one per
-        query slot regardless of the configured compute dtype.
+        Recomputes exactly the q/k path of :meth:`__call__` (including an optional
+        conditioned query override) and returns the per-head FP32 softmax weights before they
+        are cast to the value dtype, so map mass sums to one per query slot regardless of the
+        configured compute dtype.
         """
         if source.ndim != 3 or source.shape[-1] != self.width:
             raise ValueError(f"query compressor expects [batch,tokens,{self.width}]; got {source.shape}.")
         batch = source.shape[0]
-        queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
+        if queries is None:
+            queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
         logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
         return jax.nn.softmax(logits * self.head_dim**-0.5, axis=-1)
+
+
+class MemoryQueryConditioner(nnx.Module):
+    """Task conditioning for the write query bank (v3.3).
+
+    Cross-attends the learned base write queries to the layer-8 hidden states of the
+    non-image prefix tokens (instruction + state) and adds the result as a residual:
+    ``Q(I) = Q0 + out_proj(Attn(Q0 -> H_ctx))``. The output projection is ZERO-INITIALIZED,
+    so an initialized model writes exactly like the unconditioned v3.2 writer and training
+    opens the pathway only as far as the sequence objective finds it useful -- the same
+    stability discipline as the zero-init memory content gate. Padding positions are masked
+    out of the softmax.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_queries: int,
+        width: int,
+        num_heads: int,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        if num_queries < 1 or num_heads < 1 or width % num_heads:
+            raise ValueError("query count/heads must be positive and heads must divide width.")
+        self.num_queries = num_queries
+        self.width = width
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.compute_dtype = jnp.dtype(compute_dtype)
+        linear = functools.partial(
+            nnx.Linear,
+            width,
+            width,
+            use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
+        )
+        self.query_proj = linear(rngs=rngs)
+        self.key_proj = linear(rngs=rngs)
+        self.value_proj = linear(rngs=rngs)
+        self.output_proj = linear(kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+
+    def __call__(
+        self,
+        base_queries: at.Float[at.Array, "q d"],
+        context: at.Float[at.Array, "b n d"],
+        context_mask: at.Bool[at.Array, "b n"],
+    ) -> at.Float[at.Array, "b q d"]:
+        if base_queries.shape != (self.num_queries, self.width):
+            raise ValueError(f"base queries must have shape {(self.num_queries, self.width)}; got {base_queries.shape}.")
+        if context.ndim != 3 or context.shape[-1] != self.width or context.shape[:2] != context_mask.shape:
+            raise ValueError(f"context/mask mismatch: {context.shape} vs {context_mask.shape}.")
+        batch = context.shape[0]
+        queries = jnp.broadcast_to(base_queries[None], (batch, self.num_queries, self.width))
+        q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
+        k = self.key_proj(context).reshape(batch, context.shape[1], self.num_heads, self.head_dim)
+        v = self.value_proj(context).reshape(batch, context.shape[1], self.num_heads, self.head_dim)
+        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
+        logits = jnp.where(context_mask[:, None, None, :], logits * self.head_dim**-0.5, -1e30)
+        probs = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
+        pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
+        # an all-padding context (never the case in practice) must not leak the uniform softmax
+        any_valid = jnp.any(context_mask, axis=-1).astype(jnp.float32)[:, None, None]
+        return queries.astype(jnp.float32) + self.output_proj(pooled).astype(jnp.float32) * any_valid
 
 
 class Pi0(_model.BaseModel):
@@ -217,6 +299,7 @@ class Pi0(_model.BaseModel):
             # is disabled. Existing probe-trained v3/v3.1 checkpoints therefore remain strictly
             # loadable; clean no-probe recipes explicitly mask its optimizer updates.
             self.probe_head = nnx.Linear(config.memory.d_value, config.memory_probe_classes, rngs=rngs)
+            self.memory_task_conditioned_write = config.memory_task_conditioned_write
             if config.memory_architecture == "v32_layer8_dual_query":
                 self.read_query_compressor = MemoryQueryCompressor(
                     num_queries=config.memory_query_tokens,
@@ -232,6 +315,14 @@ class Pi0(_model.BaseModel):
                     compute_dtype=jnp.dtype(config.dtype),
                     rngs=rngs,
                 )
+                if config.memory_task_conditioned_write:
+                    self.write_query_conditioner = MemoryQueryConditioner(
+                        num_queries=config.memory_query_tokens,
+                        width=paligemma_config.width,
+                        num_heads=config.memory_query_heads,
+                        compute_dtype=jnp.dtype(config.dtype),
+                        rngs=rngs,
+                    )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -282,8 +373,13 @@ class Pi0(_model.BaseModel):
         *,
         top_token_count: int,
         zero_read: bool = False,
+        gate_value: at.Array | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
-        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once."""
+        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once.
+
+        `gate_value` overrides the learned content gate (diagnostics only, e.g. probing the
+        gradient pathway while the zero-init gate is still closed); None uses the parameter.
+        """
 
         if self.memory_architecture != "v32_layer8_dual_query":
             raise ValueError("the split layer-8 prefix is only defined for v3.2.")
@@ -307,11 +403,22 @@ class Pi0(_model.BaseModel):
         )
         h8_top = h8_all[:, :top_token_count].astype(jnp.float32)
         read_queries = self.read_query_compressor(h8_top)
-        write_tokens = self.write_query_compressor(h8_top)
+        write_queries = None
+        if getattr(self, "memory_task_conditioned_write", False):
+            # Task conditioning (v3.3): the non-image prefix positions carry the tokenized
+            # instruction (and state); their layer-8 hidden states are already computed above.
+            num_img = prefix_len - self.max_token_len
+            write_queries = self.write_query_conditioner(
+                self.write_query_compressor.query_bank.value,
+                h8_all[:, num_img:].astype(jnp.float32),
+                prefix_mask[:, num_img:],
+            )
+        write_tokens = self.write_query_compressor(h8_top, queries=write_queries)
         retrieved = self.memory.read(memory_state, read_queries)
         if zero_read:
             retrieved = jnp.zeros_like(retrieved)
-        memory_tokens = (self.memory_gate.value * retrieved).astype(prefix_tokens.dtype)
+        gate = self.memory_gate.value if gate_value is None else gate_value
+        memory_tokens = (gate * retrieved).astype(prefix_tokens.dtype)
 
         split_tokens = jnp.concatenate([h8_all, memory_tokens], axis=1)
         split_mask = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool)], axis=1)
@@ -334,6 +441,9 @@ class Pi0(_model.BaseModel):
             "final_prefix": final_prefix,
             "h8_top": h8_top,
             "read_queries": read_queries,
+            # None when unconditioned; the conditioned [b, q, d] bank otherwise (diagnostics
+            # must pass it to attention_probs to see the attention the write actually used)
+            "write_queries": write_queries,
             "write_tokens": write_tokens,
             "retrieved": retrieved,
             "prefix_mask": prefix_mask,
@@ -1745,7 +1855,7 @@ class Pi0(_model.BaseModel):
         slot_aux = self.memory.token_write_diagnostics(memory_state, write_tokens)
         return {
             "read_attention": self.read_query_compressor.attention_probs(h8_top),
-            "write_attention": self.write_query_compressor.attention_probs(h8_top),
+            "write_attention": self.write_query_compressor.attention_probs(h8_top, queries=prepared["write_queries"]),
             "read_queries": prepared["read_queries"],
             "write_tokens": write_tokens,
             "retrieved": retrieved,
@@ -1754,6 +1864,111 @@ class Pi0(_model.BaseModel):
             "h8_top_norm": jnp.linalg.norm(h8_top, axis=-1),
             "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (h8_top.shape[0],)),
             **{f"write_slot_{key}": value for key, value in slot_aux.items()},
+        }
+
+    def v33_endpoint_gradient_step(
+        self,
+        observation: _model.Observation,
+        *,
+        gate_override: float | None = None,
+    ) -> dict[str, at.Array]:
+        """The v3.3 gradient-flow check (handoff section 16): does the ENDPOINT's subtask CE
+        reach the write tokens of every earlier step?
+
+        Replays a sequence batch deterministically (no augmentation, no flow loss, no TBPTT
+        fences -- matching memory-critical samples, which carry none) and returns
+        ``g_tau = ||d CE(t_q) / d z_tau^w||`` per step, where t_q is each sample's last valid
+        step. The causal order (read -> predict -> write) implies g_{t_q} = 0 exactly; a
+        working credit path shows nonzero g_tau back through the evidence phase.
+
+        ``gate_override`` replaces the zero-init content gate with a constant for the probe
+        only: at initialization the gate is exactly zero, so the true gradient is trivially
+        zero -- overriding verifies the PATHWAY exists; running without it on a trained
+        checkpoint verifies the realized gradient.
+        """
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("the endpoint gradient probe is only defined for the v3.2/v3.3 interface.")
+        if observation.seq_step_mask is None:
+            raise ValueError("the endpoint gradient probe needs a sequence batch (seq_step_mask present).")
+        b, t = observation.seq_step_mask.shape
+        causal_len = observation.tokenized_causal.shape[-1]
+        mem_len = self.memory_query_tokens
+        gate = None if gate_override is None else jnp.full_like(self.memory_gate.value, gate_override)
+
+        def step_first(x):
+            return jnp.moveaxis(x, 1, 0)
+
+        xs = {
+            "images": {k: step_first(v) for k, v in observation.images.items()},
+            "state": step_first(observation.state),
+            "tokens": step_first(observation.tokenized_prompt),
+            "token_mask": step_first(observation.tokenized_prompt_mask),
+            "causal": step_first(observation.tokenized_causal),
+            "causal_mask": step_first(observation.tokenized_causal_mask),
+            "step_valid": step_first(observation.seq_step_mask),
+        }
+
+        def endpoint_ce(taps):
+            def step(state, x):
+                obs_k = _model.Observation(
+                    images=x["images"],
+                    image_masks={k: jnp.ones(b, dtype=bool) for k in x["images"]},
+                    state=x["state"],
+                    tokenized_prompt=x["tokens"],
+                    tokenized_prompt_mask=x["token_mask"],
+                )
+                prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(obs_k)
+                num_img = prefix_mask.shape[1] - self.max_token_len
+                prefix_len = prefix_mask.shape[1]
+                prepared = self._v32_prepare_memory_prefix(
+                    prefix_tokens,
+                    prefix_mask,
+                    prefix_ar,
+                    state,
+                    top_token_count=num_img // len(x["images"]),
+                    gate_value=gate,
+                )
+                causal_mask_k = x["causal_mask"]
+                causal_emb = self.PaliGemma.llm(x["causal"], method="embed")
+                causal_positions = jnp.broadcast_to(
+                    prefix_len + mem_len + jnp.arange(causal_len)[None], (b, causal_len)
+                )
+                (causal_out, _), _ = self.PaliGemma.llm(
+                    [causal_emb, None],
+                    mask=self._v32_causal_mask(prefix_mask, causal_mask_k),
+                    positions=causal_positions,
+                    kv_cache=prepared["cache"],
+                    cache_position=prefix_len + mem_len,
+                )
+                ce_hidden = jnp.concatenate([prepared["final_prefix"][:, -1:], causal_out[:, :-1]], axis=1)
+                logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
+                token_logp = jnp.take_along_axis(
+                    jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1
+                )[..., 0]
+                ce = -jnp.sum(token_logp * causal_mask_k, axis=-1) / jnp.clip(jnp.sum(causal_mask_k, axis=-1), 1)
+
+                write_tokens = prepared["write_tokens"] + x["tap"]
+                new_state, _ = self.memory.write(state, write_tokens)
+                valid = x["step_valid"]
+                state = jax.tree.map(
+                    lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
+                )
+                return state, ce * valid.astype(jnp.float32)
+
+            _, ce_steps = jax.lax.scan(
+                jax.checkpoint(step, prevent_cse=False), self.memory.init_state(b), {**xs, "tap": taps}
+            )
+            n_valid = jnp.clip(jnp.sum(xs["step_valid"].astype(jnp.int32), axis=0), 1)
+            endpoint = jnp.arange(t)[:, None] == (n_valid - 1)[None, :]
+            return jnp.sum(ce_steps * endpoint), ce_steps
+
+        taps = jnp.zeros((t, b, mem_len, self.memory.config.d_input), dtype=jnp.float32)
+        grads, ce_steps = jax.grad(endpoint_ce, has_aux=True)(taps)
+        return {
+            "write_grad_norm": jnp.moveaxis(jnp.linalg.norm(grads, axis=(-2, -1)), 0, 1),
+            "ce_per_step": jnp.moveaxis(ce_steps, 0, 1),
+            "step_valid": observation.seq_step_mask,
         }
 
     def _sample_with_memory_v32(

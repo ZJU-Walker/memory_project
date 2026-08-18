@@ -121,6 +121,27 @@ class DataConfig:
     # the file use the conservative defaults (see data_loader._episode_info_table). Used for
     # the quiz probes and the slice dead-zone rule.
     memory_reveal_frames_path: str | None = None
+    # If true, read per-episode high-level prompts from the dataset's meta/episode_prompts.json
+    # ({"<episode_index>": "<instruction>"}, written by the converter for multi-task datasets)
+    # and inject each item's episode prompt. `default_prompt` then only fills datasets/items
+    # without an entry.
+    prompt_from_episode_meta: bool = False
+    # Subtask labels (exact strings) marking memory-REQUIRED supervision frames: the current
+    # observation is ambiguous while the correct subtask still depends on earlier observations
+    # (the neutral waiting phase). Together with `evidence_subtasks` this enables the
+    # label-derived episode phase table, the phase-aware slice dead zone, and the
+    # memory-critical sampling branch. Task-specific content lives in the config, never in code.
+    memory_required_subtasks: tuple[str, ...] = ()
+    # Subtask labels marking the evidence phase (the answer is visible in the observation).
+    evidence_subtasks: tuple[str, ...] = ()
+    # Probability that a training sequence is a MEMORY-CRITICAL sample: start drawn shortly
+    # before the evidence phase, sequence truncated at a random step inside the memory-required
+    # phase, so the endpoint's subtask CE can only be solved from memory. The remaining mass is
+    # split between full trajectories and slices by `memory_slice_prob` exactly as before.
+    memory_critical_prob: float = 0.0
+    # Memory-critical starts are drawn uniformly from this many frames before the evidence
+    # phase (memory is blank shortly before the answer becomes visible).
+    memory_critical_start_pad: int = 75
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -440,6 +461,8 @@ class LeRobotYamDataConfig(DataConfigFactory):
         }
         if base_config.subtask_from_task:
             structure["subtask"] = "subtask"
+        if base_config.prompt_from_episode_meta:
+            structure["prompt"] = "prompt"
         use_quiz = use_memory and (
             getattr(model_config, "memory_probe_weight", 0) > 0
             or getattr(model_config, "memory_probe_diagnostic", False)
@@ -449,6 +472,8 @@ class LeRobotYamDataConfig(DataConfigFactory):
             structure["frame_index"] = "frame_index"
             structure["index"] = "index"
             structure["episode_length"] = "episode_length"
+            if base_config.memory_required_subtasks and base_config.evidence_subtasks:
+                structure["memory_window"] = "memory_window"
         if use_quiz:
             structure.update({key: key for key in ("quiz_side", "reveal_frame", "close_frame")})
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(structure)])
@@ -461,6 +486,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
                     stride=base_config.memory_stride_frames,
                     action_horizon=model_config.action_horizon,
                     block_steps=model_config.memory_block_steps,
+                    subtask_lookahead=base_config.subtask_lookahead,
                 ),
             )
         data_transforms = _transforms.Group(inputs=input_transforms, outputs=[yam_policy.YamOutputs()])
@@ -1303,6 +1329,116 @@ _CONFIGS = [
         weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         # Keep finer-grained v3.2 recovery/evaluation points.
+        save_interval=250,
+        num_workers=12,
+    ),
+    TrainConfig(
+        # Plain (memory-free) pi05 fine-tune config for the two-task 0816 dataset (30 banana +
+        # 30 grey-box episodes, per-episode instructions from meta/episode_prompts.json, 5-phase
+        # subtask labels). Primarily used to compute the norm stats consumed by
+        # pi05_yam_mem_v33; also a shortcut-baseline recipe.
+        name="pi05_yam_0816",
+        model=pi0_config.Pi0Config(pi05=True, predict_subtask=True),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_0816_subtask",
+            base_config=DataConfig(
+                prompt_from_episode_meta=True,
+                subtask_from_task=True,
+                subtask_lookahead=15,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        # 53k frames x 3 PNG decodes each: norm stats and the token audit need real parallelism.
+        num_workers=12,
+    ),
+    TrainConfig(
+        # v3.3: the v3.2 dual-query interface plus (a) task-conditioned write queries -- the 16
+        # learned write queries are shifted by a zero-init cross-attention over the layer-8
+        # hidden states of the instruction/state tokens, so the writer can select task-relevant
+        # content -- and (b) memory-critical sampling on the two-task 0816 dataset: half of all
+        # sequences start shortly before `inspect both bins` and are truncated at a random step
+        # inside the neutral waiting phase, where the endpoint's subtask CE (wait; target bin
+        # is left/right) can only be solved from memory (arms reset, bins closed, no
+        # side-specific motion yet). Memory-critical samples carry no TBPTT fence, so the
+        # waiting-endpoint CE backpropagates through every recurrent write back to the evidence
+        # phase; normal samples keep the 25-step blocks. Fresh from official pi05_base -- never
+        # resume a v3/v3.1/v3.2 checkpoint.
+        name="pi05_yam_mem_v33",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            # scripts/v33_audit_token_lengths.py over all 53,593 frames of the converted 0816
+            # dataset: maximum context length 68 (the new prompts are shorter than v3.2's even
+            # with the longer state strings). Eighty keeps twelve spare positions and v3.2's
+            # static shapes.
+            max_token_len=80,
+            memory_layer=8,
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            memory_query_heads=8,
+            memory_task_conditioned_write=True,
+            # Same audit: maximum causal length (subtask + FAST actions) 122 -- the longer
+            # 5-phase label strings are offset by slightly shorter FAST encodings. 128 keeps
+            # six spare positions and matches v3.2's static shapes.
+            causal_token_len=128,
+            bf16_vocab_projection=True,
+            simulated_delay=6,
+            memory_seq_steps=40,
+            memory_block_steps=25,
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
+            memory_probe_classes=2,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_0816_subtask",
+            # Per-episode instructions ("find the banana" / "find the grey pepper box") come
+            # from the dataset's meta/episode_prompts.json; there is no constant prompt.
+            base_config=DataConfig(
+                prompt_from_episode_meta=True,
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=15,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=14,
+                memory_sequence_buckets=(14, 27, 40),
+                # Label-derived phases replace the reveal-frames json: the labels themselves
+                # say when the answer is visible and when memory is required.
+                evidence_subtasks=("inspect both bins",),
+                memory_required_subtasks=(
+                    "wait; target bin is left",
+                    "wait; target bin is right",
+                ),
+                memory_critical_prob=0.5,
+                memory_critical_start_pad=75,
+            ),
+            assets=AssetsConfig(assets_dir="./assets/pi05_yam_0816"),
+        ),
+        # Only the Titans write gates stay frozen at their measured stable operating point.
+        freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
+        batch_size=12,
+        gradient_accumulation_steps=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
         save_interval=250,
         num_workers=12,
     ),
