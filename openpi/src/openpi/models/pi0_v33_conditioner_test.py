@@ -26,13 +26,12 @@ from openpi.models.pi0_v32_test import _TinyV32
 
 class _TinyV33(_TinyV32):
     v33_endpoint_gradient_step = pi0.Pi0.v33_endpoint_gradient_step
+    v32_query_attention_step = pi0.Pi0.v32_query_attention_step
 
     def __init__(self, rngs: nnx.Rngs):
         super().__init__(rngs)
         self.memory_task_conditioned_write = True
-        self.write_query_conditioner = pi0.MemoryQueryConditioner(
-            num_queries=16, width=64, num_heads=8, rngs=rngs
-        )
+        self.write_query_conditioner = pi0.MemoryQueryConditioner(num_queries=16, width=64, num_heads=8, rngs=rngs)
 
 
 @pytest.fixture(scope="module")
@@ -55,13 +54,26 @@ def test_zero_init_conditioner_is_bitwise_v32(tiny_v33):
         unconditioned = _prepare(tiny_v33, observation, state)
     finally:
         tiny_v33.memory_task_conditioned_write = True
-    np.testing.assert_array_equal(
-        np.asarray(conditioned["write_tokens"]), np.asarray(unconditioned["write_tokens"])
-    )
+    np.testing.assert_array_equal(np.asarray(conditioned["write_tokens"]), np.asarray(unconditioned["write_tokens"]))
     assert unconditioned["write_queries"] is None
     np.testing.assert_array_equal(
         np.asarray(conditioned["write_queries"]),
         np.broadcast_to(np.asarray(tiny_v33.write_query_compressor.query_bank.value)[None], (1, 16, 64)),
+    )
+
+
+def test_query_attention_step_returns_factorial_extras(tiny_v33):
+    """The offline diagnostic contract: a conditioned model's attention step must expose the
+    conditioned bank and the unconditioned-Q0 baseline map, and at zero init (out_proj = 0)
+    the two attention variants must be identical."""
+    observation = _single_observation()
+    state = tiny_v33.memory.init_state(1)
+    out = tiny_v33.v32_query_attention_step(observation, state)
+    assert {"write_queries", "write_attention_base"} <= set(out)
+    np.testing.assert_array_equal(np.asarray(out["write_attention"]), np.asarray(out["write_attention_base"]))
+    np.testing.assert_array_equal(
+        np.asarray(out["write_queries"])[0],
+        np.asarray(tiny_v33.write_query_compressor.query_bank.value),
     )
 
 

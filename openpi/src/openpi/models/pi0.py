@@ -139,9 +139,7 @@ class MemoryQueryCompressor(nnx.Module):
         if queries is None:
             queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
         elif queries.shape != (batch, self.num_queries, self.width):
-            raise ValueError(
-                f"queries must have shape {(batch, self.num_queries, self.width)}; got {queries.shape}."
-            )
+            raise ValueError(f"queries must have shape {(batch, self.num_queries, self.width)}; got {queries.shape}.")
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
         v = self.value_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
@@ -221,7 +219,9 @@ class MemoryQueryConditioner(nnx.Module):
         context_mask: at.Bool[at.Array, "b n"],
     ) -> at.Float[at.Array, "b q d"]:
         if base_queries.shape != (self.num_queries, self.width):
-            raise ValueError(f"base queries must have shape {(self.num_queries, self.width)}; got {base_queries.shape}.")
+            raise ValueError(
+                f"base queries must have shape {(self.num_queries, self.width)}; got {base_queries.shape}."
+            )
         if context.ndim != 3 or context.shape[-1] != self.width or context.shape[:2] != context_mask.shape:
             raise ValueError(f"context/mask mismatch: {context.shape} vs {context_mask.shape}.")
         batch = context.shape[0]
@@ -1853,6 +1853,15 @@ class Pi0(_model.BaseModel):
         write_tokens = prepared["write_tokens"]
         retrieved = prepared["retrieved"]
         slot_aux = self.memory.token_write_diagnostics(memory_state, write_tokens)
+        conditioned = {}
+        if getattr(self, "memory_task_conditioned_write", False):
+            # v3.3 extras: the instruction-conditioned query bank actually used above, plus the
+            # unconditioned-Q0 attention as the within-frame baseline -- their divergence is the
+            # direct readout of how much the instruction steers the writer.
+            conditioned = {
+                "write_queries": prepared["write_queries"],
+                "write_attention_base": self.write_query_compressor.attention_probs(h8_top),
+            }
         return {
             "read_attention": self.read_query_compressor.attention_probs(h8_top),
             "write_attention": self.write_query_compressor.attention_probs(h8_top, queries=prepared["write_queries"]),
@@ -1863,6 +1872,7 @@ class Pi0(_model.BaseModel):
             "write_slot_norm": jnp.linalg.norm(write_tokens.astype(jnp.float32), axis=-1),
             "h8_top_norm": jnp.linalg.norm(h8_top, axis=-1),
             "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (h8_top.shape[0],)),
+            **conditioned,
             **{f"write_slot_{key}": value for key, value in slot_aux.items()},
         }
 
@@ -1943,9 +1953,9 @@ class Pi0(_model.BaseModel):
                 )
                 ce_hidden = jnp.concatenate([prepared["final_prefix"][:, -1:], causal_out[:, :-1]], axis=1)
                 logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
-                token_logp = jnp.take_along_axis(
-                    jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1
-                )[..., 0]
+                token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1)[
+                    ..., 0
+                ]
                 ce = -jnp.sum(token_logp * causal_mask_k, axis=-1) / jnp.clip(jnp.sum(causal_mask_k, axis=-1), 1)
 
                 write_tokens = prepared["write_tokens"] + x["tap"]
