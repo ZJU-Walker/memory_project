@@ -5,14 +5,16 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+# ruff: noqa: I001 - data_loader (torch) must import before config (tensorflow), or the
+# interpreter segfaults; same pinned order as data_loader_test.py.
 import numpy as np
 import tqdm
 import tyro
 
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
-import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.config as _config
 import openpi.transforms as transforms
 
 
