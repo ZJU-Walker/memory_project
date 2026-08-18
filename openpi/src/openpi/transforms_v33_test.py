@@ -66,16 +66,20 @@ def test_straddled_wait_ends_on_the_last_neutral_step_before_it():
     assert not out["seq_block_boundary"].any()
 
 
-def test_random_endpoint_covers_the_whole_eligible_range():
-    # start 30: eligible grid steps are frames 150, 165, 180 within [140, 195-lookahead...]
+def test_endpoints_are_deterministic_per_start_and_stratified_across_starts():
+    """The same start must always truncate identically (exact bucket assignment depends on
+    it), while consecutive starts cycle through the eligible waiting-phase endpoints."""
     build = _build(subtask_lookahead=0)
-    endpoints = set()
-    np.random.seed(0)
-    for _ in range(50):
-        out = build(_raw_sequence_item(frame_index=30, window=[30, 60, 140, 199]))
-        endpoints.add(int(out["seq_step_mask"].sum()))
-    # frames 30+15k in [140,199]: k in {8,9,10,11} -> 8..12 valid steps, all reachable
-    assert endpoints == {9, 10, 11, 12}
+    lengths = {}
+    for start in range(30, 38):
+        out = build(_raw_sequence_item(frame_index=start, window=[30, 60, 140, 199]))
+        again = build(_raw_sequence_item(frame_index=start, window=[30, 60, 140, 199]))
+        np.testing.assert_array_equal(out["seq_step_mask"], again["seq_step_mask"])
+        lengths[start] = int(out["seq_step_mask"].sum())
+    assert len(set(lengths.values())) > 1, f"no endpoint diversity across starts: {lengths}"
+    # every endpoint observation lies in the waiting phase [140, 199]
+    for start, n in lengths.items():
+        assert 140 <= start + (n - 1) * 15 <= 199
 
 
 def test_disabled_window_row_means_normal_sample():

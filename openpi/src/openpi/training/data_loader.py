@@ -425,21 +425,35 @@ def _sequence_sampling_info(
         memory_hi = info["memory_hi"][episode]
         dead = usable & (frame > info["evidence_end"][episode]) & (frame <= memory_hi)
         in_window = usable & (frame >= window[:, 0][episode]) & (frame <= window[:, 1][episode])
-        # the whole memory-required phase must be reachable within the sequence budget
+        # the waiting phase must be reachable within the sequence budget
         mc_ok = in_window & (memory_lo - frame <= (max_steps - 1) * stride)
-        # memory-critical starts get a conservative bucket: steps up to the latest endpoint
-        cap = np.minimum(memory_hi, frame + (max_steps - 1) * stride)
-        valid_steps = np.where(mc_ok, ((cap - frame) // stride + 1).astype(np.int32), valid_steps)
+        # Each memory-critical start truncates at memory_critical_endpoint's DETERMINISTIC
+        # step, so its exact valid length is known here and bucket assignment is precise --
+        # BuildMemorySequence recomputes the identical endpoint at fetch time. (A per-draw
+        # random endpoint would mix bucket lengths inside one batch and trip the homogeneity
+        # check in _sequence_bucket_collate_fn.)
+        for i in np.nonzero(mc_ok)[0]:
+            t_q = _transforms.memory_critical_endpoint(
+                int(frame[i]),
+                window[episode[i]],
+                stride=stride,
+                lookahead=data_config.subtask_lookahead,
+                num_steps=max_steps,
+            )
+            valid_steps[i] = t_q + 1
     else:
         dead = (frame > info["reveal"][episode]) & (frame < info["switch"][episode])
-        mc_ok = np.zeros(len(episode), dtype=bool)
+        in_window = np.zeros(len(episode), dtype=bool)
+        mc_ok = in_window
 
     mc_prob = data_config.memory_critical_prob if int(mc_ok.sum()) > 0 else 0.0
     if data_config.memory_critical_prob > 0 and mc_prob == 0.0:
         logging.warning("memory_critical_prob > 0 but no eligible memory-critical starts; branch disabled.")
 
     min_frames = data_config.memory_min_slice_steps * stride
-    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~dead & ~mc_ok
+    # ~in_window (not just ~mc_ok): a window start drawn as a slice would still be truncated
+    # by BuildMemorySequence, so window frames belong to the memory-critical branch or nothing
+    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~dead & ~in_window
 
     slice_prob = data_config.memory_slice_prob
     weights = np.zeros(len(episode), dtype=np.float64)

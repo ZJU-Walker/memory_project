@@ -16,6 +16,7 @@ import pytest
 
 import openpi.training.data_loader as _data_loader
 import openpi.training.config as _config
+import openpi.transforms as _transforms
 
 OPEN, INSPECT, CLOSE = "open both lids", "inspect both bins", "close both lids and reset arms"
 WAIT_L, WAIT_R = "wait; target bin is left", "wait; target bin is right"
@@ -78,6 +79,7 @@ def _data_config(**overrides) -> _config.DataConfig:
         memory_stride_frames=15,
         memory_slice_prob=0.5,
         memory_min_slice_steps=2,
+        subtask_lookahead=5,
         evidence_subtasks=(INSPECT,),
         memory_required_subtasks=(WAIT_L, WAIT_R),
         memory_critical_prob=0.5,
@@ -132,11 +134,43 @@ def test_sampler_branch_masses_dead_zone_and_cell_balance(four_cell_dataset):
     # execution starts are ordinary slices again
     assert weights[:, 160:170].sum() > 0.0
 
-    # memory-critical starts are bucketed up to their latest waiting endpoint, not episode end
+    # memory-critical starts are bucketed at their deterministic endpoint, not episode end
     steps = sampling.valid_steps.reshape(4, 200)
-    assert steps[0, 30] == (159 - 30) // 15 + 1  # 9 steps to the last wait frame
-    assert steps[0, 60] == (159 - 60) // 15 + 1
+    assert steps[0, 30] == 9  # start 30: the single eligible wait step is frame 150 (k=8)
+    assert steps[0, 60] == 7  # start 60: frame 150 again (k=6)
     assert steps[0, 0] == np.ceil(200 / 15)  # full trajectories still run to the episode end
+
+
+def test_sampler_and_transform_agree_on_every_memory_critical_length(four_cell_dataset):
+    """THE bucket-homogeneity invariant behind the collate error seen at launch: for every
+    window start, the sampler's valid_steps must equal the steps BuildMemorySequence actually
+    leaves after truncation -- otherwise a truncated sample lands in a longer bucket's batch
+    and _sequence_bucket_collate_fn raises 'sequence bucket batch is not homogeneous'."""
+    config = _data_config()
+    sampling = _data_loader._sequence_sampling_info(four_cell_dataset, _StubMeta(), config, max_steps=40)
+    info = _data_loader._episode_info_table(four_cell_dataset, _StubMeta(), config)
+    windows = _data_loader._memory_critical_windows(info, config)
+    build = _transforms.BuildMemorySequence(
+        stride=15, action_horizon=3, block_steps=4, subtask_lookahead=config.subtask_lookahead
+    )
+    steps = sampling.valid_steps.reshape(4, 200)
+    weights = sampling.weights.reshape(4, 200)
+    for e in range(4):
+        for f in range(int(windows[e, 0]), int(windows[e, 1]) + 1):
+            assert weights[e, f] > 0
+            item = {
+                "frame_index": np.int64(f),
+                "index": np.int64(0),
+                "episode_length": np.int32(200),
+                "memory_window": windows[e],
+                "observation/image": np.zeros((40, 2, 2, 3), dtype=np.uint8),
+                "observation/left_wrist_image": np.zeros((40, 2, 2, 3), dtype=np.uint8),
+                "observation/right_wrist_image": np.zeros((40, 2, 2, 3), dtype=np.uint8),
+                "observation/state": np.zeros((40, 14), dtype=np.float32),
+                "actions": np.zeros((40, 3 * 14), dtype=np.float32),
+            }
+            out = build(item)
+            assert int(out["seq_step_mask"].sum()) == steps[e, f], (e, f, steps[e, f])
 
 
 def test_sampler_without_phase_config_keeps_legacy_behavior(four_cell_dataset):

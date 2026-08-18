@@ -399,6 +399,33 @@ class MemorySequenceSubtasks(DataTransformFn):
         return {**data, "subtask": [self.tasks[int(ep_tasks[i])] for i in idx]}
 
 
+def memory_critical_endpoint(
+    frame_index: int, window: np.ndarray, *, stride: int, lookahead: int, num_steps: int
+) -> int:
+    """The truncation step t_q for a memory-critical sequence starting at `frame_index`.
+
+    DETERMINISTIC per start frame -- the bucket sampler must know each start's exact valid
+    length ahead of time, so per-draw randomness would break batch homogeneity (mixed-bucket
+    collate error). Endpoint diversity instead comes from stratification: consecutive starts
+    in the window cycle through the eligible waiting-phase grid steps, and the start itself is
+    drawn uniformly. Eligibility tiers (each may be empty for short/straddled waits):
+      1. grid steps whose observation lies in [memory_lo, memory_hi - lookahead], so the
+         lookahead-shifted CE target is still a memory-required label;
+      2. any grid step inside the waiting phase (waits shorter than the lookahead);
+      3. the last grid step before the waiting phase -- observation still neutral, target
+         already memory-required.
+    """
+    memory_lo, memory_hi = int(window[2]), int(window[3])
+    step_frames = frame_index + np.arange(num_steps) * stride
+    in_wait = (step_frames >= memory_lo) & (step_frames <= memory_hi)
+    eligible = np.nonzero(in_wait & (step_frames <= memory_hi - lookahead))[0]
+    if len(eligible) == 0:
+        eligible = np.nonzero(in_wait)[0]
+    if len(eligible) == 0:
+        eligible = np.nonzero(step_frames < memory_lo)[0][-1:]
+    return int(eligible[frame_index % len(eligible)])
+
+
 @dataclasses.dataclass(frozen=True)
 class BuildMemorySequence(DataTransformFn):
     """Builds a sequence training sample from lerobot's stacked step frames (RoboTTT-style).
@@ -411,11 +438,10 @@ class BuildMemorySequence(DataTransformFn):
       * emits "seq_step_mask" (False for steps past the episode end -- lerobot pads by
         repeating the last frame; those steps are loss-masked and their writes are no-ops),
       * MEMORY-CRITICAL samples (start inside the episode's "memory_window", attached by
-        MemoryEpisodeInfo): additionally truncates the mask at a per-draw random step whose
-        observation still lies in the memory-required (waiting) phase, so the endpoint's
-        subtask CE can only be solved from memory; the endpoint avoids the last
-        `subtask_lookahead` waiting frames so its (lookahead-shifted) target stays a
-        memory-required label,
+        MemoryEpisodeInfo): additionally truncates the mask at `memory_critical_endpoint`'s
+        deterministic waiting-phase step, so the endpoint's subtask CE can only be solved
+        from memory. Determinism per start frame is required for exact bucket assignment;
+        endpoint diversity comes from the uniformly drawn start (see the helper),
       * emits "seq_block_boundary": the gradient-block fence, True every `block_steps` steps
         with a fresh random shift per sample (never at step 0). Memory-critical samples get NO
         fence: their entire point is end-to-end credit from the waiting-endpoint CE back to
@@ -456,18 +482,9 @@ class BuildMemorySequence(DataTransformFn):
 
         memory_critical = window is not None and window[0] >= 0 and window[0] <= frame_index <= window[1]
         if memory_critical:
-            memory_lo, memory_hi = int(window[2]), int(window[3])
-            in_wait = (step_frames >= memory_lo) & (step_frames <= memory_hi)
-            eligible = in_wait & (step_frames <= memory_hi - self.subtask_lookahead)
-            if not eligible.any():
-                eligible = in_wait  # waiting phase shorter than the lookahead
-            if not eligible.any():
-                # The stride grid straddles a very short waiting phase entirely. End at the
-                # last step before it: the observation is still neutral (close/reset) and its
-                # lookahead-shifted target is already a memory-required label.
-                eligible = np.zeros(num_steps, dtype=bool)
-                eligible[np.nonzero(step_frames < memory_lo)[0][-1]] = True
-            t_q = np.random.choice(np.nonzero(eligible)[0])
+            t_q = memory_critical_endpoint(
+                frame_index, window, stride=self.stride, lookahead=self.subtask_lookahead, num_steps=num_steps
+            )
             data["seq_step_mask"] = data["seq_step_mask"] & (np.arange(num_steps) <= t_q)
 
         boundary = np.zeros(num_steps, dtype=bool)

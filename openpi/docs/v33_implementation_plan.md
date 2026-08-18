@@ -97,14 +97,20 @@ a phase are excluded from the branch with a warning.
 
 **`transforms.MemoryEpisodeInfo`** attaches the per-episode phase bounds;
 **`transforms.BuildMemorySequence`**: when the item's start frame is inside the
-memory-critical window, draw `t_q` uniformly over the stride-grid steps whose observation
-frame lies in `[memory_lo, memory_hi − lookahead]` (clamped to be nonempty — covers the
-13-frame wait — and capped at `start + (T−1)·stride`), then truncate `seq_step_mask` after
-`t_q`. Steps beyond `t_q` are loss-masked and their writes are no-ops, exactly like
-end-of-episode padding today. Per-draw randomness matches the existing block-shift precedent.
+memory-critical window, truncate `seq_step_mask` at `memory_critical_endpoint(start)` — the
+**deterministic** stride-grid step whose observation lies in
+`[memory_lo, memory_hi − lookahead]` (fallback tiers cover the 13-frame wait and grids that
+straddle a short wait). Steps beyond `t_q` are loss-masked and their writes are no-ops,
+exactly like end-of-episode padding today.
 
-Rationale for per-draw endpoints: full §11 endpoint diversity at zero bucket cost (the whole
-window lands in bucket 27 regardless of `t_q`).
+Endpoints must be deterministic per start frame: the bucket sampler assigns each start's
+exact valid length ahead of time, and a per-draw random endpoint mixes lengths inside one
+bucket batch whenever a long wait crosses a bucket boundary (this tripped
+`_sequence_bucket_collate_fn`'s homogeneity check on the first launch — waits reach 337
+frames). Endpoint DIVERSITY (§11) comes from stratification instead: consecutive starts
+cycle through the eligible waiting steps, and the start itself is drawn uniformly from the
+window. The identical helper runs in the sampler (for `valid_steps`) and in the transform
+(for the mask), with a regression test asserting they agree on every window start.
 
 **TBPTT:** `memory_block_steps=25` stays for normal samples; `BuildMemorySequence` emits no
 fence for memory-critical samples (see correction #4), so
