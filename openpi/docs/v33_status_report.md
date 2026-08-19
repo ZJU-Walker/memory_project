@@ -5,11 +5,14 @@
 **Scope**: what v3.3 changes relative to v3.2, how it is trained and verified, and what five
 checkpoints of writer-attention diagnostics show.
 
-The short version: **training is converging well (loss 7.85 → 0.062, CE-dominated) and the
-task-conditioning pathway is active and growing, but the writer's *spatial* attention has
-gone through anchor → collapse rather than learning to look at the instructed object.** At
-step 6250 the write queries put essentially zero mass on either bin. Details and the
-alternative explanations we can and cannot yet rule out are in §5–§7.
+The short version: **training converges well (loss 7.85 → 0.062, CE-dominated) and the subtask
+policy is strong (waiting-phase side correct 18/18), but the episodic memory is not being used
+to produce that answer.** Zeroing the memory read leaves side accuracy at 18/18; a
+contradicting donor memory never flips a prediction; the read moves the left-vs-right decision
+by ~0.2–0.4 nats against margins of 15–22 nats. In parallel the writer's spatial attention went
+anchor → collapse (bin focus 0.36 at step 4250 → 0.001 at 6250). The likely root cause is that
+the waiting observation leaks the answer — proprioception alone recovers the side at 70% — so
+nothing pressures the model to remember. Evidence in §6.2 and §6.4; consequences in §7.
 
 ---
 
@@ -248,20 +251,80 @@ carrying the answer regardless of where attention points; if it does not, the mo
 the task without memory and the whole pipeline needs rethinking. That test is implemented for
 v3.2 (`v32_checkpoint.py`, section 12.6) and is the top-priority next diagnostic.
 
+## 6.4 Offline eval: the memory is not being used (decisive)
+
+`scripts/v33_offline_eval.py` answers the question §6.3 left open. It replays the same four
+episodes through `sample_with_memory` at the write cadence and **scores every prediction
+against the ground-truth label**, with three memory conditions at each step: normal (reads the
+live memory, commits its write), **zero-read** (retrieval zeroed), and **swap** (reads a donor
+episode's memory built by replaying an episode with the *opposite* side through its evidence
+phase). It also teacher-forces both side answers to measure how many nats the read moves the
+left-vs-right decision — catching influence below the argmax threshold.
+
+Results at step 6250 (4 episodes, 243 scored predictions):
+
+| phase | n | exact | exact (zero-read) | side acc | side acc (zero-read) | follows swap | mean abs margin shift |
+|---|---|---|---|---|---|---|---|
+| approach | 73 | 0.95 | 0.95 | — | — | 0.05 | 0.343 |
+| evidence | 12 | 0.67 | 0.67 | — | — | 0.00 | 0.293 |
+| retention | 58 | 0.93 | 0.93 | — | — | 0.00 | 0.202 |
+| **waiting** | 18 | 0.83 | 0.67 | **1.00** | **1.00** | **0.00** | 0.379 |
+| execute | 82 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 0.142 |
+
+**The subtask policy is good.** Execute is perfect, retention 0.93, and the waiting-phase side
+is correct in **18 of 18** steps. The residual "errors" are one-step phase-boundary timing
+(emitting `inspect both bins` one step before the label switches), not semantic mistakes.
+
+**The memory contributes nothing to the answer.** Three independent measurements agree:
+
+1. **Zero-read keeps side accuracy at 18/18.** The apparent +0.17 exact-match gain in the
+   waiting phase is *entirely* timing: every normal-vs-zero-read disagreement is
+   `wait; target bin is right` vs `open right bin` — the same side, a different phase word.
+   Not one disagreement is a side flip.
+2. **A contradicting memory never changes the answer** (`follows_swap = 0.00` in every phase
+   after approach). Feeding a frame the memory of an opposite-side episode leaves the
+   prediction exactly where it was.
+3. **The margins say why.** The forced log-probability gap between the two side answers is
+   **15–22 nats**, while zeroing the read moves it by only **0.1–1.0 nats**. The decision is
+   made ~20× more strongly than anything the memory could influence — consistent with a
+   content gate still at 0.063.
+
+**Where the answer actually comes from.** The waiting-phase observation is not as neutral as the
+task design assumes: a leave-one-out logistic regression on the robot's own joint state during
+waiting recovers the side at **70%** (chance 50%), and one gripper joint separates the classes
+by ~20 pooled SD within any single episode's wait window. So proprioception leaks a substantial
+part of the answer, and the wrist cameras plausibly supply the rest — the model can be right
+without remembering anything. This also explains §6.2's attention collapse: if the current
+observation carries the answer, there is no gradient pressure to keep attending the evidence,
+and none to open the content gate.
+
+Artifacts: `diagnostic_outputs/v33_offline_eval/6250_v2/episode_*_eval.mp4` (H.264, 30 fps,
+672×928) burn in ground truth, all three decodes, the margin shift, and a running waiting-phase
+scoreboard; `episode_*.json` holds every per-step record.
+
 ## 7. Recommended next steps
 
-1. **Zero-read ablation + memory-swap at waiting frames** (highest value): does the retrieval
-   actually carry the answer? Swap two episodes' memory states and see whether the predicted
-   side follows the memory.
-2. **§16 gradient probe on a trained checkpoint without `gate_override`** — measures the
-   *realized* credit reaching evidence-phase writes now, versus the pathway check we ran at
-   init.
-3. **Watch the content gate.** If it stays ~0.06 while CE keeps falling, the model is learning
-   to answer without memory, and the fix is architectural pressure (e.g. a stronger
-   memory-critical mixture, or an explicit read bottleneck), not more steps.
-4. **Consider breaking the shortcut in data**: episodes where a bin is empty, or the pairing is
-   randomized, would make "always encode the right bin" insufficient and force genuine
-   instruction-conditioned encoding.
+§6.4 already ran the decisive ablation, so these are ordered by what its result implies.
+
+1. **Fix the leak, or the memory can never be needed** (blocking). The waiting observation
+   carries the answer: joint state alone gives 70% and the wrist cameras likely supply more. As
+   long as that holds, no amount of training will make the model remember, because remembering
+   buys nothing. Options, roughly in order of cost: (a) randomize/neutralize the arm pose during
+   the wait so proprioception is uninformative; (b) drop or mask the wrist cameras during the
+   wait phase; (c) lengthen the wait and re-home the arms first. This is a *data/protocol*
+   change, not a modeling one.
+2. **Quantify the remaining leak before retraining.** Run the same LOO probe on wrist-camera
+   embeddings, not just joint state, so we know exactly which channels to close.
+3. **Then re-measure with the existing tooling.** `v33_offline_eval.py` gives the pass/fail
+   signal directly: memory works when zero-read *drops* side accuracy and `follows_swap` rises
+   above ~0.5.
+4. **Only after that, revisit the architecture.** The conditioning pathway is healthy
+   (`out_proj` 2.96 → 5.30) and the §16 credit path is verified, so there is no evidence the
+   mechanism is broken — it is unexercised. If the gate still refuses to open on non-leaky data,
+   then consider an explicit read bottleneck or a stronger memory-critical mixture.
+5. **Note for interpreting §6.2**: the attention collapse is most likely a *consequence* of the
+   leak rather than an independent failure — with the answer available in the current frame,
+   nothing keeps the writer looking at the evidence.
 
 ## 8. Reproducing
 
