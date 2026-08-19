@@ -13,11 +13,17 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
 CKPT="${1:-6500}"
 DATA=/iris/u/kewalk/.cache/huggingface/lerobot/yam/bin_memory_0816_subtask
 
+# Sample every 5 frames but WRITE on the training grid (15): at stride 15 the two phases that
+# carry the question are the thinnest (evidence 3.5 frames/episode, waiting 4.2), and sampling
+# finer lifts them to ~10.4 and ~12.8 without moving the fast weights off-distribution.
+SAMPLE_STRIDE="${2:-5}"
+
 # Smoke first: 8 episodes, so a broken path fails in ~4 min rather than ~40.
 uv run python scripts/v33_write_token_probe.py \
   --checkpoint "checkpoints/pi05_yam_mem_v33/v33_run1/${CKPT}" \
   --dataset_root "$DATA" \
   --output_dir "diagnostic_outputs/v33_write_probe/${CKPT}_smoke" \
+  --sample_stride "$SAMPLE_STRIDE" \
   --max_episodes 8 || exit 1
 echo "=== SMOKE OK, running all 60 episodes ==="
 
@@ -25,4 +31,5 @@ echo "=== SMOKE OK, running all 60 episodes ==="
 exec uv run python scripts/v33_write_token_probe.py \
   --checkpoint "checkpoints/pi05_yam_mem_v33/v33_run1/${CKPT}" \
   --dataset_root "$DATA" \
-  --output_dir "diagnostic_outputs/v33_write_probe/${CKPT}"
+  --output_dir "diagnostic_outputs/v33_write_probe/${CKPT}" \
+  --sample_stride "$SAMPLE_STRIDE"

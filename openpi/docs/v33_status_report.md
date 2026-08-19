@@ -302,6 +302,48 @@ Artifacts: `diagnostic_outputs/v33_offline_eval/6250_v2/episode_*_eval.mp4` (H.2
 672×928) burn in ground truth, all three decodes, the margin shift, and a running waiting-phase
 scoreboard; `episode_*.json` holds every per-step record.
 
+## 6.5 Write-token probe: was the answer ever written down?
+
+§6.4 proved the *policy* ignores the memory. That is ambiguous between two failures needing
+opposite fixes:
+
+* **never written** — the side never entered `W_t`, so the writer is the broken component;
+* **written but never read** — `W_t` holds the side and the read/gate path is the broken link.
+
+`scripts/v33_write_token_probe.py` discriminates by fitting a **diagnostic-only** linear readout
+(no loss, no gradient reaches the model) on the write tokens `W_t ∈ R^{16×d}` harvested at the
+training write cadence while carrying real memory state:
+
+    W_t  ->  {left, right}
+
+**Methodology (the result is worthless without it).** Frames inside one episode share lighting,
+object placement and arm pose, all correlated with side, so a frame-level split lets the probe
+memorize episode identity and report a meaningless ~1.0. The split is therefore
+**leave-one-EPISODE-out**, enforced in code, with one mean vector per episode per phase (60
+episodes, 4 balanced cells of 15). Sampling runs at `--sample_stride 5` while writes stay on the
+training grid of 15: at stride 15 the two phases that carry the question are the thinnest
+(evidence 3.5 frames/episode, min 2; waiting 4.2, min 1), and finer sampling lifts them to ~10.4
+and ~12.8 without moving the fast weights off-distribution.
+
+Every probe is reported against three controls, because an AUC in isolation is uninterpretable:
+
+| control | rules out |
+|---|---|
+| `shuffled` labels | the null *this estimator at this sample size* produces |
+| `read` tokens | what the policy consumes vs. what was written |
+| `state` (raw proprioception) | the known leak — joint state alone already gives ~70% |
+
+**A write-token AUC that does not clear both the shuffled null and the `state` baseline is not
+evidence of encoded memory.** The `approach` phase is an internal negative control: it precedes
+the reveal, so signal there means the probe is reading a nuisance rather than the evidence.
+
+The counterfactual-instruction test from the same replay asks whether the instruction steers
+*content*: fit on true-instruction tokens, then score the same frames re-encoded under the other
+instruction. `cf_flip_rate` is the fraction of held-out episodes whose decoded side flips when
+only the prompt changes.
+
+Status: implemented and unit-tested (17 tests); the checkpoint-6500 run is pending a free GPU.
+
 ## 7. Recommended next steps
 
 §6.4 already ran the decisive ablation, so these are ordered by what its result implies.

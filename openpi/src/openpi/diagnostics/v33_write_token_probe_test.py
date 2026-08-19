@@ -181,6 +181,23 @@ def test_cf_transfer_reports_no_flip_when_instruction_is_ignored():
     assert cf["mean_abs_score_shift"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_sample_stride_must_divide_the_write_stride():
+    """A sample grid that misses write frames would advance memory at frames it never observed."""
+    for write_stride, sample_stride, ok in [(15, 5, True), (15, 15, True), (15, 4, False), (15, 30, True)]:
+        divides = (write_stride % sample_stride == 0) or sample_stride >= write_stride
+        assert divides == ok, f"{write_stride}/{sample_stride}"
+
+
+def test_options_reject_nonpositive_sample_stride():
+    with pytest.raises(ValueError, match="sample_stride must be positive"):
+        probe.Options(checkpoint="c", dataset_root="d", output_dir="o", sample_stride=0)
+
+
+def test_options_default_sample_stride_is_none():
+    options = probe.Options(checkpoint="c", dataset_root="d", output_dir="o")
+    assert options.sample_stride is None
+
+
 def test_analyze_skips_phases_with_too_few_episodes():
     rng = np.random.default_rng(8)
     harvested = [_harvest(i, "right" if i % 2 else "left", "p", rng.normal(size=8)) for i in range(3)]

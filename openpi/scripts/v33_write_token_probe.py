@@ -21,7 +21,16 @@ def main() -> None:
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--config", default="pi05_yam_mem_v33")
     parser.add_argument("--episode_indices", type=int, nargs="*", default=[])
-    parser.add_argument("--stride", type=int, default=None)
+    parser.add_argument("--stride", type=int, default=None, help="memory WRITE cadence (default: training stride)")
+    parser.add_argument(
+        "--sample_stride",
+        type=int,
+        default=None,
+        help=(
+            "frame cadence for probe sampling, decoupled from the write cadence and must divide "
+            "it (default: same as --stride). Use 5 to thicken the sparse evidence/waiting phases."
+        ),
+    )
     parser.add_argument(
         "--max_episodes",
         type=int,
@@ -38,6 +47,7 @@ def main() -> None:
         config=args.config,
         episode_indices=tuple(args.episode_indices),
         stride=args.stride,
+        sample_stride=args.sample_stride,
         max_episodes=args.max_episodes,
         seed=args.seed,
     )

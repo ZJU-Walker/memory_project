@@ -69,6 +69,14 @@ class Options:
     config: str = "pi05_yam_mem_v33"
     episode_indices: tuple[int, ...] = ()
     stride: int | None = None
+    # Sampling cadence for the probe, decoupled from the WRITE cadence above. At the training
+    # stride of 15 the two phases that carry the question are the thinnest: evidence averages
+    # 3.5 frames per episode (min 2) and waiting 4.2 (min 1), so a per-episode mean is noisy.
+    # Sampling every `sample_stride` frames raises those to ~10.4 and ~12.8 at stride 5. The
+    # memory state is still advanced ONLY on the write grid, so retrieval stays on-distribution;
+    # writing 3x more often than training would put the fast weights somewhere the model never
+    # sees. None = sample exactly on the write grid.
+    sample_stride: int | None = None
     max_episodes: int = 0  # 0 = all usable episodes
     seed: int = 0
 
@@ -78,6 +86,8 @@ class Options:
         object.__setattr__(self, "episode_indices", tuple(self.episode_indices))
         if self.stride is not None and self.stride <= 0:
             raise ValueError("stride must be positive")
+        if self.sample_stride is not None and self.sample_stride <= 0:
+            raise ValueError("sample_stride must be positive")
         if self.max_episodes < 0:
             raise ValueError("max_episodes must be non-negative")
 
@@ -226,9 +236,20 @@ class WriteTokenProbeRunner(_wa.V33WriterAttentionRunner):
             )
         )
         self.probe_options = options
+        self.sample_stride = self.stride if options.sample_stride is None else options.sample_stride
+        if self.stride % self.sample_stride and self.sample_stride < self.stride:
+            raise ValueError(
+                f"sample_stride ({self.sample_stride}) must divide the write stride ({self.stride}) "
+                "so that every write frame is also sampled"
+            )
 
     def _harvest(self, plan: _wa._EpisodePlan, tasks: dict[int, str]) -> dict[str, Any]:
-        """One episode -> per-phase mean token vectors under TRUE and CF instructions."""
+        """One episode -> per-phase mean token vectors under TRUE and CF instructions.
+
+        Sampling happens on the (possibly finer) ``sample_stride`` grid; the memory state is
+        committed only on the training ``stride`` grid, so the retrieved tokens a sampled frame
+        sees are exactly the ones the model would see at that point in the episode.
+        """
         source = _wc._load_lerobot_sources(self.probe_options.dataset_root, [plan.episode])[0]
         columns = ["image", "left_wrist_image", "right_wrist_image", "state", "frame_index", "task_index"]
         rows = pq.read_table(source.path, columns=columns).to_pylist()
@@ -241,7 +262,7 @@ class WriteTokenProbeRunner(_wa.V33WriterAttentionRunner):
         started = time.monotonic()
         for row in rows:
             raw_frame = int(row["frame_index"])
-            if raw_frame % self.stride or raw_frame > plan.memory[1]:
+            if raw_frame % self.sample_stride or raw_frame > plan.memory[1]:
                 continue
             observation_true, _ = self._observation(row, raw_frame, plan.prompt)
             observation_cf, _ = self._observation(row, raw_frame, plan.counterfactual)
@@ -263,8 +284,10 @@ class WriteTokenProbeRunner(_wa.V33WriterAttentionRunner):
                 bucket[f"write_{cond}"].append(np.asarray(out["write_tokens"], dtype=np.float64)[0].reshape(-1))
                 bucket[f"read_{cond}"].append(np.asarray(out["retrieved"], dtype=np.float64)[0].reshape(-1))
                 bucket[f"state_{cond}"].append(state_vector)
-            # Commit exactly what the model would write under the REAL instruction.
-            memory_state = self._write(memory_state, out_true["write_tokens"])[0]
+            # Commit exactly what the model would write under the REAL instruction -- but only on
+            # the training write grid, so a finer sample_stride does not over-write the memory.
+            if raw_frame % self.stride == 0:
+                memory_state = self._write(memory_state, out_true["write_tokens"])[0]
 
         summary = {
             phase: {key: np.mean(np.stack(vals), axis=0) for key, vals in bucket.items() if vals}
