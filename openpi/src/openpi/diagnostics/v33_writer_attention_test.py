@@ -91,6 +91,48 @@ def test_slot_grid_frame_places_each_slot_tile():
         wa.slot_grid_frame(image, maps[:4], scales, "label")
 
 
+def test_v32_style_tile_matches_the_v32_convention():
+    """The v32 style must reproduce v32_checkpoint._attention_video's math exactly: per-frame
+    per-slot max normalization, JET, opacity = 0.6 * intensity. A uniform map and a peaked map
+    both saturate their own peak -- that relativeness IS the convention."""
+    import cv2
+
+    image = np.full((224, 224, 3), 100, dtype=np.uint8)
+    slot_map = np.zeros(256)
+    slot_map[137] = 1.0  # patch (8, 9)
+    slot_map[0] = 0.5
+
+    tile = wa._v32_style_tile(image, slot_map)
+    grid = slot_map.reshape(16, 16)
+    heat = grid / grid.max()
+    heat224 = cv2.resize(heat.astype(np.float32), (224, 224), interpolation=cv2.INTER_NEAREST)
+    color = cv2.applyColorMap((heat224 * 255).astype(np.uint8), cv2.COLORMAP_JET)[:, :, ::-1]
+    weight = (0.6 * heat224)[..., None]
+    expected = (image.astype(np.float32) * (1 - weight) + color * weight).astype(np.uint8)
+    np.testing.assert_array_equal(tile, expected)
+
+    # the peak patch is JET-red (red channel dominates, blue suppressed) and visibly shifted
+    # from the raw image; an unattended patch keeps the raw image untouched
+    peak = tile[8 * 14 + 7, 9 * 14 + 7]
+    assert peak[0] > peak[2], f"peak should be red-dominant, got RGB {peak}"
+    assert peak[0] > image[0, 0, 0], "peak should be brighter in red than the raw image"
+    np.testing.assert_array_equal(tile[15 * 14 + 7, 15 * 14 + 7], image[0, 0])
+
+    # scaling the whole map changes nothing (purely relative)
+    np.testing.assert_array_equal(wa._v32_style_tile(image, slot_map * 17.0), tile)
+
+
+def test_slot_grid_frame_style_validation_and_shape():
+    image = np.zeros((224, 224, 3), dtype=np.uint8)
+    maps = np.full((16, 256), 1.0 / 256)
+    frame = wa.slot_grid_frame(image, maps, None, "label", style="v32")
+    assert frame.shape == (wa._SLOT_GRID_HEADER + 4 * 224, 4 * 224, 3)
+    with pytest.raises(ValueError, match="unsupported slot grid style"):
+        wa.slot_grid_frame(image, maps, None, "label", style="rainbow")
+    with pytest.raises(ValueError, match="needs one color scale per slot"):
+        wa.slot_grid_frame(image, maps, None, "label", style="video")
+
+
 class _PhaseConfig:
     evidence_subtasks = ("inspect both bins",)
     memory_required_subtasks = ("wait; target bin is left", "wait; target bin is right")

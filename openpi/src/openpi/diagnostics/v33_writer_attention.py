@@ -246,34 +246,81 @@ def _slot_scales(slot_maps: np.ndarray) -> list[token_heatmap.ColorScale]:
 
 _SLOT_GRID_HEADER = 28
 
+# Rendering styles for the per-slot grid. They answer different questions and are NOT
+# interchangeable:
+#
+# "video" -- one fixed scale per slot across the whole episode (99th percentile), inferno,
+#   flat alpha. Frames are comparable to each other, so "attention got stronger/weaker" is
+#   readable. Cost: attention here is extremely peaked (the top patch often holds ~35-40% of
+#   a frame's mass), so against a video-wide ceiling ~96% of patches render below 2%
+#   brightness -- a genuinely sharp map can look like an almost untouched image.
+#
+# "v32" -- the v3.2 convention (diagnostics/v32_checkpoint.py `_attention_video`): each tile
+#   normalized by ITS OWN per-frame maximum, JET colormap, opacity proportional to intensity.
+#   Every tile's peak therefore saturates red in every frame, which makes the SHAPE of each
+#   slot's attention obvious at a glance. Cost: it is purely relative -- a weak diffuse frame
+#   and a razor-sharp one look equally red, so it says nothing about magnitude across time.
+#
+# Read "v32" for locating what a slot looks at; read "video" for whether that changed.
+SLOT_GRID_STYLES = ("video", "v32")
+
+
+def _v32_style_tile(image: np.ndarray, slot_map: np.ndarray) -> np.ndarray:
+    """One tile in the v3.2 convention: per-frame max normalization, JET, intensity alpha.
+
+    Mirrors `v32_checkpoint.V32CheckpointRunner._attention_video` exactly so the two
+    generations' videos are visually comparable.
+    """
+    grid = np.asarray(slot_map, dtype=np.float64).reshape(token_heatmap.TOKEN_GRID_SIZE, token_heatmap.TOKEN_GRID_SIZE)
+    heat = grid / max(float(grid.max()), _EPS)
+    heat224 = cv2.resize(heat.astype(np.float32), (224, 224), interpolation=cv2.INTER_NEAREST)
+    color = cv2.applyColorMap((heat224 * 255).astype(np.uint8), cv2.COLORMAP_JET)[:, :, ::-1]
+    weight = (0.6 * heat224)[..., None]
+    return (image.astype(np.float32) * (1 - weight) + color * weight).astype(np.uint8)
+
 
 def slot_grid_frame(
     image: np.ndarray,
     slot_maps: np.ndarray,
-    scales: list[token_heatmap.ColorScale],
+    scales: list[token_heatmap.ColorScale] | None,
     label: str,
+    *,
+    style: str = "video",
 ) -> np.ndarray:
     """Compose one 4x4 grid frame (16 write slots) over the same camera image: a header bar
-    plus 16 individually scaled 224x224 overlays, slot index stamped in each tile."""
+    plus 16 per-slot 224x224 overlays, slot index and (in v32 style) the slot's entropy and
+    effective token count stamped in each tile. See SLOT_GRID_STYLES for the normalizations."""
     maps = np.asarray(slot_maps, dtype=np.float64)
     if maps.shape != (16, 256):
         raise ValueError(f"per-frame slot maps must be [16, 256], got {maps.shape}")
-    if len(scales) != 16:
-        raise ValueError(f"need one color scale per slot, got {len(scales)}")
+    if style not in SLOT_GRID_STYLES:
+        raise ValueError(f"unsupported slot grid style {style!r}; choose one of {SLOT_GRID_STYLES}")
+    if style == "video" and (scales is None or len(scales) != 16):
+        raise ValueError("style='video' needs one color scale per slot")
+
+    normalized = maps / np.maximum(maps.sum(axis=-1, keepdims=True), _EPS)
+    clipped = np.clip(normalized, _EPS, 1.0)
+    entropy = -(clipped * np.log(clipped)).sum(axis=-1)
+
     rows = []
     for row_index in range(4):
         tiles = []
         for column in range(4):
             slot = 4 * row_index + column
-            overlay, _ = token_heatmap.heatmap_overlay(
-                image, maps[slot], scales[slot], scale_mode="video", draw_grid=False
-            )
-            cv2.putText(overlay, f"s{slot}", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-            tiles.append(overlay)
+            if style == "v32":
+                tile = _v32_style_tile(image, maps[slot])
+                text = f"s{slot} eff={np.exp(entropy[slot]):.0f} H={entropy[slot]:.2f}"
+            else:
+                tile, _ = token_heatmap.heatmap_overlay(
+                    image, maps[slot], scales[slot], scale_mode="video", draw_grid=False
+                )
+                text = f"s{slot}"
+            cv2.putText(tile, text, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (245, 245, 245), 1, cv2.LINE_AA)
+            tiles.append(tile)
         rows.append(np.concatenate(tiles, axis=1))
     grid = np.concatenate(rows, axis=0)
     bar = np.zeros((_SLOT_GRID_HEADER, grid.shape[1], 3), dtype=np.uint8)
-    cv2.putText(bar, label, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(bar, f"[{style}] {label}", (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (245, 245, 245), 1, cv2.LINE_AA)
     return np.concatenate([bar, grid], axis=0)
 
 
@@ -284,13 +331,16 @@ def render_slot_grid(
     path: Path,
     *,
     fps: float = 4.0,
+    style: str = "video",
 ) -> str:
     """Encode the per-slot 4x4 grid video; returns the encoder identifier."""
     maps = np.asarray(slot_maps, dtype=np.float64)
     if len(images) != maps.shape[0] or len(labels) != maps.shape[0]:
         raise ValueError(f"images/labels/maps disagree: {len(images)}/{len(labels)}/{maps.shape[0]}")
-    scales = _slot_scales(maps)
-    frames = [slot_grid_frame(image, maps[index], scales, labels[index]) for index, image in enumerate(images)]
+    scales = _slot_scales(maps) if style == "video" else None
+    frames = [
+        slot_grid_frame(image, maps[index], scales, labels[index], style=style) for index, image in enumerate(images)
+    ]
     return token_heatmap.encode_mp4(frames, path, fps)
 
 
@@ -302,6 +352,7 @@ def slot_grid_from_npz(
     *,
     variant: str = "true",
     fps: float = 4.0,
+    style: str = "video",
 ) -> str:
     """Re-render the per-slot grid from a saved maps NPZ -- CPU only, no model or GPU.
 
@@ -324,7 +375,7 @@ def slot_grid_from_npz(
         model_rgb, _ = token_heatmap.raw_top_camera_to_model_rgb(raw)
         images.append(model_rgb)
         labels.append(f"ep{episode} f{int(frame)} {variant.upper()} | {tasks[int(row['task_index'])]}"[:70])
-    return render_slot_grid(images, maps, labels, output_path, fps=fps)
+    return render_slot_grid(images, maps, labels, output_path, fps=fps, style=style)
 
 
 class V33WriterAttentionRunner:
@@ -558,13 +609,21 @@ class V33WriterAttentionRunner:
                 f"ep{plan.episode} f{frame['frame']} {frame['phase']} | TRUE: {plan.prompt}"
                 for frame in replay["frames"]
             ]
-            slot_encoder = render_slot_grid(
-                replay["images"],
-                np.stack(replay["maps"]["true"]).astype(np.float64),
-                slot_labels,
-                self.options.output_dir / f"{stem}_slots.mp4",
-                fps=self.options.video_fps,
-            )
+            # Both normalizations: "v32" is readable at a glance (per-frame per-slot max, JET),
+            # "video" is comparable across frames. See SLOT_GRID_STYLES.
+            slot_maps = np.stack(replay["maps"]["true"]).astype(np.float64)
+            slot_encoder = {
+                style: render_slot_grid(
+                    replay["images"],
+                    slot_maps,
+                    slot_labels,
+                    self.options.output_dir
+                    / (f"{stem}_slots.mp4" if style == "video" else f"{stem}_slots_{style}.mp4"),
+                    fps=self.options.video_fps,
+                    style=style,
+                )
+                for style in SLOT_GRID_STYLES
+            }
             np.savez_compressed(
                 self.options.output_dir / f"{stem}_maps.npz",
                 frames=np.asarray([f["frame"] for f in replay["frames"]], dtype=np.int32),
