@@ -352,7 +352,36 @@ The counterfactual-instruction test from the same replay asks whether the instru
 instruction. `cf_flip_rate` is the fraction of held-out episodes whose decoded side flips when
 only the prompt changes.
 
-Status: implemented and unit-tested (17 tests); the checkpoint-6500 run is pending a free GPU.
+**Result at checkpoint 6500 (60 episodes, balanced 30/30).** Full write-up with methodology and
+per-phase detail: [`docs/v33_write_token_probe.md`](v33_write_token_probe.md).
+
+```
+     phase   n  stream    acc    auc  null_acc  null_p95
+  approach  60   write   0.83   0.92      0.48      0.63   <-- NEGATIVE CONTROL FIRES
+  approach  60   state   0.93   0.94      0.48      0.57
+  evidence  60   write   0.72   0.79      0.50      0.63
+  evidence  60   state   0.72   0.82      0.50      0.63
+ retention  60   write   0.82   0.88      0.46      0.60
+   waiting  60   write   0.90   0.95      0.51      0.61
+   waiting  60    read   0.43   0.36      0.46      0.62   <-- READ AT/BELOW CHANCE
+   waiting  60   state   0.70   0.73      0.47      0.66
+```
+
+Write-token AUC clears the shuffled null everywhere, but that is **not** evidence of encoded
+memory, for two reasons the controls were built to expose. First, the negative control fires:
+`approach` scores AUC 0.92 *before the bins are ever opened*, when the side is not observable by
+any means. Second, the `state` row tracks the `write` row almost exactly (0.94/0.92, 0.82/0.79,
+0.88/0.88) — the write tokens are largely re-encoding proprioception, the same leak §6.4 found.
+Decisively, **evidence — where a real memory should stand out — is the weakest write row (0.79)
+and does not beat its own state baseline (0.82).**
+
+The `read` stream settles the ambiguity: retrieved tokens sit at **AUC 0.43 (retention) and 0.36
+(waiting)**, at or below chance. So of the two hypotheses, **"never written" is supported and
+"written but never read" is not** — repairing the read path or forcing the gate open is not the
+priority. `cf_flip_rate` peaks at 0.25 (evidence) / 0.37 (retention) with `|shift| < |true_score|`
+in every phase: the instruction perturbs the writer without flipping an encoded side.
+
+This strengthens §7 rather than redirecting it — the leak remains the blocking problem.
 
 ## 7. Recommended next steps
 
