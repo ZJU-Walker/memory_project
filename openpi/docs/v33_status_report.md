@@ -164,8 +164,22 @@ the training write cadence, carrying the real memory state — each frame commit
 - **CF** — identical frame and memory state, counterfactual instruction;
 - **BASE (Q0)** — the unconditioned bank, the within-frame baseline.
 
-Outputs per episode: a 4-panel H.264 video (camera | TRUE | CF | |TRUE−CF|), a 16-tile per-slot
-grid video, an NPZ of head-averaged maps, and per-frame metrics.
+Outputs per episode: a 4-panel H.264 video (camera | TRUE | CF | |TRUE−CF|), 16-tile per-slot
+grid videos, an NPZ of head-averaged maps, and per-frame metrics.
+
+**A note on reading the videos.** Attention here is extremely peaked — the single top patch
+typically holds 35–40% of a frame's mass and the top five hold ~85%. Two renderings are
+produced because they answer different questions:
+
+- `*_slots_v32.mp4` — the v3.2 convention: each tile normalized by its own per-frame maximum,
+  JET colormap, opacity proportional to intensity. Every slot's peak saturates red, so *where*
+  a slot looks is obvious at a glance. Purely relative: it says nothing about magnitude.
+- `*_slots.mp4` and the 4-panel video — one fixed scale across the episode, inferno, flat
+  alpha, so frames are comparable over time. Against that fixed ceiling ~96% of patches render
+  below 2% brightness, which makes a genuinely sharp map look like an almost untouched image.
+
+Both agree with the numbers: in the v3.2-style rendering at 4250 every slot shows a saturated
+blob on the right bin, while at 6250 the blobs sit on empty table and letterbox padding.
 
 `scripts/v33_writer_correctness.py` grounds those maps in scene geometry. The bins occupy fixed
 patch regions of the letterboxed 16×16 grid — rows 6–9, left bin cols 5–7, right bin cols 8–10,
@@ -266,10 +280,11 @@ uv run scripts/v33_writer_correctness.py \
   --run_dirs diagnostic_outputs/v33_writer_attention/{2750,3500,4250,5000,6250} \
   --stills --dataset_root ~/.cache/huggingface/lerobot/yam/bin_memory_0816_subtask
 
-# per-slot grids for other variants, CPU-only re-render from saved NPZ
+# per-slot grids: v3.2-style (readable) or other variants, CPU-only from saved NPZ
 uv run scripts/v33_render_slot_grids.py \
-  --run_dir diagnostic_outputs/v33_writer_attention/<step> \
-  --dataset_root ~/.cache/huggingface/lerobot/yam/bin_memory_0816_subtask --variant cf
+  --run_dirs diagnostic_outputs/v33_writer_attention/<step> \
+  --dataset_root ~/.cache/huggingface/lerobot/yam/bin_memory_0816_subtask \
+  --style v32 [--variant cf]
 
 # section-16 gradient-flow check
 uv run scripts/v33_gradient_flow_check.py \
