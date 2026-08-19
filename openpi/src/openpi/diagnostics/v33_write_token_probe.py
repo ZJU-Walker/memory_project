@@ -318,7 +318,7 @@ class WriteTokenProbeRunner(_wa.V33WriterAttentionRunner):
         if not self.probe_options.episode_indices:
             plans = _plan_all_episodes(self.probe_options, self.data_config)
         if self.probe_options.max_episodes:
-            plans = plans[: self.probe_options.max_episodes]
+            plans = _stratified_subset(plans, self.probe_options.max_episodes)
 
         print(f"pathway scalars: {self.scalars}")
         print(f"probing {len(plans)} episodes")
@@ -378,6 +378,27 @@ def _plan_all_episodes(options: Options, data_config: Any) -> list[_wa._EpisodeP
     return plans
 
 
+def _stratified_subset(plans: list[_wa._EpisodePlan], limit: int) -> list[_wa._EpisodePlan]:
+    """Cap the episode count while keeping the (instruction, side) cells balanced.
+
+    The dataset is stored in cell order, so a naive ``plans[:limit]`` yields a degenerate
+    design -- the first 8 episodes are 7 left / 1 right, where "always left" scores 0.875 and
+    the probe measures nothing. Round-robin over the four cells instead.
+    """
+    if limit >= len(plans):
+        return plans
+    cells: dict[tuple[str, str], list[_wa._EpisodePlan]] = {}
+    for plan in plans:
+        cells.setdefault((plan.prompt, plan.side), []).append(plan)
+    ordered = [sorted(group, key=lambda p: p.episode) for _, group in sorted(cells.items())]
+    picked: list[_wa._EpisodePlan] = []
+    for depth in range(max(len(group) for group in ordered)):
+        for group in ordered:
+            if depth < len(group) and len(picked) < limit:
+                picked.append(group[depth])
+    return sorted(picked, key=lambda p: p.episode)
+
+
 def analyze(harvested: list[dict[str, Any]], *, seed: int = 0) -> dict[str, Any]:
     """Leave-one-episode-out probes for every (phase, stream), plus shuffled nulls.
 
@@ -388,7 +409,19 @@ def analyze(harvested: list[dict[str, Any]], *, seed: int = 0) -> dict[str, Any]
     """
     labels = np.array([1 if h["plan"].side == "right" else 0 for h in harvested], dtype=np.int64)
     prompts = [h["plan"].prompt for h in harvested]
-    out: dict[str, Any] = {"phases": {}, "label_balance": {"right": int(labels.sum()), "n": len(labels)}}
+    majority = float(max(labels.mean(), 1.0 - labels.mean())) if len(labels) else float("nan")
+    out: dict[str, Any] = {
+        "phases": {},
+        "label_balance": {"right": int(labels.sum()), "n": len(labels), "majority_rate": majority},
+    }
+    # A lopsided design makes accuracy meaningless (predict the majority and "win"), so say so
+    # rather than emit a number that reads as a result. AUC is balance-robust; accuracy is not.
+    if len(labels) and majority > 0.65:
+        out["warning"] = (
+            f"label design is imbalanced ({int(labels.sum())} right / {len(labels)}): "
+            f"always predicting the majority scores {majority:.2f}. Read AUC, not accuracy."
+        )
+        print(f"WARNING: {out['warning']}")
 
     for phase in PROBE_PHASES:
         available = [h for h in harvested if phase in h["phase_vectors"] and "write_true" in h["phase_vectors"][phase]]

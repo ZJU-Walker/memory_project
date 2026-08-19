@@ -5,6 +5,8 @@ tests target the ways it could lie: a leaky split reporting fake signal, an AUC 
 with a brute-force definition, and a null that fails to flag a separable-by-construction design.
 """
 
+# ruff: noqa: SLF001 - the private probe/planning helpers are part of the contract under test.
+
 import numpy as np
 import pytest
 
@@ -147,7 +149,8 @@ def test_analyze_reports_signal_and_null_per_stream():
     assert evidence["n_episodes"] == 16
     assert evidence["write"]["auc"] > 0.9
     assert evidence["write"]["null"]["auc_mean"] < 0.8
-    assert results["label_balance"] == {"right": 8, "n": 16}
+    assert results["label_balance"]["right"] == 8
+    assert results["label_balance"]["n"] == 16
 
 
 def test_cf_transfer_detects_an_instruction_driven_flip():
@@ -179,6 +182,53 @@ def test_cf_transfer_reports_no_flip_when_instruction_is_ignored():
     cf = results["phases"]["evidence"]["write"]["cf_transfer"]
     assert cf["cf_flip_rate"] == 0.0
     assert cf["mean_abs_score_shift"] == pytest.approx(0.0, abs=1e-9)
+
+
+def _plan(episode: int, prompt: str, side: str):
+    return probe._wa._EpisodePlan(
+        episode=episode,
+        prompt=prompt,
+        counterfactual="other",
+        side=side,
+        evidence=(0, 10),
+        memory=(20, 30),
+        length=31,
+    )
+
+
+def test_stratified_subset_balances_cells_where_a_prefix_would_not():
+    """Regression: the dataset is stored in cell order (15 episodes per cell), so a naive
+    prefix drew every episode from one cell -- the real 8-episode smoke run came out 7 left /
+    1 right and its shuffled null hit AUC 1.00, i.e. it measured nothing."""
+    cells = [("banana", "left"), ("banana", "right"), ("box", "left"), ("box", "right")]
+    plans = [_plan(i, *cells[i // 15]) for i in range(60)]
+    assert len({(p.prompt, p.side) for p in plans[:8]}) == 1  # the degenerate design a prefix gives
+
+    picked = probe._stratified_subset(plans, 8)
+    assert len(picked) == 8
+    assert sum(p.side == "right" for p in picked) == 4
+    assert len({(p.prompt, p.side) for p in picked}) == 4
+
+
+def test_stratified_subset_is_a_noop_when_limit_exceeds_supply():
+    plans = [_plan(i, "banana", "left" if i % 2 else "right") for i in range(6)]
+    assert probe._stratified_subset(plans, 10) == plans
+
+
+def test_analyze_warns_on_an_imbalanced_design():
+    rng = np.random.default_rng(12)
+    harvested = [_harvest(i, "left" if i < 7 else "right", "banana", rng.normal(size=8)) for i in range(8)]
+    results = probe.analyze(harvested, seed=0)
+    assert "warning" in results
+    assert results["label_balance"]["majority_rate"] == pytest.approx(7 / 8)
+
+
+def test_analyze_does_not_warn_on_a_balanced_design():
+    rng = np.random.default_rng(13)
+    harvested = [_harvest(i, "right" if i % 2 else "left", "banana", rng.normal(size=8)) for i in range(8)]
+    results = probe.analyze(harvested, seed=0)
+    assert "warning" not in results
+    assert results["label_balance"]["majority_rate"] == pytest.approx(0.5)
 
 
 def test_sample_stride_must_divide_the_write_stride():

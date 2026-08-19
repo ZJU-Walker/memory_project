@@ -337,6 +337,16 @@ Every probe is reported against three controls, because an AUC in isolation is u
 evidence of encoded memory.** The `approach` phase is an internal negative control: it precedes
 the reveal, so signal there means the probe is reading a nuisance rather than the evidence.
 
+These controls earned their keep immediately. An 8-episode smoke run drew its episodes as a
+prefix, and because the dataset is stored in cell order (15 episodes per cell) that gave a 7
+left / 1 right design where "always guess left" scores 0.875. The evidence-phase write tokens
+duly reported accuracy 0.88 / AUC 1.00 — which reads as a triumphant result and means nothing:
+the shuffled null also reached AUC 1.00, so no number cleared its own baseline. The episode cap
+is now stratified across the four cells, and `analyze()` emits an explicit warning whenever the
+majority-class rate exceeds 0.65. The full 60-episode run is balanced by construction (4 cells
+of 15) and was never affected, but the episode is the reason this report quotes nulls beside
+every probe rather than bare accuracies.
+
 The counterfactual-instruction test from the same replay asks whether the instruction steers
 *content*: fit on true-instruction tokens, then score the same frames re-encoded under the other
 instruction. `cf_flip_rate` is the fraction of held-out episodes whose decoded side flips when
