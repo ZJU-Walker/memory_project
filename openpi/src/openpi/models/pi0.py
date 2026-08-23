@@ -1690,6 +1690,87 @@ class Pi0(_model.BaseModel):
                 result[f"subtask_to_camera_{name}_mass"] = jnp.sum(subtask_rows[:, :, start : start + mem_len], axis=-1)
         return result
 
+    def prompt_attention_maps(
+        self,
+        observation: _model.Observation,
+        *,
+        layer: int | None = None,
+        head: int | None = None,
+    ) -> dict[str, at.Array]:
+        """Attention from every tokenized-prompt row onto the image patches.
+
+        Read-only diagnostic over the plain image+prompt prefix: no memory tokens are
+        inserted, nothing is denoised, nothing is written. With :meth:`capture_attention`
+        active it returns, for the requested gemma block, each prompt-token row's
+        head-averaged attention over the 256 top-camera patch keys plus mass partitions
+        over every camera and the text block. Under the v3.2 split architecture the
+        prefix pass is bit-identical to inference for blocks ``0..memory_layer`` (memory
+        tokens only join after that block), so the default ``layer=memory_layer`` shows
+        exactly the attention that shaped the hidden states the memory reads and writes;
+        larger layers describe a memory-less forward instead.
+
+        Each row of ``prompt_to_top`` is one softmax over ALL prefix keys, so it does not
+        sum to one; the ``*_mass`` entries close the budget. Which rows belong to the
+        instruction words versus the discretized state digits is a tokenizer question,
+        so callers slice rows themselves (see diagnostics/v33_prompt_attention.py).
+
+        ``layer=-1`` returns the whole depth at once -- every map/mass entry gains a
+        leading per-layer axis after batch ([b, depth, ...]). ``head=-1`` does the same
+        for the heads of ONE layer ([b, heads, ...]); combining both sweeps is rejected
+        to keep the result rank fixed. The capture already materializes everything, so
+        neither sweep costs extra forward passes.
+        """
+        target_layer = self.memory_layer if layer is None else layer
+        depth = self.PaliGemma.llm.module.configs[0].depth
+        if target_layer != -1 and not 0 <= target_layer < depth:
+            raise ValueError(f"layer {target_layer} is outside the model's depth {depth}")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        num_img = prefix_mask.shape[1] - self.max_token_len
+        mem_len = num_img // len(preprocessed.images)
+        prefix_len = prefix_mask.shape[1]
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        prefill = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=attn_mask, positions=positions, return_hidden_states=True
+        )
+        if len(prefill) != 4:
+            raise RuntimeError("prompt_attention_maps requires the capture_attention() context")
+        probs = prefill[3]  # [depth, b, heads, T, S]
+        num_heads = probs.shape[2]
+        if head is not None and head != -1 and not 0 <= head < num_heads:
+            raise ValueError(f"head {head} is outside the layer's {num_heads} heads")
+        if head == -1 and target_layer == -1:
+            raise ValueError("layer=-1 and head=-1 cannot be combined; sweep one axis at a time")
+        stack = probs if target_layer == -1 else probs[target_layer][None]  # [groups, b, heads, T, S]
+        if head is None:
+            grouped = jnp.mean(stack, axis=2)
+        elif head == -1:
+            grouped = jnp.moveaxis(stack[0], 1, 0)  # heads become the group axis
+        else:
+            grouped = stack[:, :, head]
+        rows = jnp.moveaxis(grouped, 0, 1)  # [b, groups, T, S]
+        if target_layer != -1 and head != -1:
+            rows = rows[:, 0]
+        prompt_rows = rows[..., num_img:prefix_len, :].astype(jnp.float32)
+        camera_names = list(preprocessed.images)
+        result = {
+            "prompt_to_top": prompt_rows[..., :mem_len],
+            "prompt_to_images_mass": jnp.sum(prompt_rows[..., :num_img], axis=-1),
+            "prompt_to_text_mass": jnp.sum(prompt_rows[..., num_img:prefix_len], axis=-1),
+            "prompt_token_mask": prefix_mask[:, num_img:prefix_len],
+            "layer": jnp.asarray(target_layer),
+            "depth": jnp.asarray(depth),
+            "top_camera_tokens": jnp.asarray(mem_len),
+            "num_image_tokens": jnp.asarray(num_img),
+            "num_heads": jnp.asarray(num_heads),
+            "head": jnp.asarray(-1 if head is None else head),
+        }
+        for index, name in enumerate(camera_names):
+            start = index * mem_len
+            result[f"prompt_to_camera_{name}_mass"] = jnp.sum(prompt_rows[..., start : start + mem_len], axis=-1)
+        return result
+
     def retrieved_token_ablation_step(
         self,
         observation: _model.Observation,
