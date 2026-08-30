@@ -37,10 +37,21 @@ class _TinyV32(nnx.Module):
     _v32_empty_cache = pi0.Pi0._v32_empty_cache  # noqa: SLF001
     _v32_layer_mask = pi0.Pi0._v32_layer_mask  # noqa: SLF001
     _pad_attention_columns = staticmethod(pi0.Pi0._pad_attention_columns)  # noqa: SLF001
+    _v32_prepare_memory_interface = pi0.Pi0._v32_prepare_memory_interface  # noqa: SLF001
     _v32_prepare_memory_prefix = pi0.Pi0._v32_prepare_memory_prefix  # noqa: SLF001
+    _v32_memory_scale_metrics = staticmethod(pi0.Pi0._v32_memory_scale_metrics)  # noqa: SLF001
     _v32_causal_mask = pi0.Pi0._v32_causal_mask  # noqa: SLF001
     _v32_step_mask = pi0.Pi0._v32_step_mask  # noqa: SLF001
     _v32_suffix_mask = pi0.Pi0._v32_suffix_mask  # noqa: SLF001
+    _v32_content_gate = pi0.Pi0._v32_content_gate  # noqa: SLF001
+    _v32_inject_memory = pi0.Pi0._v32_inject_memory  # noqa: SLF001
+    _v32_top_patch_valid = pi0.Pi0._v32_top_patch_valid  # noqa: SLF001
+    _v32_split_late_mask = pi0.Pi0._v32_split_late_mask  # noqa: SLF001
+    _v32_ce_seed_hidden = pi0.Pi0._v32_ce_seed_hidden  # noqa: SLF001
+    _v32_causal_seed = pi0.Pi0._v32_causal_seed  # noqa: SLF001
+    _v32_apply_state_null = pi0.Pi0._v32_apply_state_null  # noqa: SLF001
+    v32_memory_interface_step = pi0.Pi0.v32_memory_interface_step
+    v32_query_attention_step = pi0.Pi0.v32_query_attention_step
 
     def __init__(self, rngs: nnx.Rngs):
         config = gemma.get_config("dummy")
@@ -198,6 +209,65 @@ def test_dual_query_banks_are_distinct_and_emit_16_tokens(tiny_model):
     state_paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(nnx.state(tiny_model))]
     assert any("read_query_compressor" in path for path in state_paths)
     assert any("write_query_compressor" in path for path in state_paths)
+
+
+def test_query_diagnostic_reports_layer8_and_retrieval_rms(tiny_model):
+    observation = _single_observation()
+    state, _ = tiny_model.memory.write(
+        tiny_model.memory.init_state(1), jax.random.normal(jax.random.key(13), (1, 16, 64))
+    )
+    prepared = _prepare(tiny_model, observation, state)
+    out = tiny_model.v32_query_attention_step(observation, state)
+
+    for key in (
+        "h8_all_rms",
+        "h8_valid_rms",
+        "h8_valid_token_count",
+        "h8_image_rms",
+        "h8_context_valid_rms",
+        "h8_top_rms",
+        "retrieved_rms",
+        "memory_token_rms",
+    ):
+        assert out[key].shape == (1,)
+        assert np.isfinite(np.asarray(out[key])).all()
+    expected_h8_all = np.sqrt(np.mean(np.square(np.asarray(prepared["h8_all"], dtype=np.float32))))
+    expected_retrieved = np.sqrt(np.mean(np.square(np.asarray(prepared["retrieved"], dtype=np.float32))))
+    np.testing.assert_allclose(out["h8_all_rms"], expected_h8_all, rtol=2e-6)
+    np.testing.assert_allclose(out["retrieved_rms"], expected_retrieved, rtol=2e-6)
+    # This fixture uses an all-ones content gate, so raw retrieval and injected-token RMS agree.
+    np.testing.assert_allclose(out["memory_token_rms"], out["retrieved_rms"], rtol=2e-6)
+
+
+def test_early_only_memory_interface_matches_full_diagnostic_exactly(tiny_model):
+    observation = _single_observation()
+    state, _ = tiny_model.memory.write(
+        tiny_model.memory.init_state(1), jax.random.normal(jax.random.key(14), (1, 16, 64))
+    )
+    early = tiny_model.v32_memory_interface_step(observation, state)
+    full = tiny_model.v32_query_attention_step(observation, state)
+
+    expected_keys = (
+        "read_queries",
+        "write_tokens",
+        "retrieved",
+        "write_keys",
+        "write_values",
+        "h8_all_rms",
+        "h8_valid_rms",
+        "h8_valid_token_count",
+        "h8_image_rms",
+        "h8_context_valid_rms",
+        "h8_top_rms",
+        "retrieved_rms",
+        "memory_token_rms",
+        "memory_gate_norm",
+    )
+    assert set(early) == set(expected_keys)
+    for key in expected_keys:
+        if key not in full:  # v3.4 ladder extras exist only on the early-only step
+            continue
+        np.testing.assert_array_equal(early[key], full[key])
 
 
 def test_write_tokens_depend_only_on_current_h8_while_read_uses_prewrite_state(tiny_model):

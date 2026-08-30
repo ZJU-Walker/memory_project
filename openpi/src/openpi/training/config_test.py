@@ -74,3 +74,43 @@ def test_gradient_accumulation_is_opt_in_and_validated() -> None:
         dataclasses.replace(config, gradient_accumulation_steps=0)
     with pytest.raises(ValueError, match="must be divisible"):
         dataclasses.replace(config, gradient_accumulation_steps=5)
+
+
+def test_v34_run4_differs_only_by_identity_and_blank_memory_output() -> None:
+    v34 = _config.get_config("pi05_yam_mem_v34")
+    run4 = _config.get_config("pi05_yam_mem_v34_run4")
+
+    assert isinstance(run4.weight_loader, weight_loaders.PartialCheckpointWeightLoader)
+    assert run4.weight_loader.params_path == _PI05_BASE_PARAMS
+    assert v34.model.memory.blank_initial_output is False
+    assert run4.model.memory.blank_initial_output is True
+    assert not run4.freeze_filter(("memory", "m0", "w3"), object())
+    normalized = dataclasses.replace(
+        run4,
+        name=v34.name,
+        model=dataclasses.replace(
+            run4.model,
+            memory=dataclasses.replace(run4.model.memory, blank_initial_output=False),
+        ),
+    )
+    assert normalized == v34
+
+
+def test_v34_run5_differs_from_run4_only_by_identity_and_eta_scale() -> None:
+    run4 = _config.get_config("pi05_yam_mem_v34_run4")
+    run5 = _config.get_config("pi05_yam_mem_v34_run5_eta0")
+
+    assert isinstance(run5.weight_loader, weight_loaders.PartialCheckpointWeightLoader)
+    assert run5.weight_loader.params_path == _PI05_BASE_PARAMS
+    assert run5.model.memory.blank_initial_output is True
+    assert run4.model.memory.eta_scale == 1.0
+    assert run5.model.memory.eta_scale == 0.0
+    normalized = dataclasses.replace(
+        run5,
+        name=run4.name,
+        model=dataclasses.replace(
+            run5.model,
+            memory=dataclasses.replace(run5.model.memory, eta_scale=run4.model.memory.eta_scale),
+        ),
+    )
+    assert normalized == run4

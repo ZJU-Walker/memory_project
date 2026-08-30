@@ -67,6 +67,57 @@ def test_pathway_scalars_reports_both_norms():
     assert scalars["memory_gate_norm"] == pytest.approx(np.sqrt(16 * 8 * 9.0))
 
 
+def test_writer_clip_statistics_uses_preclip_threshold():
+    stats = wa.writer_clip_statistics(np.array([0.5, 2.0, 30.0, 100.0]), max_grad_norm=1.0)
+    assert stats["write_grad_norm_preclip_min"] == pytest.approx(0.5)
+    assert stats["write_grad_norm_preclip_median"] == pytest.approx(16.0)
+    assert stats["write_grad_norm_preclip_p95"] == pytest.approx(89.5)
+    assert stats["write_grad_norm_preclip_max"] == pytest.approx(100.0)
+    assert stats["write_clip_saturation_fraction"] == pytest.approx(0.75)
+    assert stats["write_clip_factor_median"] == pytest.approx((1.0 / 2.0 + 1.0 / 30.0) / 2.0)
+
+
+def test_writer_clip_statistics_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="non-empty vector"):
+        wa.writer_clip_statistics(np.empty(0), max_grad_norm=1.0)
+    with pytest.raises(ValueError, match="finite nonnegative"):
+        wa.writer_clip_statistics(np.array([1.0, np.nan]), max_grad_norm=1.0)
+    with pytest.raises(ValueError, match="finite and positive"):
+        wa.writer_clip_statistics(np.array([1.0]), max_grad_norm=0.0)
+
+
+def test_retrieval_scale_statistics_excludes_blank_reads():
+    stats = wa.retrieval_scale_statistics(
+        h8_valid_rms=np.array([2.0, 2.0, 3.0]),
+        h8_valid_token_count=np.array([4, 4, 8]),
+        h8_image_rms=np.array([2.0, 2.0, 2.5]),
+        h8_context_valid_rms=np.array([2.0, 2.0, 4.0]),
+        retrieved_rms=np.array([0.0, 0.5, 1.5]),
+        memory_token_rms=np.array([0.0, 0.01, 0.03]),
+    )
+    assert stats["h8_valid_rms_median"] == pytest.approx(2.0)
+    assert stats["retrieved_rms_median"] == pytest.approx(0.5)
+    assert stats["retrieval_zero_fraction"] == pytest.approx(1.0 / 3.0)
+    assert stats["retrieval_match_c_count"] == 2
+    assert stats["retrieval_match_c_median"] == pytest.approx(3.0)
+    assert stats["retrieval_match_c_p05"] == pytest.approx(2.1)
+    assert stats["retrieval_match_c_p95"] == pytest.approx(3.9)
+    assert stats["memory_token_to_h8_ratio_median"] == pytest.approx(0.005)
+    expected_h8_energy = np.sqrt((2.0**2 * 4 + 2.0**2 * 4 + 3.0**2 * 8) / 16)
+    expected_retrieved_energy = np.sqrt((0.0**2 + 0.5**2 + 1.5**2) / 3)
+    assert stats["retrieval_match_c_energy"] == pytest.approx(expected_h8_energy / expected_retrieved_energy)
+
+
+def test_retrieval_scale_statistics_all_blank_has_no_c():
+    stats = wa.retrieval_scale_statistics(
+        np.ones(2), np.ones(2), np.ones(2), np.ones(2), np.zeros(2), np.zeros(2)
+    )
+    assert stats["retrieval_match_c_count"] == 0
+    assert stats["retrieval_match_c_median"] is None
+    assert stats["retrieval_match_c_p05"] is None
+    assert stats["retrieval_match_c_p95"] is None
+
+
 def test_slot_grid_frame_places_each_slot_tile():
     """16 per-slot tiles in a 4x4 grid under a header bar; a slot's hot patch must light up
     inside that slot's tile and nowhere else in its row/column neighborhood."""

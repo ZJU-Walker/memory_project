@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import re
 from typing import Any
 
 import etils.epath as epath
@@ -70,6 +72,25 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
+def _log_training_identity(config: _config.TrainConfig) -> None:
+    """Make single-variable memory interventions unambiguous in every startup log."""
+    memory_config = getattr(config.model, "memory", None)
+    logging.info(
+        "Training config: name=%s exp_name=%s eta_scale=%s",
+        config.name,
+        config.exp_name,
+        getattr(memory_config, "eta_scale", None),
+    )
+
+
+_PER_POSITION_METRIC_SUFFIX = re.compile(r"_p\d+$")
+
+
+def _is_per_position_metric(key: str) -> bool:
+    """Only suppress expanded vector entries such as ``..._p17`` from console output."""
+    return _PER_POSITION_METRIC_SUFFIX.search(key) is not None
+
+
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
@@ -90,6 +111,59 @@ def _pad_probe_grids(correct_grid: at.Array, active_grid: at.Array, max_steps: i
     return jnp.pad(correct_grid, (0, pad)), jnp.pad(active_grid, (0, pad))
 
 
+def _aux_macro_ce(class_ce_sum: at.Array, class_count: at.Array) -> at.Array:
+    """Class-balanced macro CE (v3.4 plan 5.1): mean over PRESENT classes of the per-class mean
+    CE, so frequent phase labels cannot dominate and re-reward the phase-only representation."""
+    present = class_count > 0
+    per_class = jnp.where(present, class_ce_sum / jnp.maximum(class_count, 1.0), 0.0)
+    return jnp.sum(per_class) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+
+
+def _aux_group_metrics(chunked_loss: dict[str, at.Array], side_class_ids: tuple[int, ...]) -> dict[str, at.Array]:
+    """Per-class-group (phase vs side-bearing) accuracy numerators/denominators for logging."""
+    class_count = chunked_loss["aux_count_class"]
+    class_correct = chunked_loss["aux_correct_class"]
+    num_classes = class_count.shape[0]
+    side = jnp.zeros((num_classes,), dtype=bool)
+    if side_class_ids:
+        side = side.at[jnp.asarray(side_class_ids, dtype=jnp.int32)].set(True)
+    return {
+        "diagnostic/aux_side_correct": jnp.sum(jnp.where(side, class_correct, 0.0)),
+        "diagnostic/aux_side_count": jnp.sum(jnp.where(side, class_count, 0.0)),
+        "diagnostic/aux_phase_correct": jnp.sum(jnp.where(side, 0.0, class_correct)),
+        "diagnostic/aux_phase_count": jnp.sum(jnp.where(side, 0.0, class_count)),
+    }
+
+
+def _write_diagnostic_sums(chunked_loss: dict[str, at.Array]) -> dict[str, at.Array]:
+    """Unreduced write telemetry with a shared valid-write denominator.
+
+    Keeping numerators/counts intact here lets `_reduce_infos` pool exactly across samples,
+    unequal sequence buckets, microbatches, and optimizer updates.
+    """
+    return {
+        "diagnostic/write_inner_grad_sum": jnp.sum(chunked_loss["write_grad_norm_sum"]),
+        "diagnostic/write_inner_valid_count": jnp.sum(chunked_loss["write_valid_count"]),
+        "diagnostic/write_inner_clip_count": jnp.sum(chunked_loss["write_clip_count"]),
+        "diagnostic/write_inner_severe_clip_count": jnp.sum(chunked_loss["write_severe_clip_count"]),
+        "diagnostic/write_inner_grad_max": jnp.max(chunked_loss["write_grad_norm_max"]),
+    }
+
+
+_LADDER_RUNGS = ("ladder_writer", "ladder_read")
+
+# v3.4 Section 6: the online probe-ladder heads. Their gradients are removed from the main
+# optimizer path entirely (a probe must not scale main-model updates through the global clip
+# norm) and applied by a separate constant-LR SGD in train_step.
+LADDER_PROBE_FILTER = nnx_utils.PathRegex(r".*ladder_(writer|read)_head.*")
+
+# Every parameter on the memory path: the Titans core (memory/*), the read/write query
+# compressors and conditioner, and the v3.2+/v3.4 interface params (memory_inject_w,
+# memory_gate, memory_aux_*, memory_slot_embedding, state_null_embedding). Used by the
+# optional `memory_grad_clip` group pre-clip in train_step.
+MEMORY_PATH_FILTER = nnx_utils.PathRegex(r".*(memory|query_compressor|query_conditioner|state_null_embedding).*")
+
+
 def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
     stacked_infos = common_utils.stack_forest(infos)
     reduced = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos))
@@ -102,6 +176,35 @@ def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
         for key in ("grad_norm", "param_norm"):
             reduced[key] = np.sum(jax.device_get(stacked_infos[key]), axis=0) / np.maximum(count, 1)
         reduced.pop(norm_count_key)
+    write_count_key = "diagnostic/write_inner_valid_count"
+    if write_count_key in reduced:
+        # Exact pooled ratios. Averaging per-sample/per-update means would over-weight short
+        # sequences and sparse buckets.
+        count = np.sum(jax.device_get(stacked_infos[write_count_key]), axis=0)
+        grad_sum = np.sum(jax.device_get(stacked_infos["diagnostic/write_inner_grad_sum"]), axis=0)
+        clip_count = np.sum(jax.device_get(stacked_infos["diagnostic/write_inner_clip_count"]), axis=0)
+        severe_count = np.sum(
+            jax.device_get(stacked_infos["diagnostic/write_inner_severe_clip_count"]), axis=0
+        )
+        reduced.update(
+            {
+                "diagnostic/write_inner_grad_norm": grad_sum / np.maximum(count, 1),
+                "diagnostic/write_inner_clip_fraction": clip_count / np.maximum(count, 1),
+                "diagnostic/write_inner_severe_clip_fraction": severe_count / np.maximum(count, 1),
+            }
+        )
+        for key in (
+            write_count_key,
+            "diagnostic/write_inner_grad_sum",
+            "diagnostic/write_inner_clip_count",
+            "diagnostic/write_inner_severe_clip_count",
+        ):
+            reduced.pop(key)
+    # This metric is already a max over sequence position and batch inside each optimizer
+    # update. Preserve its meaning across the logging window instead of averaging those maxima.
+    window_max_key = "diagnostic/write_inner_grad_max"
+    if window_max_key in reduced:
+        reduced[window_max_key] = np.max(jax.device_get(stacked_infos[window_max_key]), axis=0)
     probe_count_key = "diagnostic/probe_count"
     if probe_count_key in reduced:
         # Diagnostic accuracies are ratios over every live probe in the entire log window, not
@@ -134,6 +237,15 @@ def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
         reduced.pop(grid_correct_key)
         reduced.pop("diagnostic/probe_active_grid")
         reduced["diagnostic/probe_accuracy_by_step"] = correct_grid / np.maximum(active_grid, 1)
+
+    # v3.4 aux/ladder accuracies: any (X_correct, X_count) pair becomes a window-exact ratio.
+    for key in [k for k in reduced if k.endswith("_count") and k.replace("_count", "_correct") in reduced]:
+        correct_key = key.replace("_count", "_correct")
+        count = np.sum(jax.device_get(stacked_infos[key]), axis=0)
+        correct = np.sum(jax.device_get(stacked_infos[correct_key]), axis=0)
+        reduced[key.replace("_count", "_accuracy")] = correct / np.maximum(count, 1)
+        reduced.pop(key)
+        reduced.pop(correct_key)
     return reduced
 
 
@@ -208,6 +320,10 @@ def train_step(
             # Subtask co-training: combine the flow and (weighted) token CE losses, log both.
             loss = jnp.mean(chunked_loss["flow"]) + model.ce_loss_weight * jnp.mean(chunked_loss["ce"])
             info = {"flow_loss": jnp.mean(chunked_loss["flow"]), "ce_loss": jnp.mean(chunked_loss["ce"])}
+            if "write_grad_norm_sum" in chunked_loss:
+                # Core-steepness telemetry (v34 postmortems): healthy ~0.5-3; ramping toward
+                # ~50 preceded both explosion cycles by several hundred steps.
+                info.update(_write_diagnostic_sums(chunked_loss))
             if "probe_ce_sum" in chunked_loss:
                 # Probe outputs are logged under an explicitly diagnostic namespace. Detached
                 # diagnostic mode has weight zero and therefore cannot affect the main loss.
@@ -240,6 +356,26 @@ def train_step(
                         "diagnostic/probe_active_grid": active_grid,
                     }
                 )
+            if "aux_ce_class_sum" in chunked_loss:
+                # v3.4 plan 5.1: class-balanced macro CE, trained by the MAIN optimizer.
+                aux_loss = _aux_macro_ce(chunked_loss["aux_ce_class_sum"], chunked_loss["aux_count_class"])
+                loss += model.memory_aux_loss_weight * aux_loss
+                info["aux_loss"] = aux_loss
+                info.update(_aux_group_metrics(chunked_loss, model.memory_aux_side_class_ids))
+                if "aux_margin_sum" in chunked_loss:
+                    aux_margin = chunked_loss["aux_margin_sum"] / jnp.maximum(chunked_loss["aux_margin_count"], 1.0)
+                    loss += model.memory_aux_margin_weight * aux_margin
+                    info["aux_margin"] = aux_margin
+            if "ladder_writer_ce_sum" in chunked_loss:
+                # Section 6 online rungs: features are stop-gradient'ed inside the model, so
+                # this term reaches ONLY the ladder heads -- whose grads train_step removes
+                # from the main optimizer path and applies with the isolated probe SGD.
+                for rung in _LADDER_RUNGS:
+                    rung_loss = chunked_loss[f"{rung}_ce_sum"] / jnp.maximum(chunked_loss[f"{rung}_count"], 1.0)
+                    loss += rung_loss
+                    info[f"diagnostic/{rung}_loss"] = rung_loss
+                    info[f"diagnostic/{rung}_correct"] = chunked_loss[f"{rung}_correct"]
+                    info[f"diagnostic/{rung}_count"] = chunked_loss[f"{rung}_count"]
             if observation.seq_step_mask is not None:
                 info.update(
                     sequence_bucket_steps=jnp.asarray(observation.seq_step_mask.shape[1], dtype=jnp.float32),
@@ -274,6 +410,30 @@ def train_step(
             None if observation.seq_probe_mask is None else jnp.sum(observation.seq_probe_mask.astype(jnp.float32))
         )
 
+        # v3.4 objectives are ratios with data-only denominators too: compute the GLOBAL
+        # per-class counts (aux macro CE) and per-rung frame counts (ladder) from the full
+        # accumulated batch so summing microbatch contributions reproduces the exact
+        # full-batch objective.
+        aux_class_count_global = None
+        if observation.seq_subtask_class is not None:
+            num_aux_classes = getattr(config.model, "memory_aux_num_classes", 0)
+            aux_cls = observation.seq_subtask_class
+            aux_valid = (aux_cls >= 0) & (aux_cls < num_aux_classes) & observation.seq_step_mask
+            aux_onehot = jax.nn.one_hot(jnp.clip(aux_cls, 0, num_aux_classes - 1), num_aux_classes)
+            aux_class_count_global = jnp.sum(aux_onehot * aux_valid[..., None].astype(jnp.float32), axis=(0, 1, 2))
+            aux_margin_count_global = jnp.sum(aux_valid.astype(jnp.float32))
+        ladder_count_global = None
+        if observation.seq_side_label is not None and observation.seq_evidence_mask is not None:
+            side_ok = (observation.seq_side_label >= 0) & (observation.seq_side_label < 2)
+            ladder_count_global = {
+                "ladder_writer": jnp.sum(
+                    (observation.seq_evidence_mask & observation.seq_step_mask & side_ok[..., None]).astype(jnp.float32)
+                ),
+                "ladder_read": jnp.sum(
+                    (observation.seq_waiting_mask & observation.seq_step_mask & side_ok[..., None]).astype(jnp.float32)
+                ),
+            }
+
         def microbatch_loss_fn(model, rng, micro_observation, micro_actions):
             chunked_loss = model.compute_loss(rng, micro_observation, micro_actions, train=True)
             if not isinstance(chunked_loss, dict):
@@ -284,6 +444,8 @@ def train_step(
             loss = (flow_loss + model.ce_loss_weight * ce_loss) / accumulation_steps
             # These are additive contributions to the metrics of the effective global batch.
             info = {"flow_loss": flow_loss / accumulation_steps, "ce_loss": ce_loss / accumulation_steps}
+            if "write_grad_norm_sum" in chunked_loss:
+                info.update(_write_diagnostic_sums(chunked_loss))
             if "probe_ce_sum" in chunked_loss:
                 if global_probe_count is None:
                     raise ValueError("Probe losses require observation.seq_probe_mask.")
@@ -312,6 +474,30 @@ def train_step(
                         "diagnostic/probe_active_grid": active_grid,
                     }
                 )
+            if "aux_ce_class_sum" in chunked_loss:
+                if aux_class_count_global is None:
+                    raise ValueError("aux losses require observation.seq_subtask_class.")
+                present = aux_class_count_global > 0
+                per_class = jnp.where(
+                    present, chunked_loss["aux_ce_class_sum"] / jnp.maximum(aux_class_count_global, 1.0), 0.0
+                )
+                aux_contrib = jnp.sum(per_class) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+                loss += model.memory_aux_loss_weight * aux_contrib
+                info["aux_loss"] = aux_contrib  # additive: sums to the exact global macro CE
+                info.update(_aux_group_metrics(chunked_loss, model.memory_aux_side_class_ids))
+                if "aux_margin_sum" in chunked_loss:
+                    aux_margin = chunked_loss["aux_margin_sum"] / jnp.maximum(aux_margin_count_global, 1.0)
+                    loss += model.memory_aux_margin_weight * aux_margin
+                    info["aux_margin"] = aux_margin
+            if "ladder_writer_ce_sum" in chunked_loss:
+                if ladder_count_global is None:
+                    raise ValueError("ladder probe losses require the seq_side/evidence/waiting fields.")
+                for rung in _LADDER_RUNGS:
+                    rung_loss = chunked_loss[f"{rung}_ce_sum"] / jnp.maximum(ladder_count_global[rung], 1.0)
+                    loss += rung_loss
+                    info[f"diagnostic/{rung}_loss"] = rung_loss
+                    info[f"diagnostic/{rung}_correct"] = chunked_loss[f"{rung}_correct"]
+                    info[f"diagnostic/{rung}_count"] = chunked_loss[f"{rung}_count"]
             if micro_observation.seq_step_mask is not None:
                 info.update(
                     sequence_bucket_steps=jnp.asarray(
@@ -343,9 +529,17 @@ def train_step(
                 micro_observation,
                 actions[microbatch_index],
             )
+            accumulated_info = jax.tree.map(jnp.add, accumulated_info, micro_info)
+            write_max_key = "diagnostic/write_inner_grad_max"
+            if write_max_key in accumulated_info:
+                # Every other info leaf is additive across microbatches. The write max is the
+                # sole max-reduced leaf and must not be summed by the generic tree reduction.
+                accumulated_info[write_max_key] = jnp.maximum(
+                    carry[1][write_max_key], micro_info[write_max_key]
+                )
             return (
                 accumulated_loss + micro_loss,
-                jax.tree.map(jnp.add, accumulated_info, micro_info),
+                accumulated_info,
                 jax.tree.map(jnp.add, accumulated_grads, micro_grads),
             )
 
@@ -367,13 +561,50 @@ def train_step(
             grads, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
         )
 
+    # v3.4 Section 6: the probe ladder gets an ISOLATED optimizer. The ladder-head grads are
+    # extracted, then zeroed out of the main path BEFORE tx.update -- so they contribute
+    # nothing to the global clip norm or the Adam state -- and applied afterwards as a plain
+    # constant-LR SGD step. With probe features stop-gradient'ed in the model, one main-model
+    # update is bit-identical with the probes enabled or disabled (unit-tested).
+    ladder_isolated = getattr(config.model, "memory_ladder_probes", False)
+    if ladder_isolated:
+        ladder_grads = grads.filter(LADDER_PROBE_FILTER)
+        grads = nnx_utils.state_map(
+            grads, LADDER_PROBE_FILTER, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
+
+    # v34_run1 postmortem: pre-clip the memory-path gradient group to its own norm budget
+    # BEFORE the shared global clip. The recurrent memory backward can spike orders of
+    # magnitude above the rest of the model; without this, one bad chain scales EVERY
+    # parameter's update toward zero through the global clip (the observed explosion/collapse
+    # limit cycle). The group clip preserves the memory gradient's direction and leaves all
+    # non-memory gradients untouched.
+    if config.memory_grad_clip is not None:
+        memory_norm = optax.global_norm(grads.filter(MEMORY_PATH_FILTER))
+        memory_scale = jnp.minimum(1.0, config.memory_grad_clip / (memory_norm + 1e-12))
+        grads = nnx_utils.state_map(
+            grads,
+            MEMORY_PATH_FILTER,
+            # flax None-bias slots survive into the grads State as None-valued leaves.
+            lambda variable: variable if variable.value is None else variable.replace(variable.value * memory_scale),
+        )
+        loss_info["memory_grad_norm"] = memory_norm
+
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     if diagnostic_only_probe:
         updates = nnx_utils.state_map(
             updates, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
         )
+    if ladder_isolated:
+        # Erase the weight-decay-only AdamW update on the ladder leaves, then apply the SGD.
+        updates = nnx_utils.state_map(
+            updates, LADDER_PROBE_FILTER, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
     new_params = optax.apply_updates(params, updates)
+    if ladder_isolated:
+        ladder_new = jax.tree.map(lambda p, g: p - config.probe_lr * g, params.filter(LADDER_PROBE_FILTER), ladder_grads)
+        new_params = nnx.State.merge(new_params.filter(nnx.Not(LADDER_PROBE_FILTER)), ladder_new)
 
     # Update the model in place and return the new full state.
     nnx.update(model, new_params)
@@ -431,6 +662,7 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+    _log_training_identity(config)
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -442,7 +674,12 @@ def main(config: _config.TrainConfig):
             f"Microbatch size {microbatch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Cluster jobs can inherit an AFS home directory even though the working tree and caches
+    # live on Iris.  Allow launchers to choose the cache location without mutating HOME.
+    jax_cache_dir = os.environ.get("OPENPI_JAX_CACHE_DIR")
+    if jax_cache_dir is None:
+        jax_cache_dir = str(epath.Path("~/.cache/jax").expanduser())
+    jax.config.update("jax_compilation_cache_dir", jax_cache_dir)
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -531,7 +768,9 @@ def main(config: _config.TrainConfig):
                     reduced_info.update({f"{k}_p{i}": float(x) for i, x in enumerate(v)})
                 else:
                     reduced_info[f"{k}"] = float(v)
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if "_p" not in k)
+            info_str = ", ".join(
+                f"{k}={v:.4f}" for k, v in reduced_info.items() if not _is_per_position_metric(k)
+            )
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

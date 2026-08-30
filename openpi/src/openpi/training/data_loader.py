@@ -143,6 +143,24 @@ class FakeDataset(Dataset):
                 seq_probe_mask=probe_mask,
                 seq_probe_visible=probe_mask & (jnp.arange(t) < 3 * t // 4),
             )
+        # v3.4 fields: keep fake labels inside their valid ranges and give the phase masks a
+        # deterministic evidence-then-waiting shape so the aux/ladder paths execute.
+        replacements = {}
+        if observation.seq_subtask_class is not None:
+            replacements["seq_subtask_class"] = observation.seq_subtask_class % 2
+        if observation.seq_side_label is not None:
+            t = observation.seq_step_mask.shape[0]
+            replacements["seq_side_label"] = observation.seq_side_label % 2
+            replacements["seq_evidence_mask"] = observation.seq_step_mask & (jnp.arange(t) < t // 2)
+            replacements["seq_waiting_mask"] = observation.seq_step_mask & (jnp.arange(t) >= t // 2)
+        if observation.seq_state_masked is not None:
+            replacements["seq_state_masked"] = (jnp.asarray(index.__index__()) % 2).astype(bool)
+        if observation.token_state_mask is not None:
+            token_len = observation.token_state_mask.shape[-1]
+            span = (jnp.arange(token_len) >= token_len // 2) & (jnp.arange(token_len) < token_len // 2 + 3)
+            replacements["token_state_mask"] = jnp.broadcast_to(span, observation.token_state_mask.shape)
+        if replacements:
+            observation = dataclasses.replace(observation, **replacements)
 
         return {
             **observation.to_dict(),
@@ -219,6 +237,7 @@ def create_torch_dataset(
                     lookahead=data_config.subtask_lookahead,
                     episode_tasks=info["episode_tasks"],
                     tasks=dataset_meta.tasks,
+                    episode_waiting_valid=info.get("episode_waiting_valid", ()),
                 )
             )
         seq_transforms.append(
@@ -228,6 +247,8 @@ def create_torch_dataset(
                 episode_reveal=info["reveal"] if quiz else None,
                 episode_close=info["close"] if quiz else None,
                 episode_memory_window=_memory_critical_windows(info, data_config),
+                # v3.4 ladder-probe side label; dropped at repack unless the config carries it.
+                episode_side_label=info["side"],
             )
         )
         dataset = TransformedDataset(dataset, seq_transforms)
@@ -376,7 +397,127 @@ def _episode_info_table(
                 f"memory-critical phases missing/malformed in {int((~usable).sum())}/{num_episodes} "
                 "episodes; they are excluded from the memory-critical branch."
             )
+        if data_config.memory_waiting_max_speed is not None:
+            _trim_waiting_to_static(
+                info,
+                np.asarray(cols["state"], dtype=np.float32),
+                starts,
+                ends,
+                data_config,
+                stride=max(int(data_config.memory_stride_frames), 1),
+            )
     return info
+
+
+def _longest_static_run(
+    window: np.ndarray, max_speed: float, max_excursion: float
+) -> tuple[int, int] | None:
+    """Longest contiguous span of `window` [n, d] that holds still.
+
+    "Still" is two conditions, because either alone admits motion: no frame-to-frame step on any
+    dimension may exceed `max_speed` (catches motion onset), and the span's total per-dimension
+    excursion must stay within `max_excursion` (catches slow creep that never trips the speed
+    test). Returns inclusive [a, b] indices into `window`, or None when no span qualifies.
+    """
+    if len(window) < 2:
+        return None
+    speed = np.abs(np.diff(window, axis=0)).max(axis=1)
+    # A frame is quiet when the step that ARRIVES at it is small; the first frame has no
+    # arriving step, so it borrows the one leaving it. Seeding it True instead would make any
+    # window -- including one that moves throughout -- report a spurious static frame at 0.
+    quiet = np.concatenate([[speed[0] < max_speed], speed < max_speed])
+    best: tuple[int, int] | None = None
+    best_len = 0
+    start = 0
+    while start < len(quiet):
+        if not quiet[start]:
+            start += 1
+            continue
+        stop = start
+        while stop + 1 < len(quiet) and quiet[stop + 1]:
+            stop += 1
+        # The run is speed-quiet; walk its left edge in until the excursion also fits.
+        left = start
+        while left <= stop:
+            span = window[left : stop + 1]
+            if float((span.max(axis=0) - span.min(axis=0)).max()) <= max_excursion:
+                break
+            left += 1
+        # A single frame carries no evidence of stillness, so runs must span at least two.
+        if stop - left + 1 >= 2 and stop - left + 1 > best_len:
+            best_len = stop - left + 1
+            best = (left, stop)
+        start = stop + 1
+    return best
+
+
+def _trim_waiting_to_static(
+    info: dict[str, np.ndarray],
+    state: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    data_config: "_config.DataConfig",
+    stride: int,
+) -> None:
+    """Shrink [memory_lo, memory_hi] to each episode's stationary core and mark the waiting
+    frames it drops (v3.4.1 leak fix 1; see DataConfig.memory_waiting_max_speed).
+
+    Mutates `info` in place: tightens "memory_lo"/"memory_hi", adds "memory_critical_ok"
+    (False for episodes whose static core cannot hold a single grid step -- the phase bounds
+    stay accurate for the slice dead zone, but no memory-critical endpoint may be placed there),
+    and adds "episode_waiting_valid" -- per-episode per-frame booleans that are False exactly on
+    waiting-labeled frames outside the static core, so the aux target and the ladder waiting
+    mask can drop them.
+    """
+    max_speed = data_config.memory_waiting_max_speed
+    max_excursion = data_config.memory_waiting_max_excursion
+    num_episodes = len(info["length"])
+    valid = [np.ones(int(info["length"][e]), dtype=bool) for e in range(num_episodes)]
+    ok = info["memory_lo"] >= 0
+    trimmed = []
+    disabled = []
+    for e in range(num_episodes):
+        lo, hi = int(info["memory_lo"][e]), int(info["memory_hi"][e])
+        if lo < 0 or hi < lo:
+            continue
+        episode_state = state[starts[e] : ends[e]]
+        run = _longest_static_run(episode_state[lo : hi + 1], max_speed, max_excursion)
+        if run is None:
+            info["memory_lo"][e] = -1
+            info["memory_hi"][e] = -1
+            valid[e][lo : hi + 1] = False
+            ok[e] = False
+            disabled.append(e)
+            continue
+        new_lo, new_hi = lo + run[0], lo + run[1]
+        valid[e][lo:new_lo] = False
+        valid[e][new_hi + 1 : hi + 1] = False
+        info["memory_lo"][e] = new_lo
+        info["memory_hi"][e] = new_hi
+        if new_hi - new_lo + 1 < stride:
+            # Too short to place even one grid step: keep the honest phase bounds and label
+            # mask, but take the episode out of the memory-critical branch rather than crowding
+            # every endpoint onto a handful of frames.
+            ok[e] = False
+            disabled.append(e)
+        if (new_lo, new_hi) != (lo, hi):
+            trimmed.append((e, lo, hi, new_lo, new_hi))
+    info["episode_waiting_valid"] = tuple(valid)
+    info["memory_critical_ok"] = ok
+    dropped = int(sum((~v).sum() for v in valid))
+    total = int(sum(int(info["length"][e]) for e in range(num_episodes)))
+    logging.info(
+        f"waiting-phase static trim (speed<{max_speed}, excursion<{max_excursion}): "
+        f"{len(trimmed)}/{num_episodes} episodes trimmed, {dropped} waiting frames dropped from "
+        f"memory supervision ({dropped / max(total, 1):.1%} of all frames); "
+        f"memory-critical branch disabled for {disabled}"
+    )
+    for e, lo, hi, new_lo, new_hi in trimmed:
+        if (lo != new_lo) or (hi - new_hi) > 0:
+            logging.info(
+                f"  episode {e}: waiting [{lo}, {hi}] -> [{new_lo}, {new_hi}] "
+                f"(head -{new_lo - lo}, tail -{hi - new_hi})"
+            )
 
 
 def _memory_critical_windows(info: dict[str, np.ndarray], data_config: "_config.DataConfig") -> np.ndarray | None:
@@ -388,7 +529,10 @@ def _memory_critical_windows(info: dict[str, np.ndarray], data_config: "_config.
     evidence_start = info["evidence_start"]
     start_lo = np.maximum(1, evidence_start - data_config.memory_critical_start_pad)
     window = np.stack([start_lo, evidence_start, info["memory_lo"], info["memory_hi"]], axis=1)
-    window[evidence_start < 0] = -1
+    # A row needs BOTH a usable evidence phase and a waiting phase that can hold an endpoint:
+    # memory_critical_endpoint divides by the eligible-step count, so a row with no waiting
+    # window must be disabled here rather than reaching it.
+    window[(evidence_start < 0) | ~info.get("memory_critical_ok", info["memory_lo"] >= 0)] = -1
     return window.astype(np.int32)
 
 
@@ -427,6 +571,16 @@ def _sequence_sampling_info(
     starts = np.nonzero(np.append(True, episode[1:] != episode[:-1]))[0]
     frame = np.arange(len(episode)) - starts[np.searchsorted(starts, np.arange(len(episode)), side="right") - 1]
 
+    # Held-out evaluation episodes (v3.4: one per instruction x side cell) receive ZERO
+    # sampling mass in every branch -- full trajectories, slices, and memory-critical starts.
+    num_episodes = len(info["length"])
+    heldout = np.asarray(sorted(set(data_config.heldout_episodes)), dtype=np.int64)
+    if len(heldout) > 0:
+        if heldout.min() < 0 or heldout.max() >= num_episodes:
+            raise ValueError(f"heldout_episodes {heldout.tolist()} out of range [0, {num_episodes}).")
+        logging.info(f"holding out {len(heldout)} episodes from ALL training sampling: {heldout.tolist()}")
+    allowed = ~np.isin(episode, heldout)
+
     stride = data_config.memory_stride_frames
     length = info["length"][episode]
     valid_steps = np.minimum((length - frame + stride - 1) // stride, max_steps).astype(np.int32)
@@ -443,7 +597,7 @@ def _sequence_sampling_info(
         dead = usable & (frame > info["evidence_start"][episode]) & (frame <= memory_hi)
         in_window = usable & (frame >= window[:, 0][episode]) & (frame <= window[:, 1][episode])
         # the waiting phase must be reachable within the sequence budget
-        mc_ok = in_window & (memory_lo - frame <= (max_steps - 1) * stride)
+        mc_ok = in_window & (memory_lo - frame <= (max_steps - 1) * stride) & allowed
         # Each memory-critical start truncates at memory_critical_endpoint's DETERMINISTIC
         # step, so its exact valid length is known here and bucket assignment is precise --
         # BuildMemorySequence recomputes the identical endpoint at fetch time. (A per-draw
@@ -470,12 +624,13 @@ def _sequence_sampling_info(
     min_frames = data_config.memory_min_slice_steps * stride
     # ~in_window (not just ~mc_ok): a window start drawn as a slice would still be truncated
     # by BuildMemorySequence, so window frames belong to the memory-critical branch or nothing
-    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~dead & ~in_window
+    slice_ok = (frame > 0) & (frame + min_frames <= length) & ~dead & ~in_window & allowed
 
     slice_prob = data_config.memory_slice_prob
     weights = np.zeros(len(episode), dtype=np.float64)
-    n_full = int((frame == 0).sum())
-    weights[frame == 0] = (1.0 - mc_prob) * (1.0 - slice_prob) / max(n_full, 1)
+    full_ok = (frame == 0) & allowed
+    n_full = int(full_ok.sum())
+    weights[full_ok] = (1.0 - mc_prob) * (1.0 - slice_prob) / max(n_full, 1)
     if slice_prob > 0 and int(slice_ok.sum()) > 0:
         weights[slice_ok] = (1.0 - mc_prob) * slice_prob / int(slice_ok.sum())
 
@@ -1023,6 +1178,7 @@ _SEQUENCE_TIME_KEYS = frozenset(
         "token_ar_mask",
         "token_loss_mask",
         "token_fast_mask",
+        "token_state_mask",
         "tokenized_causal",
         "tokenized_causal_mask",
         "causal_fast_mask",
@@ -1031,6 +1187,11 @@ _SEQUENCE_TIME_KEYS = frozenset(
         "seq_probe_labels",
         "seq_probe_mask",
         "seq_probe_visible",
+        # v3.4 per-step supervision (seq_state_masked and seq_side_label are per-SEGMENT
+        # scalars and deliberately not listed).
+        "seq_subtask_class",
+        "seq_evidence_mask",
+        "seq_waiting_mask",
     }
 )
 

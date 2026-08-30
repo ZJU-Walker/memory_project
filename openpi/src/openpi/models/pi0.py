@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import logging
+import math
 
 import augmax
 import einops
@@ -87,8 +88,55 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def letterbox_patch_valid(source_hw: tuple[int, int], *, target: int = 224, patch_size: int = 14) -> tuple[bool, ...]:
+    """Static per-patch validity mask P_valid for a letterboxed camera (v3.4 plan 5.5).
+
+    Mirrors `image_tools.resize_with_pad` arithmetic exactly (including the int() truncation
+    and divmod padding split): a raw ``source_hw`` image is resized to fit ``target x target``
+    and padded with black. A SigLIP patch is valid iff its ``patch_size``-pixel cell overlaps
+    the real (non-padding) region. Returned flattened row-major over the (target/patch)^2 grid,
+    as a hashable tuple so it can live on an nnx.Module as static metadata.
+
+    For the YAM 480x640 top camera at 224x224/14 this marks grid rows 0-1 and 14-15 (the
+    letterbox bands) invalid -- the measured v3.3 write-attention sink.
+    """
+    source_height, source_width = source_hw
+    ratio = max(source_width / target, source_height / target)
+    resized_height = int(source_height / ratio)
+    resized_width = int(source_width / ratio)
+    pad_h0, _ = divmod(target - resized_height, 2)
+    pad_w0, _ = divmod(target - resized_width, 2)
+    if target % patch_size:
+        raise ValueError(f"patch size {patch_size} must divide the target resolution {target}.")
+    grid = target // patch_size
+    valid = []
+    for row in range(grid):
+        y0, y1 = row * patch_size, (row + 1) * patch_size
+        row_valid = y1 > pad_h0 and y0 < pad_h0 + resized_height
+        for col in range(grid):
+            x0, x1 = col * patch_size, (col + 1) * patch_size
+            col_valid = x1 > pad_w0 and x0 < pad_w0 + resized_width
+            valid.append(bool(row_valid and col_valid))
+    if not any(valid):
+        raise ValueError(f"letterbox geometry {source_hw} leaves no valid patch -- refusing an all-masked softmax.")
+    return tuple(valid)
+
+
 class MemoryQueryCompressor(nnx.Module):
-    """Learned query bank that cross-attends to the 256 layer-8 top-camera slots."""
+    """Learned query bank that cross-attends to the 256 layer-8 top-camera slots.
+
+    v3.4 (plan 5.5) additions, both default-off so v3.2/v3.3 checkpoints replay bit-exactly:
+      * ``qk_norm``: cosine attention -- queries and keys are L2-normalized per head and the
+        logits are scaled by a learned per-head temperature ``exp(lambda_h)`` initialized to
+        ``sqrt(head_dim)`` (unit-vector dot products have std ~1/sqrt(d), so restoring
+        ~unit-std logits needs a MULTIPLIER of sqrt(d), not 1/sqrt(d)) and clamped <= 64 so
+        attention cannot re-saturate.
+      * ``source_valid``: a static/broadcast per-patch validity mask applied as -inf on the
+        logits BEFORE the softmax. Training attention (:meth:`__call__`) and diagnostic
+        attention (:meth:`attention_probs`) share :meth:`_attention_logits`, so they are the
+        same object by construction -- an invalid patch is mathematically incapable of
+        receiving attention in either.
+    """
 
     def __init__(
         self,
@@ -97,6 +145,7 @@ class MemoryQueryCompressor(nnx.Module):
         width: int,
         num_heads: int,
         compute_dtype: jnp.dtype = jnp.float32,
+        qk_norm: bool = False,
         rngs: nnx.Rngs,
     ):
         if num_queries < 1 or num_heads < 1 or width % num_heads:
@@ -106,6 +155,7 @@ class MemoryQueryCompressor(nnx.Module):
         self.num_heads = num_heads
         self.head_dim = width // num_heads
         self.compute_dtype = jnp.dtype(compute_dtype)
+        self.qk_norm = qk_norm
         self.query_bank = nnx.Param(
             jax.random.normal(rngs.params(), (num_queries, width), dtype=jnp.float32) / jnp.sqrt(width)
         )
@@ -125,14 +175,50 @@ class MemoryQueryCompressor(nnx.Module):
         self.key_proj = linear(rngs=rngs)
         self.value_proj = linear(rngs=rngs)
         self.output_proj = linear(rngs=rngs)
+        if qk_norm:
+            # exp(lambda) = sqrt(head_dim) at init; lambda is learned per head.
+            self.logit_scale = nnx.Param(
+                jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32)
+            )
+
+    def _attention_logits(
+        self,
+        q: at.Float[at.Array, "b q h dh"],
+        k: at.Float[at.Array, "b n h dh"],
+        source_valid: at.Bool[at.Array, " n"] | at.Bool[at.Array, "b n"] | None,
+    ) -> at.Float[at.Array, "b h q n"]:
+        """Shared FP32 scaled-and-masked logits for __call__ and attention_probs."""
+        if self.qk_norm:
+            q32 = q.astype(jnp.float32)
+            k32 = k.astype(jnp.float32)
+            q32 = q32 * jax.lax.rsqrt(jnp.sum(jnp.square(q32), axis=-1, keepdims=True) + 1e-12)
+            k32 = k32 * jax.lax.rsqrt(jnp.sum(jnp.square(k32), axis=-1, keepdims=True) + 1e-12)
+            scale = jnp.minimum(jnp.exp(self.logit_scale.value), 64.0)
+            logits = jnp.einsum("bqhd,bnhd->bhqn", q32, k32, preferred_element_type=jnp.float32)
+            logits = logits * scale[None, :, None, None]
+        else:
+            logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
+            logits = logits * self.head_dim**-0.5
+        if source_valid is not None:
+            if source_valid.ndim == 1:
+                keep = source_valid[None, None, None, :]
+            elif source_valid.ndim == 2:
+                keep = source_valid[:, None, None, :]
+            else:
+                raise ValueError(f"source_valid must be [n] or [b, n]; got shape {source_valid.shape}.")
+            logits = jnp.where(keep, logits, -jnp.inf)
+        return logits
 
     def __call__(
         self,
         source: at.Float[at.Array, "b n d"],
         queries: at.Float[at.Array, "b q d"] | None = None,
+        source_valid: at.Bool[at.Array, " n"] | at.Bool[at.Array, "b n"] | None = None,
     ) -> at.Float[at.Array, "b q d"]:
         """Compress `source` into `num_queries` slots. `queries` overrides the learned bank
-        (v3.3 task-conditioned writes); None keeps the unconditioned broadcast bank."""
+        (v3.3 task-conditioned writes); None keeps the unconditioned broadcast bank.
+        `source_valid` masks source positions (e.g. letterbox padding patches) out of the
+        attention softmax entirely."""
         if source.ndim != 3 or source.shape[-1] != self.width:
             raise ValueError(f"query compressor expects [batch,tokens,{self.width}]; got {source.shape}.")
         batch = source.shape[0]
@@ -143,8 +229,8 @@ class MemoryQueryCompressor(nnx.Module):
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
         v = self.value_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
-        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
-        probs = jax.nn.softmax(logits * self.head_dim**-0.5, axis=-1).astype(v.dtype)
+        logits = self._attention_logits(q, k, source_valid)
+        probs = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
         pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
         return self.output_proj(pooled).astype(jnp.float32)
 
@@ -152,11 +238,13 @@ class MemoryQueryCompressor(nnx.Module):
         self,
         source: at.Float[at.Array, "b n d"],
         queries: at.Float[at.Array, "b q d"] | None = None,
+        source_valid: at.Bool[at.Array, " n"] | at.Bool[at.Array, "b n"] | None = None,
     ) -> at.Float[at.Array, "b h q n"]:
         """Offline diagnostic view of the query->source attention distribution.
 
         Recomputes exactly the q/k path of :meth:`__call__` (including an optional
-        conditioned query override) and returns the per-head FP32 softmax weights before they
+        conditioned query override and the source-validity mask, through the SAME
+        :meth:`_attention_logits`) and returns the per-head FP32 softmax weights before they
         are cast to the value dtype, so map mass sums to one per query slot regardless of the
         configured compute dtype.
         """
@@ -167,8 +255,7 @@ class MemoryQueryCompressor(nnx.Module):
             queries = jnp.broadcast_to(self.query_bank.value[None], (batch, self.num_queries, self.width))
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(source).reshape(batch, source.shape[1], self.num_heads, self.head_dim)
-        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
-        return jax.nn.softmax(logits * self.head_dim**-0.5, axis=-1)
+        return jax.nn.softmax(self._attention_logits(q, k, source_valid), axis=-1)
 
 
 class MemoryQueryConditioner(nnx.Module):
@@ -190,6 +277,7 @@ class MemoryQueryConditioner(nnx.Module):
         width: int,
         num_heads: int,
         compute_dtype: jnp.dtype = jnp.float32,
+        qk_norm: bool = False,
         rngs: nnx.Rngs,
     ):
         if num_queries < 1 or num_heads < 1 or width % num_heads:
@@ -199,6 +287,7 @@ class MemoryQueryConditioner(nnx.Module):
         self.num_heads = num_heads
         self.head_dim = width // num_heads
         self.compute_dtype = jnp.dtype(compute_dtype)
+        self.qk_norm = qk_norm
         linear = functools.partial(
             nnx.Linear,
             width,
@@ -211,6 +300,12 @@ class MemoryQueryConditioner(nnx.Module):
         self.key_proj = linear(rngs=rngs)
         self.value_proj = linear(rngs=rngs)
         self.output_proj = linear(kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+        if qk_norm:
+            # v3.4 plan 5.5: cosine attention with a learned per-head temperature, exactly as
+            # in MemoryQueryCompressor.
+            self.logit_scale = nnx.Param(
+                jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32)
+            )
 
     def __call__(
         self,
@@ -229,8 +324,17 @@ class MemoryQueryConditioner(nnx.Module):
         q = self.query_proj(queries).reshape(batch, self.num_queries, self.num_heads, self.head_dim)
         k = self.key_proj(context).reshape(batch, context.shape[1], self.num_heads, self.head_dim)
         v = self.value_proj(context).reshape(batch, context.shape[1], self.num_heads, self.head_dim)
-        logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
-        logits = jnp.where(context_mask[:, None, None, :], logits * self.head_dim**-0.5, -1e30)
+        if self.qk_norm:
+            q32 = q.astype(jnp.float32)
+            k32 = k.astype(jnp.float32)
+            q32 = q32 * jax.lax.rsqrt(jnp.sum(jnp.square(q32), axis=-1, keepdims=True) + 1e-12)
+            k32 = k32 * jax.lax.rsqrt(jnp.sum(jnp.square(k32), axis=-1, keepdims=True) + 1e-12)
+            scale = jnp.minimum(jnp.exp(self.logit_scale.value), 64.0)
+            logits = jnp.einsum("bqhd,bnhd->bhqn", q32, k32, preferred_element_type=jnp.float32)
+            logits = jnp.where(context_mask[:, None, None, :], logits * scale[None, :, None, None], -1e30)
+        else:
+            logits = jnp.einsum("bqhd,bnhd->bhqn", q, k, preferred_element_type=jnp.float32)
+            logits = jnp.where(context_mask[:, None, None, :], logits * self.head_dim**-0.5, -1e30)
         probs = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
         pooled = jnp.einsum("bhqn,bnhd->bqhd", probs, v).reshape(batch, self.num_queries, self.width)
         # an all-padding context (never the case in practice) must not leak the uniform softmax
@@ -286,7 +390,9 @@ class Pi0(_model.BaseModel):
         self.predict_with_memory = config.predict_with_memory
         if config.predict_with_memory:
             self.memory = _memory.TitansMemory(config.memory, rngs=rngs)
-            # zero-init content gate: an untrained/empty memory injects exactly-zero token content
+            # zero-init content gate: an untrained/empty memory injects exactly-zero token content.
+            # Kept in the parameter tree even under the v3.4 tanh_rms injection (where it is
+            # unused and stays zero) so the tree layout is stable across injection modes.
             self.memory_gate = nnx.Param(jnp.zeros((config.memory.d_value,), dtype=jnp.float32))
             self.memory_layer = config.memory_layer
             self.memory_architecture = config.memory_architecture
@@ -300,12 +406,78 @@ class Pi0(_model.BaseModel):
             # loadable; clean no-probe recipes explicitly mask its optimizer updates.
             self.probe_head = nnx.Linear(config.memory.d_value, config.memory_probe_classes, rngs=rngs)
             self.memory_task_conditioned_write = config.memory_task_conditioned_write
+            # ---- v3.4 flags (V34_PLAN_final.md); all default to the v3.2/v3.3 behavior ----
+            self.memory_injection_mode = config.memory_injection_mode
+            self.memory_injection_c = config.memory_injection_c
+            self.memory_injection_tau = config.memory_injection_tau
+            self.memory_conditioner_context = config.memory_conditioner_context
+            self.memory_blind_tokens = config.memory_blind_tokens
+            self.memory_reseed_ce = config.memory_reseed_ce
+            self.memory_state_mask_prob = config.memory_state_mask_prob
+            self.memory_state_mask_dual_view = config.memory_state_mask_dual_view
+            self.memory_aux_loss_weight = config.memory_aux_loss_weight
+            self.memory_aux_margin_weight = config.memory_aux_margin_weight
+            self.memory_aux_margin_gamma = config.memory_aux_margin_gamma
+            self.memory_aux_query_space = config.memory_aux_query_space
+            self.memory_aux_side_class_ids = tuple(config.memory_aux_side_class_ids)
+            self.memory_ladder_probes = config.memory_ladder_probes
+            # Static per-patch letterbox validity over the top camera's SigLIP grid (plan 5.5).
+            # SigLIP So400m/14 at 224x224 -> patch 14, 16x16 grid = the 256 h8_top slots.
+            self.top_patch_valid = (
+                letterbox_patch_valid(tuple(config.memory_letterbox_source_hw))
+                if config.memory_letterbox_source_hw is not None
+                else None
+            )
+            if config.memory_injection_mode == "tanh_rms":
+                # plan 5.6: memory_tokens = tanh(w) * retrieved * c / max(rms, tau); w zero-init
+                # preserves the exact-zero start of the injection.
+                self.memory_inject_w = nnx.Param(jnp.zeros((config.memory.d_value,), dtype=jnp.float32))
+            if config.memory_blind_tokens:
+                # Learned content-free slot embeddings added to the injected memory tokens.
+                # This is the plan-5.3 pre-registered register-token fallback, merged into the
+                # memory slots: with blinding, a zero-injection memory-token stream is EXACTLY
+                # zero through every late block, and each RMSNorm evaluated at zero multiplies
+                # the backward by rsqrt(eps)=1e3 -- measured as a 1.6e33 gradient on the
+                # injection gate that overflows the global clip norm to inf and freezes ALL
+                # training. The slot embeddings carry no memory information (frame- and
+                # content-invariant); the content gate's exact-zero start is untouched.
+                # Unit-std init matches the ~unit RMS of embedded prompt tokens.
+                self.memory_slot_embedding = nnx.Param(
+                    jax.random.normal(
+                        rngs.params(), (config.memory_query_tokens, config.memory.d_value), dtype=jnp.float32
+                    )
+                )
+            if config.memory_state_mask_prob > 0:
+                # plan 5.2: learned null embedding substituted for state-digit tokens at the
+                # input. Unit-std init (matching embedded-token RMS), NOT zeros: a zero
+                # embedding sits at the block-0 RMSNorm singularity, whose rsqrt(eps) backward
+                # would inflate the null embedding's gradients ~1e3x and starve everything else
+                # through the global clip.
+                self.state_null_embedding = nnx.Param(
+                    jax.random.normal(rngs.params(), (paligemma_config.width,), dtype=jnp.float32)
+                )
+            if config.memory_aux_loss_weight > 0:
+                # plan 5.1: frame-invariant auxiliary query bank (L2-normalized at use) + head.
+                aux_query_dim = (
+                    config.memory.d_key if config.memory_aux_query_space == "key" else paligemma_config.width
+                )
+                self.memory_aux_queries = nnx.Param(
+                    jax.random.normal(rngs.params(), (config.memory_query_tokens, aux_query_dim), dtype=jnp.float32)
+                )
+                self.memory_aux_head = nnx.Linear(config.memory.d_value, config.memory_aux_num_classes, rngs=rngs)
+            if config.memory_ladder_probes:
+                # Section 6 online rungs: writer content (rung 1) and standard-read retrieval
+                # (rung 4). Binary side heads; features are stop-gradient'ed at the loss site
+                # and updates are isolated in train.py.
+                self.ladder_writer_head = nnx.Linear(paligemma_config.width, 2, rngs=rngs)
+                self.ladder_read_head = nnx.Linear(config.memory.d_value, 2, rngs=rngs)
             if config.memory_architecture == "v32_layer8_dual_query":
                 self.read_query_compressor = MemoryQueryCompressor(
                     num_queries=config.memory_query_tokens,
                     width=paligemma_config.width,
                     num_heads=config.memory_query_heads,
                     compute_dtype=jnp.dtype(config.dtype),
+                    qk_norm=config.memory_qk_norm,
                     rngs=rngs,
                 )
                 self.write_query_compressor = MemoryQueryCompressor(
@@ -313,6 +485,7 @@ class Pi0(_model.BaseModel):
                     width=paligemma_config.width,
                     num_heads=config.memory_query_heads,
                     compute_dtype=jnp.dtype(config.dtype),
+                    qk_norm=config.memory_qk_norm,
                     rngs=rngs,
                 )
                 if config.memory_task_conditioned_write:
@@ -321,6 +494,7 @@ class Pi0(_model.BaseModel):
                         width=paligemma_config.width,
                         num_heads=config.memory_query_heads,
                         compute_dtype=jnp.dtype(config.dtype),
+                        qk_norm=config.memory_qk_norm,
                         rngs=rngs,
                     )
 
@@ -364,7 +538,93 @@ class Pi0(_model.BaseModel):
             raise ValueError(f"attention mask width {mask.shape[-1]} exceeds cache capacity {capacity}.")
         return jnp.pad(mask, ((0, 0), (0, 0), (0, capacity - mask.shape[-1])))
 
-    def _v32_prepare_memory_prefix(
+    def _v32_content_gate(self) -> at.Array:
+        """The effective per-channel content scale of the memory injection: the zero-init gate
+        (v3.2/v3.3) or tanh(w) under the v3.4 tanh_rms form. Both start exactly zero."""
+        if getattr(self, "memory_injection_mode", "gate") == "tanh_rms":
+            return jnp.tanh(self.memory_inject_w.value)
+        return self.memory_gate.value
+
+    def _v32_inject_memory(self, retrieved: at.Array, gate_value: at.Array | None = None) -> at.Array:
+        """Turn raw retrieval into injectable memory-token content (FP32).
+
+        "gate" mode (v3.2/v3.3): gate * retrieved -- measured at ~1/62,600 of residual-stream
+        RMS on the v3.3 checkpoint, numerically invisible to blocks 9..17.
+        "tanh_rms" mode (v3.4 plan 5.6): tanh(w) * retrieved * c / max(rms(retrieved), tau),
+        rms PER TOKEN over channels. The max(rms, tau) floor is non-amplifying: near-zero
+        reads (fresh memory) stay near zero instead of being RMS-normalized up to full
+        residual scale. `gate_value` overrides the learned scale vector (diagnostics only,
+        e.g. probing the gradient pathway while the zero-init scale is still closed).
+        """
+        gate = self._v32_content_gate() if gate_value is None else gate_value
+        if getattr(self, "memory_injection_mode", "gate") == "tanh_rms":
+            retrieved32 = retrieved.astype(jnp.float32)
+            # sqrt(x + eps^2) rather than sqrt(x): a FRESH memory retrieves exactly zero, where
+            # sqrt's derivative is infinite and the zero cotangent from max(rms, tau) would
+            # backpropagate 0 * inf = NaN into every memory parameter (the _l2_norm lesson).
+            rms = jnp.sqrt(jnp.mean(jnp.square(retrieved32), axis=-1, keepdims=True) + 1e-12)
+            normed = retrieved32 * (self.memory_injection_c / jnp.maximum(rms, self.memory_injection_tau))
+            return gate * normed
+        return gate * retrieved
+
+    def _v32_top_patch_valid(self, top_token_count: int) -> at.Array | None:
+        """The static letterbox validity mask as a device array, or None when not configured."""
+        patch_valid = getattr(self, "top_patch_valid", None)
+        if patch_valid is None:
+            return None
+        if len(patch_valid) != top_token_count:
+            raise ValueError(
+                f"letterbox patch mask covers {len(patch_valid)} patches but the top camera has "
+                f"{top_token_count} tokens."
+            )
+        return jnp.asarray(patch_valid, dtype=bool)
+
+    def _v32_ce_seed_hidden(self, final_prefix: at.Array, base_prefix_mask: at.Array) -> at.Array:
+        """First-causal-token seed hidden state (v3.4 plan 5.4): the LAST VALID NON-MEMORY
+        prefix position, gathered with the pre-memory 848-wide mask -- never the concatenated
+        split mask, whose appended memory positions are all-ones and would select the last
+        memory token again. Returns [b, 1, emb]."""
+        batch, prefix_len = base_prefix_mask.shape
+        if final_prefix.shape[1] < prefix_len:
+            raise ValueError(
+                f"final_prefix covers {final_prefix.shape[1]} positions but the pre-memory mask is {prefix_len} wide."
+            )
+        positions = jnp.arange(prefix_len, dtype=jnp.int32)
+        last_valid = jnp.max(jnp.where(base_prefix_mask, positions[None], -1), axis=-1)
+        last_valid = jnp.maximum(last_valid, 0)  # an all-padding prefix cannot occur in practice
+        return final_prefix[jnp.arange(batch), last_valid][:, None]
+
+    def _v32_causal_seed(self, final_prefix: at.Array, base_prefix_mask: at.Array) -> at.Array:
+        """The hidden state that predicts causal token 0: reseeded (plan 5.4) or the legacy
+        last-memory-token output."""
+        if getattr(self, "memory_reseed_ce", False):
+            return self._v32_ce_seed_hidden(final_prefix, base_prefix_mask)
+        return final_prefix[:, -1:]
+
+    def _v32_apply_state_null(
+        self,
+        prefix_tokens: at.Array,
+        prefix_mask: at.Array,
+        token_state_mask: at.Array | None,
+        segment_masked: at.Array | None,
+    ) -> at.Array:
+        """Input-level per-segment state masking (v3.4 plan 5.2): replace the embeddings of the
+        state-digit token positions with the learned null embedding for samples whose segment
+        drew the mask. A no-op when either input is absent."""
+        if token_state_mask is None or segment_masked is None:
+            return prefix_tokens
+        batch, prefix_len = prefix_mask.shape
+        num_img = prefix_len - self.max_token_len
+        if token_state_mask.shape != (batch, self.max_token_len):
+            raise ValueError(
+                f"token_state_mask must be [batch, {self.max_token_len}]; got {token_state_mask.shape}."
+            )
+        replace = token_state_mask & segment_masked[:, None]
+        full = jnp.concatenate([jnp.zeros((batch, num_img), dtype=bool), replace], axis=1)
+        null = self.state_null_embedding.value.astype(prefix_tokens.dtype)
+        return jnp.where(full[..., None], null[None, None, :], prefix_tokens)
+
+    def _v32_prepare_memory_interface(
         self,
         prefix_tokens: at.Array,
         prefix_mask: at.Array,
@@ -374,11 +634,15 @@ class Pi0(_model.BaseModel):
         top_token_count: int,
         zero_read: bool = False,
         gate_value: at.Array | None = None,
+        state_token_mask: at.Array | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
-        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once.
+        """Run only blocks 0..memory_layer and materialize the dual-query interface.
 
         `gate_value` overrides the learned content gate (diagnostics only, e.g. probing the
         gradient pathway while the zero-init gate is still closed); None uses the parameter.
+        `state_token_mask` marks the state-digit positions within the tokenized prompt; it is
+        REQUIRED when the conditioner context is 'instruction_only' (v3.4 plan 5.9) so that a
+        forgotten call site fails loudly instead of silently running a different writer.
         """
 
         if self.memory_architecture != "v32_layer8_dual_query":
@@ -402,28 +666,119 @@ class Pi0(_model.BaseModel):
             apply_final_norm=False,
         )
         h8_top = h8_all[:, :top_token_count].astype(jnp.float32)
-        read_queries = self.read_query_compressor(h8_top)
+        source_valid = self._v32_top_patch_valid(top_token_count)
+        read_queries = self.read_query_compressor(h8_top, source_valid=source_valid)
         write_queries = None
         if getattr(self, "memory_task_conditioned_write", False):
             # Task conditioning (v3.3): the non-image prefix positions carry the tokenized
             # instruction (and state); their layer-8 hidden states are already computed above.
             num_img = prefix_len - self.max_token_len
+            context_mask = prefix_mask[:, num_img:]
+            if getattr(self, "memory_conditioner_context", "instruction_state") == "instruction_only":
+                # v3.4 plan 5.9: exclude the state-digit rows -- a dedicated phase channel,
+                # given that state encodes phase strongly and the v3.3 writer collapsed to it.
+                if state_token_mask is None:
+                    raise ValueError(
+                        "memory_conditioner_context='instruction_only' requires the observation's "
+                        "token_state_mask at every call site."
+                    )
+                if state_token_mask.shape != context_mask.shape:
+                    raise ValueError(
+                        f"token_state_mask shape {state_token_mask.shape} must match the text rows "
+                        f"{context_mask.shape}."
+                    )
+                context_mask = context_mask & ~state_token_mask
             write_queries = self.write_query_conditioner(
                 self.write_query_compressor.query_bank.value,
                 h8_all[:, num_img:].astype(jnp.float32),
-                prefix_mask[:, num_img:],
+                context_mask,
             )
-        write_tokens = self.write_query_compressor(h8_top, queries=write_queries)
+        write_tokens = self.write_query_compressor(h8_top, queries=write_queries, source_valid=source_valid)
         retrieved = self.memory.read(memory_state, read_queries)
         if zero_read:
             retrieved = jnp.zeros_like(retrieved)
-        gate = self.memory_gate.value if gate_value is None else gate_value
-        memory_tokens = (gate * retrieved).astype(prefix_tokens.dtype)
+        memory_content = self._v32_inject_memory(retrieved, gate_value)
+        slot_embedding = getattr(self, "memory_slot_embedding", None)
+        if slot_embedding is not None:
+            # Content-free learned slot embeddings (see __init__): they survive zero_read on
+            # purpose -- zero_read is the CONTENT ablation; the slots' structural presence is
+            # the separate token ablation (plan 5.3 correction).
+            memory_content = memory_content + slot_embedding.value[None]
+        memory_tokens = memory_content.astype(prefix_tokens.dtype)
+
+        return {
+            "cache": cache,
+            "h8_all": h8_all,
+            "h8_top": h8_top,
+            "memory_tokens": memory_tokens,
+            "read_queries": read_queries,
+            # None when unconditioned; the conditioned [b, q, d] bank otherwise (diagnostics
+            # must pass it to attention_probs to see the attention the write actually used)
+            "write_queries": write_queries,
+            "write_tokens": write_tokens,
+            "retrieved": retrieved,
+            "prefix_mask": prefix_mask,
+            "prefix_ar": prefix_ar,
+            "capacity": jnp.asarray(capacity, dtype=jnp.int32),
+        }
+
+    def _v32_split_late_mask(self, split_mask: at.Array, split_ar: at.Array, prefix_len: int) -> at.Array:
+        """The blocks memory_layer+1..end attention mask over [h8_all | memory tokens].
+
+        With ``memory_blind_tokens`` (v3.4 plan 5.3) the memory-token QUERY rows attend only to
+        the memory positions themselves (self/mutual 16x16 block -- never fully masked, which
+        would NaN the softmax) while remaining K/V sources for every other row: a memory
+        token's late-block output becomes a function of retrieved content only, not an
+        attention summary of images/state ("readout register" hijack).
+        """
+        full = make_attn_mask(split_mask, split_ar)
+        if getattr(self, "memory_blind_tokens", False):
+            split_len = split_mask.shape[1]
+            is_memory = jnp.arange(split_len) >= prefix_len
+            full = jnp.where(is_memory[None, :, None], is_memory[None, None, :], full)
+        return full
+
+    def _v32_prepare_memory_prefix(
+        self,
+        prefix_tokens: at.Array,
+        prefix_mask: at.Array,
+        prefix_ar: at.Array,
+        memory_state: _memory.MemoryState,
+        *,
+        top_token_count: int,
+        zero_read: bool = False,
+        gate_value: at.Array | None = None,
+        state_token_mask: at.Array | None = None,
+    ) -> dict[str, at.Array | _gemma.KVCache]:
+        """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once.
+
+        `gate_value` overrides the learned content gate (diagnostics only, e.g. probing the
+        gradient pathway while the zero-init gate is still closed); None uses the parameter.
+        """
+
+        prepared = self._v32_prepare_memory_interface(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=top_token_count,
+            zero_read=zero_read,
+            gate_value=gate_value,
+            state_token_mask=state_token_mask,
+        )
+        batch, prefix_len = prefix_mask.shape
+        mem_len = self.memory_query_tokens
+        capacity = prefix_len + mem_len + self.causal_token_len
+        depth = self.PaliGemma.llm.module.configs[0].depth
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        cache = prepared["cache"]
+        h8_all = prepared["h8_all"]
+        memory_tokens = prepared["memory_tokens"]
 
         split_tokens = jnp.concatenate([h8_all, memory_tokens], axis=1)
         split_mask = jnp.concatenate([prefix_mask, jnp.ones((batch, mem_len), dtype=bool)], axis=1)
         split_ar = jnp.concatenate([prefix_ar, jnp.zeros((batch, mem_len), dtype=prefix_ar.dtype)], axis=1)
-        late_mask = self._pad_attention_columns(make_attn_mask(split_mask, split_ar), capacity)
+        late_mask = self._pad_attention_columns(self._v32_split_late_mask(split_mask, split_ar, prefix_len), capacity)
         split_positions = jnp.concatenate(
             [positions, prefix_len + jnp.broadcast_to(jnp.arange(mem_len), (batch, mem_len))], axis=1
         )
@@ -437,18 +792,9 @@ class Pi0(_model.BaseModel):
             active_layers=late_active,
         )
         return {
+            **prepared,
             "cache": cache,
             "final_prefix": final_prefix,
-            "h8_top": h8_top,
-            "read_queries": read_queries,
-            # None when unconditioned; the conditioned [b, q, d] bank otherwise (diagnostics
-            # must pass it to attention_probs to see the attention the write actually used)
-            "write_queries": write_queries,
-            "write_tokens": write_tokens,
-            "retrieved": retrieved,
-            "prefix_mask": prefix_mask,
-            "prefix_ar": prefix_ar,
-            "capacity": jnp.asarray(capacity, dtype=jnp.int32),
         }
 
     def _v32_causal_mask(self, prefix_mask: at.Array, causal_mask: at.Array) -> at.Array:
@@ -1712,7 +2058,7 @@ class Pi0(_model.BaseModel):
         Each row of ``prompt_to_top`` is one softmax over ALL prefix keys, so it does not
         sum to one; the ``*_mass`` entries close the budget. Which rows belong to the
         instruction words versus the discretized state digits is a tokenizer question,
-        so callers slice rows themselves (see diagnostics/v33_prompt_attention.py).
+        so callers must slice rows using the tokenizer-provided masks.
 
         ``layer=-1`` returns the whole depth at once -- every map/mass entry gains a
         leading per-layer axis after batch ([b, depth, ...]). ``head=-1`` does the same
@@ -1903,6 +2249,89 @@ class Pi0(_model.BaseModel):
             "retrieval_rms": jnp.sqrt(jnp.mean(jnp.square(retrieved))),
         }
 
+    @staticmethod
+    def _v32_memory_scale_metrics(
+        prepared: dict[str, at.Array | _gemma.KVCache], *, num_img: int
+    ) -> dict[str, at.Array]:
+        """RMS measurements shared by the full and early-only memory diagnostics."""
+
+        h8_all = prepared["h8_all"]
+        h8_top = prepared["h8_top"]
+        retrieved = prepared["retrieved"]
+        memory_tokens = prepared["memory_tokens"]
+        prefix_mask = prepared["prefix_mask"]
+        h8_all_f32 = h8_all.astype(jnp.float32)
+        valid = prefix_mask[..., None].astype(jnp.float32)
+        hidden_width = h8_all.shape[-1]
+        h8_valid_token_count = jnp.sum(prefix_mask, axis=1)
+        h8_valid_count = jnp.maximum(h8_valid_token_count * hidden_width, 1)
+        context_mask = prefix_mask[:, num_img:]
+        context_valid = context_mask[..., None].astype(jnp.float32)
+        context_valid_count = jnp.maximum(jnp.sum(context_mask, axis=1) * hidden_width, 1)
+        return {
+            "h8_all_rms": jnp.sqrt(jnp.mean(jnp.square(h8_all_f32), axis=(1, 2))),
+            "h8_valid_rms": jnp.sqrt(
+                jnp.sum(jnp.square(h8_all_f32) * valid, axis=(1, 2)) / h8_valid_count
+            ),
+            "h8_valid_token_count": h8_valid_token_count,
+            "h8_image_rms": jnp.sqrt(jnp.mean(jnp.square(h8_all_f32[:, :num_img]), axis=(1, 2))),
+            "h8_context_valid_rms": jnp.sqrt(
+                jnp.sum(jnp.square(h8_all_f32[:, num_img:]) * context_valid, axis=(1, 2))
+                / context_valid_count
+            ),
+            "h8_top_rms": jnp.sqrt(jnp.mean(jnp.square(h8_top.astype(jnp.float32)), axis=(1, 2))),
+            "retrieved_rms": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
+            "memory_token_rms": jnp.sqrt(
+                jnp.mean(jnp.square(memory_tokens.astype(jnp.float32)), axis=(1, 2))
+            ),
+        }
+
+    def v32_memory_interface_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+    ) -> dict[str, at.Array]:
+        """CPU-efficient v3.2/v3.3 replay of one frame's memory interface.
+
+        This is the early-only counterpart of :meth:`v32_query_attention_step`: it uses the
+        identical preprocessing, cache geometry, blocks ``0..memory_layer``, task-conditioned
+        writer (when configured), pre-write read, gate, and RMS definitions. It deliberately
+        skips every later transformer block, attention-map recomputation, and per-slot write
+        diagnostics. The returned ``write_tokens`` can therefore be passed directly to
+        ``memory.write`` by an offline recurrent replay without paying for policy prediction.
+        """
+
+        assert self.predict_with_memory, "the model was not built with predict_with_memory"
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("memory-interface diagnostics are only defined for the v3.2/v3.3 architecture.")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        num_img = prefix_mask.shape[1] - self.max_token_len
+        prepared = self._v32_prepare_memory_interface(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=num_img // len(preprocessed.images),
+            state_token_mask=preprocessed.token_state_mask,
+        )
+        h8_top = prepared["h8_top"]
+        write_keys, write_values = self.memory.project_kv(prepared["write_tokens"])
+        result = {
+            "read_queries": prepared["read_queries"],
+            "write_tokens": prepared["write_tokens"],
+            "retrieved": prepared["retrieved"],
+            # v3.4 ladder support: the exact key/value pairs the write would store (rung 2's
+            # own-key recall reads back read_key(M_t, write_keys) after the caller commits).
+            "write_keys": write_keys,
+            "write_values": write_values,
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self._v32_content_gate()), (h8_top.shape[0],)),
+            **self._v32_memory_scale_metrics(prepared, num_img=num_img),
+        }
+        if getattr(self, "memory_task_conditioned_write", False):
+            result["write_queries"] = prepared["write_queries"]
+        return result
+
     def v32_query_attention_step(
         self,
         observation: _model.Observation,
@@ -1923,14 +2352,17 @@ class Pi0(_model.BaseModel):
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
         num_img = prefix_mask.shape[1] - self.max_token_len
+        top_tokens = num_img // len(preprocessed.images)
         prepared = self._v32_prepare_memory_prefix(
             prefix_tokens,
             prefix_mask,
             prefix_ar,
             memory_state,
-            top_token_count=num_img // len(preprocessed.images),
+            top_token_count=top_tokens,
+            state_token_mask=preprocessed.token_state_mask,
         )
         h8_top = prepared["h8_top"]
+        source_valid = self._v32_top_patch_valid(top_tokens)
         write_tokens = prepared["write_tokens"]
         retrieved = prepared["retrieved"]
         slot_aux = self.memory.token_write_diagnostics(memory_state, write_tokens)
@@ -1941,18 +2373,23 @@ class Pi0(_model.BaseModel):
             # direct readout of how much the instruction steers the writer.
             conditioned = {
                 "write_queries": prepared["write_queries"],
-                "write_attention_base": self.write_query_compressor.attention_probs(h8_top),
+                "write_attention_base": self.write_query_compressor.attention_probs(
+                    h8_top, source_valid=source_valid
+                ),
             }
         return {
-            "read_attention": self.read_query_compressor.attention_probs(h8_top),
-            "write_attention": self.write_query_compressor.attention_probs(h8_top, queries=prepared["write_queries"]),
+            "read_attention": self.read_query_compressor.attention_probs(h8_top, source_valid=source_valid),
+            "write_attention": self.write_query_compressor.attention_probs(
+                h8_top, queries=prepared["write_queries"], source_valid=source_valid
+            ),
             "read_queries": prepared["read_queries"],
             "write_tokens": write_tokens,
             "retrieved": retrieved,
             "retrieved_slot_norm": jnp.linalg.norm(retrieved.astype(jnp.float32), axis=-1),
             "write_slot_norm": jnp.linalg.norm(write_tokens.astype(jnp.float32), axis=-1),
             "h8_top_norm": jnp.linalg.norm(h8_top, axis=-1),
-            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (h8_top.shape[0],)),
+            "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self._v32_content_gate()), (h8_top.shape[0],)),
+            **self._v32_memory_scale_metrics(prepared, num_img=num_img),
             **conditioned,
             **{f"write_slot_{key}": value for key, value in slot_aux.items()},
         }
@@ -1985,7 +2422,11 @@ class Pi0(_model.BaseModel):
         b, t = observation.seq_step_mask.shape
         causal_len = observation.tokenized_causal.shape[-1]
         mem_len = self.memory_query_tokens
-        gate = None if gate_override is None else jnp.full_like(self.memory_gate.value, gate_override)
+        gate = (
+            None
+            if gate_override is None
+            else jnp.full((self.memory.config.d_value,), gate_override, dtype=jnp.float32)
+        )
 
         def step_first(x):
             return jnp.moveaxis(x, 1, 0)
@@ -1999,6 +2440,8 @@ class Pi0(_model.BaseModel):
             "causal_mask": step_first(observation.tokenized_causal_mask),
             "step_valid": step_first(observation.seq_step_mask),
         }
+        if observation.token_state_mask is not None:
+            xs["token_state_mask"] = step_first(observation.token_state_mask)
 
         def endpoint_ce(taps):
             def step(state, x):
@@ -2019,6 +2462,7 @@ class Pi0(_model.BaseModel):
                     state,
                     top_token_count=num_img // len(x["images"]),
                     gate_value=gate,
+                    state_token_mask=x.get("token_state_mask"),
                 )
                 causal_mask_k = x["causal_mask"]
                 causal_emb = self.PaliGemma.llm(x["causal"], method="embed")
@@ -2032,7 +2476,9 @@ class Pi0(_model.BaseModel):
                     kv_cache=prepared["cache"],
                     cache_position=prefix_len + mem_len,
                 )
-                ce_hidden = jnp.concatenate([prepared["final_prefix"][:, -1:], causal_out[:, :-1]], axis=1)
+                ce_hidden = jnp.concatenate(
+                    [self._v32_causal_seed(prepared["final_prefix"], prefix_mask), causal_out[:, :-1]], axis=1
+                )
                 logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
                 token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1)[
                     ..., 0
@@ -2076,9 +2522,15 @@ class Pi0(_model.BaseModel):
         forced_subtask_tokens: at.Int[at.Array, "b cl"] | None,
         forced_subtask_mask: at.Bool[at.Array, "b cl"] | None,
         zero_read: bool,
-        allow_write: bool,
+        write_mode: str,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
-        """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens."""
+        """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens.
+
+        ``write_mode`` implements the plan-8.4 three-way retention control:
+        "normal" commits the full Titans update, "frozen" returns the input state unchanged
+        (M_t = M_{t-1}, S_t = S_{t-1} -- the old ``allow_write=False``), and "dynamics_only"
+        applies S_t = eta S_{t-1}, M_t = (1-alpha) M_{t-1} + S_t with the gradient term zeroed.
+        """
 
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         batch = preprocessed.state.shape[0]
@@ -2106,6 +2558,7 @@ class Pi0(_model.BaseModel):
             memory_state,
             top_token_count=top_tokens,
             zero_read=zero_read,
+            state_token_mask=preprocessed.token_state_mask,
         )
         kv_cache = prepared["cache"]
         final_prefix = prepared["final_prefix"]
@@ -2113,19 +2566,22 @@ class Pi0(_model.BaseModel):
         retrieved = prepared["retrieved"]
 
         def finish(actions, tokens, token_mask, *, extra=None):
-            candidate_state, write_aux = self.memory.write(memory_state, write_tokens)
-            new_state = candidate_state if allow_write else memory_state
+            if write_mode == "dynamics_only":
+                candidate_state, write_aux = self.memory.decay_step(memory_state, write_tokens)
+            else:
+                candidate_state, write_aux = self.memory.write(memory_state, write_tokens)
+            new_state = memory_state if write_mode == "frozen" else candidate_state
             aux = {
                 **write_aux,
                 "tokens": tokens,
                 "token_mask": token_mask,
                 "retrieval_norm": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
-                "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self.memory_gate.value), (batch,)),
+                "memory_gate_norm": jnp.broadcast_to(jnp.linalg.norm(self._v32_content_gate()), (batch,)),
                 "read_query_norm": jnp.sqrt(
                     jnp.mean(jnp.square(prepared["read_queries"].astype(jnp.float32)), axis=(1, 2))
                 ),
                 "write_token_norm": jnp.sqrt(jnp.mean(jnp.square(write_tokens.astype(jnp.float32)), axis=(1, 2))),
-                "write_occurred": jnp.full((batch,), allow_write, dtype=bool),
+                "write_occurred": jnp.full((batch,), write_mode == "normal", dtype=bool),
             }
             if extra is not None:
                 aux.update(extra)
@@ -2145,7 +2601,9 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 cache_position=gen_base,
             )
-            score_hidden = jnp.concatenate([final_prefix[:, -1:], causal_out[:, :-1]], axis=1)
+            score_hidden = jnp.concatenate(
+                [self._v32_causal_seed(final_prefix, prefix_mask), causal_out[:, :-1]], axis=1
+            )
             score_logits = self.PaliGemma.llm(score_hidden, method="decode").astype(jnp.float32)
             token_logp = jnp.take_along_axis(jax.nn.log_softmax(score_logits, axis=-1), gen_tokens[..., None], axis=-1)[
                 ..., 0
@@ -2191,7 +2649,7 @@ class Pi0(_model.BaseModel):
             logits = self.PaliGemma.llm(hidden_vec[:, None], method="decode")[:, 0]
             return jnp.argmax(logits, axis=-1).astype(preprocessed.tokenized_prompt.dtype)
 
-        token0 = greedy(final_prefix[:, -1])
+        token0 = greedy(self._v32_causal_seed(final_prefix, prefix_mask)[:, 0])
         gen_tokens = jnp.zeros((batch, self.causal_token_len), dtype=preprocessed.tokenized_prompt.dtype)
         gen_mask = jnp.zeros((batch, self.causal_token_len), dtype=bool)
 
@@ -2273,6 +2731,7 @@ class Pi0(_model.BaseModel):
         forced_subtask_mask: at.Bool[at.Array, "b cl"] | None = None,
         zero_read: bool = False,
         allow_write: bool = True,
+        write_mode: str | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
 
@@ -2292,9 +2751,18 @@ class Pi0(_model.BaseModel):
         retrieved content with zeros. ``allow_write=False`` still computes write diagnostics but
         returns the input state unchanged. These controls make counterfactual evaluations
         side-effect-free without changing normal inference defaults.
+
+        ``write_mode`` (v3.4 plan 8.4) generalizes ``allow_write`` into the three-way retention
+        control: "normal" (full Titans update), "frozen" (state unchanged; equals
+        ``allow_write=False``), "dynamics_only" (gradient term zeroed: S_t = eta S_{t-1},
+        M_t = (1-alpha) M_{t-1} + S_t). When None, it is derived from ``allow_write``.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
         assert max_decode_steps <= self.causal_token_len
+        if write_mode is None:
+            write_mode = "normal" if allow_write else "frozen"
+        if write_mode not in ("normal", "frozen", "dynamics_only"):
+            raise ValueError(f"unsupported write_mode: {write_mode!r}.")
         if getattr(self, "memory_architecture", "v3_v31") == "v32_layer8_dual_query":
             return self._sample_with_memory_v32(
                 rng,
@@ -2308,8 +2776,13 @@ class Pi0(_model.BaseModel):
                 forced_subtask_tokens=forced_subtask_tokens,
                 forced_subtask_mask=forced_subtask_mask,
                 zero_read=zero_read,
-                allow_write=allow_write,
+                write_mode=write_mode,
             )
+        if write_mode == "dynamics_only":
+            raise ValueError("write_mode='dynamics_only' is only implemented for the v3.2/v3.3/v3.4 interface.")
+        # the legacy v3/v3.1 body below branches on allow_write; keep it consistent with an
+        # explicitly passed write_mode
+        allow_write = write_mode == "normal"
         preprocessed = _model.preprocess_observation(None, observation, train=False)
         batch = preprocessed.state.shape[0]
         self._check_action_prefix_shapes(action_prefix, batch)
@@ -2582,7 +3055,25 @@ class Pi0(_model.BaseModel):
     def _compute_sequence_loss_v32(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> dict[str, at.Array]:
-        """Sequence objective for the layer-8 dual-query v3.2 interface."""
+        """Sequence objective for the layer-8 dual-query v3.2 interface.
+
+        v3.4 additions (V34_PLAN_final.md), each active only when its config flag and data
+        fields are present:
+          * plan 5.2 -- input-level per-segment state masking: samples whose segment drew the
+            mask have their state-digit embeddings replaced by the learned null for EVERY step;
+            everything downstream (h8, read queries, writes, retrieval, CE, flow) uses the
+            masked view. The dual-view variant instead drives the memory-state evolution
+            (write tokens) from the full view while CE/flow/read come from the masked forward.
+          * plan 5.4 -- the first causal token is decoded from the last valid non-memory prefix
+            position (`_v32_causal_seed`).
+          * plan 5.1 -- auxiliary demand: decode the per-step subtask class from the POST-write
+            memory through the frame-invariant Q_aux bank (read_key; memory-only by
+            construction). Class-balanced macro CE is assembled in train.py from the per-class
+            sums returned here. Optional episode-vs-reset margin with a stop-gradient baseline.
+          * Section 6 -- online ladder probes: side from stop-gradient'ed pooled write tokens
+            (evidence frames) and from stop-gradient'ed pooled standard-read retrieval
+            (waiting frames). Head updates are isolated in train.py.
+        """
 
         b, t = observation.seq_step_mask.shape
         ah, ad = actions.shape[-2:]
@@ -2590,6 +3081,20 @@ class Pi0(_model.BaseModel):
         images = self._augment_sequence_images(aug_rng, observation.images) if train else observation.images
         causal_len = observation.tokenized_causal.shape[-1]
         quiz = (self.memory_probe_weight > 0 or self.memory_probe_diagnostic) and observation.seq_probe_mask is not None
+        aux_on = getattr(self, "memory_aux_loss_weight", 0.0) > 0 and observation.seq_subtask_class is not None
+        margin_on = aux_on and getattr(self, "memory_aux_margin_weight", 0.0) > 0
+        ladder_on = (
+            getattr(self, "memory_ladder_probes", False)
+            and observation.seq_side_label is not None
+            and observation.seq_evidence_mask is not None
+            and observation.seq_waiting_mask is not None
+        )
+        mask_state = (
+            getattr(self, "memory_state_mask_prob", 0.0) > 0
+            and observation.seq_state_masked is not None
+            and observation.token_state_mask is not None
+        )
+        dual_view = mask_state and getattr(self, "memory_state_mask_dual_view", False)
 
         def step_first(x):
             return jnp.moveaxis(x, 1, 0)
@@ -2608,6 +3113,8 @@ class Pi0(_model.BaseModel):
             "noise": jax.random.normal(noise_rng, (t, b, ah, ad)),
             "time": jax.random.beta(time_rng, 1.5, 1, (t, b)) * 0.999 + 0.001,
         }
+        if observation.token_state_mask is not None:
+            xs["token_state_mask"] = step_first(observation.token_state_mask)
         if self.simulated_delay is not None:
             delay_rng = jax.random.fold_in(rng, 0x525443)
             xs["delay"] = jax.random.randint(delay_rng, (t, b), 0, self.simulated_delay + 1)
@@ -2616,6 +3123,42 @@ class Pi0(_model.BaseModel):
             xs["probe_label"] = step_first(jnp.clip(observation.seq_probe_labels, 0, n_classes - 1))
             xs["probe_act"] = step_first(observation.seq_probe_mask)
             xs["probe_vis"] = step_first(observation.seq_probe_visible & observation.seq_probe_mask)
+        if aux_on:
+            xs["aux_class"] = step_first(observation.seq_subtask_class)
+        if ladder_on:
+            xs["evidence_mask"] = step_first(observation.seq_evidence_mask)
+            xs["waiting_mask"] = step_first(observation.seq_waiting_mask)
+
+        # Per-sample (step-invariant) inputs are closed over rather than scanned.
+        segment_masked = observation.seq_state_masked if mask_state else None
+        if ladder_on:
+            side_label = observation.seq_side_label
+            side_ok = (side_label >= 0) & (side_label < 2)
+            safe_side = jnp.clip(side_label, 0, 1)
+        if aux_on:
+            aux_classes = self.memory_aux_head.out_features
+            # Frame-invariant auxiliary queries (plan 5.1): L2-normalized bank, broadcast per
+            # sample; the "hidden" A/B routes a hidden-space bank through project_q instead.
+            bank = self.memory_aux_queries.value
+            bank = bank * jax.lax.rsqrt(jnp.sum(jnp.square(bank), axis=-1, keepdims=True) + 1e-12)
+            bank_b = jnp.broadcast_to(bank[None], (b, *bank.shape))
+            if getattr(self, "memory_aux_query_space", "key") == "hidden":
+                aux_query_key = self.memory.project_q(bank_b)
+            else:
+                aux_query_key = bank_b
+
+            def aux_logits_from(state):
+                r_aux = self.memory.read_key(state, aux_query_key)
+                feats = jnp.mean(r_aux, axis=1)
+                feats = feats * jax.lax.rsqrt(jnp.sum(jnp.square(feats), axis=-1, keepdims=True) + 1e-12)
+                return self.memory_aux_head(feats).astype(jnp.float32)
+
+            if margin_on:
+                # Reset-memory baseline for the margin variant; the ENTIRE M_0 branch is
+                # stop-gradient'ed so the objective cannot be gamed by degrading the baseline.
+                baseline_logp = jax.lax.stop_gradient(
+                    jax.nn.log_softmax(aux_logits_from(self.memory.init_state(b)), axis=-1)
+                )
 
         def step(state, x):
             state = jax.tree.map(
@@ -2634,13 +3177,39 @@ class Pi0(_model.BaseModel):
             top_tokens = num_img // len(x["images"])
             prefix_len = prefix_mask.shape[1]
             mem_len = self.memory_query_tokens
+            state_token_mask = x.get("token_state_mask")
+            if mask_state:
+                masked_prefix_tokens = self._v32_apply_state_null(
+                    prefix_tokens, prefix_mask, state_token_mask, segment_masked
+                )
+            else:
+                masked_prefix_tokens = prefix_tokens
             prepared = self._v32_prepare_memory_prefix(
-                prefix_tokens, prefix_mask, prefix_ar, state, top_token_count=top_tokens
+                masked_prefix_tokens,
+                prefix_mask,
+                prefix_ar,
+                state,
+                top_token_count=top_tokens,
+                state_token_mask=state_token_mask,
             )
+            if dual_view:
+                # Plan 5.2 gold-standard variant: memory-state evolution from the FULL view
+                # (deployment-identical write dynamics); CE/flow and their own retrieval from
+                # the masked forward above. Early blocks only -- no second late/causal pass.
+                full_prepared = self._v32_prepare_memory_interface(
+                    prefix_tokens,
+                    prefix_mask,
+                    prefix_ar,
+                    state,
+                    top_token_count=top_tokens,
+                    state_token_mask=state_token_mask,
+                )
+                write_tokens = full_prepared["write_tokens"]
+            else:
+                write_tokens = prepared["write_tokens"]
             kv_cache = prepared["cache"]
             final_prefix = prepared["final_prefix"]
             read_queries = prepared["read_queries"]
-            write_tokens = prepared["write_tokens"]
 
             causal_mask_k = x["causal_mask"]
             causal_emb = self.PaliGemma.llm(x["causal"], method="embed")
@@ -2652,7 +3221,7 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 cache_position=prefix_len + mem_len,
             )
-            ce_hidden = jnp.concatenate([final_prefix[:, -1:], causal_out[:, :-1]], axis=1)
+            ce_hidden = jnp.concatenate([self._v32_causal_seed(final_prefix, prefix_mask), causal_out[:, :-1]], axis=1)
             logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
             token_logp = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), x["causal"][..., None], axis=-1)[
                 ..., 0
@@ -2682,11 +3251,39 @@ class Pi0(_model.BaseModel):
             flow_tokens = jnp.mean(jnp.square(v_t - u_t), axis=-1)
             flow = jnp.mean(_rtc.renormalize_flow_loss(flow_tokens, rtc_loss_mask), axis=-1)
 
-            new_state, _ = self.memory.write(state, write_tokens)
+            new_state, write_aux = self.memory.write(state, write_tokens)
             valid = x["step_valid"]
             state = jax.tree.map(
                 lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
             )
+            validf = valid.astype(jnp.float32)
+            outputs = {
+                "ce": ce * validf,
+                "flow": flow * validf,
+                "valid": validf,
+                # Core-steepness telemetry (v34_run1/2 postmortems): the raw inner write
+                # gradient norm ramped ~0.5-2.8 (healthy) -> 45-53 before both explosion
+                # cycles. Observation only -- stop-gradient keeps it out of the objective.
+                # `where` is intentional: multiplication would leave an invalid padded NaN as
+                # NaN (IEEE 0 * NaN), poisoning an otherwise valid logging window.
+                "write_grad_norm": jnp.where(
+                    valid, jax.lax.stop_gradient(write_aux["grad_norm"]), jnp.zeros_like(write_aux["grad_norm"])
+                ),
+                # Fraction of valid writes whose raw inner gradient is clipped, plus a severe
+                # saturation marker (clip factor < .2 means raw norm > 5 at the configured
+                # max_grad_norm=1). These are diagnostics only and cannot affect optimization.
+                "write_clip_active": jnp.where(
+                    valid,
+                    jax.lax.stop_gradient((write_aux["clip_factor"] < 1.0).astype(jnp.float32)),
+                    0.0,
+                ),
+                "write_clip_severe": jnp.where(
+                    valid,
+                    jax.lax.stop_gradient((write_aux["clip_factor"] < 0.2).astype(jnp.float32)),
+                    0.0,
+                ),
+            }
+
             if quiz:
                 probe_read = self.memory.read(state, read_queries)
                 pooled = jnp.mean(self.memory_gate.value * probe_read, axis=1)
@@ -2695,30 +3292,109 @@ class Pi0(_model.BaseModel):
                     probe_logits = jax.lax.stop_gradient(probe_logits)
                 probe_logp = jax.nn.log_softmax(probe_logits, axis=-1)
                 actf = x["probe_act"].astype(jnp.float32)
-                probe_ce = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf
-                probe_correct = (jnp.argmax(probe_logits, axis=-1) == x["probe_label"]).astype(jnp.float32) * actf
-                probe_vis = x["probe_vis"].astype(jnp.float32)
-            else:
-                probe_ce = probe_correct = actf = probe_vis = jnp.zeros((b,), dtype=jnp.float32)
-            validf = valid.astype(jnp.float32)
-            return state, (ce * validf, flow * validf, validf, probe_ce, probe_correct, actf, probe_vis)
+                outputs["probe_ce"] = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf
+                outputs["probe_correct"] = (
+                    jnp.argmax(probe_logits, axis=-1) == x["probe_label"]
+                ).astype(jnp.float32) * actf
+                outputs["probe_act"] = actf
+                outputs["probe_vis"] = x["probe_vis"].astype(jnp.float32)
+
+            if aux_on:
+                # POST-write read (plan 5.1): same-step credit for the writer; on waiting
+                # frames the side-bearing label is decodable from M_t only via evidence-phase
+                # writes persisting in the fast weights.
+                aux_logits = aux_logits_from(state)
+                aux_logp = jax.nn.log_softmax(aux_logits, axis=-1)
+                label = x["aux_class"]
+                label_ok = (label >= 0) & (label < aux_classes)
+                safe_label = jnp.clip(label, 0, aux_classes - 1)
+                true_logp = jnp.take_along_axis(aux_logp, safe_label[:, None], axis=-1)[:, 0]
+                outputs["aux_ce"] = -true_logp
+                outputs["aux_correct"] = (jnp.argmax(aux_logits, axis=-1) == safe_label).astype(jnp.float32)
+                outputs["aux_valid"] = (label_ok & valid).astype(jnp.float32)
+                outputs["aux_label"] = safe_label
+                if margin_on:
+                    baseline_true = jnp.take_along_axis(baseline_logp, safe_label[:, None], axis=-1)[:, 0]
+                    gamma = getattr(self, "memory_aux_margin_gamma", 1.0)
+                    outputs["aux_margin"] = jnp.maximum(0.0, gamma - (true_logp - baseline_true))
+
+            if ladder_on:
+                # Rung 1 -- writer content on evidence frames; rung 4 -- standard-read
+                # retrieval (pre-write M_{t-1}) on waiting frames. Features are STOP-GRADIENTED
+                # (the heads observe; they never train the model).
+                writer_feats = jnp.mean(write_tokens.astype(jnp.float32), axis=1)
+                writer_feats = writer_feats * jax.lax.rsqrt(
+                    jnp.sum(jnp.square(writer_feats), axis=-1, keepdims=True) + 1e-12
+                )
+                writer_logits = self.ladder_writer_head(jax.lax.stop_gradient(writer_feats)).astype(jnp.float32)
+                read_feats = jnp.mean(prepared["retrieved"].astype(jnp.float32), axis=1)
+                read_feats = read_feats * jax.lax.rsqrt(
+                    jnp.sum(jnp.square(read_feats), axis=-1, keepdims=True) + 1e-12
+                )
+                read_logits = self.ladder_read_head(jax.lax.stop_gradient(read_feats)).astype(jnp.float32)
+                for name, head_logits, frame_mask in (
+                    ("ladder_writer", writer_logits, x["evidence_mask"]),
+                    ("ladder_read", read_logits, x["waiting_mask"]),
+                ):
+                    logp = jax.nn.log_softmax(head_logits, axis=-1)
+                    active = (frame_mask & valid & side_ok).astype(jnp.float32)
+                    outputs[f"{name}_ce"] = -jnp.take_along_axis(logp, safe_side[:, None], axis=-1)[:, 0] * active
+                    outputs[f"{name}_correct"] = (
+                        jnp.argmax(head_logits, axis=-1) == safe_side
+                    ).astype(jnp.float32) * active
+                    outputs[f"{name}_count"] = active
+
+            return state, outputs
 
         _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), self.memory.init_state(b), xs)
-        ce_steps, flow_steps, valid_steps, probe_ce, probe_cor, probe_act, probe_vis = ys
-        n_valid = jnp.clip(jnp.sum(valid_steps, axis=0), 1)
-        losses = {"flow": jnp.sum(flow_steps, axis=0) / n_valid, "ce": jnp.sum(ce_steps, axis=0) / n_valid}
+        write_valid_count = jnp.sum(ys["valid"], axis=0)
+        n_valid = jnp.clip(write_valid_count, 1)
+        losses = {
+            "flow": jnp.sum(ys["flow"], axis=0) / n_valid,
+            "ce": jnp.sum(ys["ce"], axis=0) / n_valid,
+            # Preserve raw numerators/counts so train.py can pool exactly across unequal
+            # sequence lengths, samples, microbatches, and logging windows.
+            "write_grad_norm_sum": jnp.sum(ys["write_grad_norm"], axis=0),
+            "write_valid_count": write_valid_count,
+            "write_clip_count": jnp.sum(ys["write_clip_active"], axis=0),
+            "write_severe_clip_count": jnp.sum(ys["write_clip_severe"], axis=0),
+            # Per-sample forms remain useful to offline callers; training telemetry uses the
+            # exact raw sums above rather than averaging these unequal-denominator ratios.
+            "write_grad_norm_mean": jnp.sum(ys["write_grad_norm"], axis=0) / n_valid,
+            "write_grad_norm_max": jnp.max(ys["write_grad_norm"], axis=0),
+            "write_clip_fraction": jnp.sum(ys["write_clip_active"], axis=0) / n_valid,
+            "write_severe_clip_fraction": jnp.sum(ys["write_clip_severe"], axis=0) / n_valid,
+        }
         if quiz:
             losses.update(
                 {
-                    "probe_ce_sum": jnp.sum(probe_ce, axis=0),
-                    "probe_count": jnp.sum(probe_act, axis=0),
-                    "probe_correct": jnp.sum(probe_cor, axis=0),
-                    "probe_count_visible": jnp.sum(probe_vis, axis=0),
-                    "probe_correct_visible": jnp.sum(probe_cor * probe_vis, axis=0),
-                    "probe_correct_grid": jnp.moveaxis(probe_cor, 0, 1),
-                    "probe_active_grid": jnp.moveaxis(probe_act, 0, 1),
+                    "probe_ce_sum": jnp.sum(ys["probe_ce"], axis=0),
+                    "probe_count": jnp.sum(ys["probe_act"], axis=0),
+                    "probe_correct": jnp.sum(ys["probe_correct"], axis=0),
+                    "probe_count_visible": jnp.sum(ys["probe_vis"], axis=0),
+                    "probe_correct_visible": jnp.sum(ys["probe_correct"] * ys["probe_vis"], axis=0),
+                    "probe_correct_grid": jnp.moveaxis(ys["probe_correct"], 0, 1),
+                    "probe_active_grid": jnp.moveaxis(ys["probe_act"], 0, 1),
                 }
             )
+        if aux_on:
+            # Per-class sums for the class-balanced macro CE (plan 5.1: frequent phase labels
+            # must not dominate). train.py divides by the GLOBAL per-class counts so the macro
+            # objective stays exact under gradient accumulation.
+            aux_classes = self.memory_aux_head.out_features
+            class_onehot = jax.nn.one_hot(ys["aux_label"], aux_classes, dtype=jnp.float32)
+            weighted = class_onehot * ys["aux_valid"][..., None]
+            losses["aux_ce_class_sum"] = jnp.sum(weighted * ys["aux_ce"][..., None], axis=(0, 1))
+            losses["aux_count_class"] = jnp.sum(weighted, axis=(0, 1))
+            losses["aux_correct_class"] = jnp.sum(weighted * ys["aux_correct"][..., None], axis=(0, 1))
+            if margin_on:
+                losses["aux_margin_sum"] = jnp.sum(ys["aux_margin"] * ys["aux_valid"])
+                losses["aux_margin_count"] = jnp.sum(ys["aux_valid"])
+        if ladder_on:
+            for name in ("ladder_writer", "ladder_read"):
+                losses[f"{name}_ce_sum"] = jnp.sum(ys[f"{name}_ce"])
+                losses[f"{name}_correct"] = jnp.sum(ys[f"{name}_correct"])
+                losses[f"{name}_count"] = jnp.sum(ys[f"{name}_count"])
         return losses
 
     def _compute_sequence_loss(

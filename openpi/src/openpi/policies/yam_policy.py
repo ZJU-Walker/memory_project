@@ -80,6 +80,12 @@ class YamInputs(transforms.DataTransformFn):
             "seq_probe_labels",
             "seq_probe_mask",
             "seq_probe_visible",
+            # v3.4 supervision fields (V34_PLAN_final.md)
+            "seq_state_masked",
+            "seq_subtask_class",
+            "seq_side_label",
+            "seq_evidence_mask",
+            "seq_waiting_mask",
         ):
             if key in data:
                 inputs[key] = data[key]

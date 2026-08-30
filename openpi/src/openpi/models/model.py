@@ -141,6 +141,23 @@ class Observation(Generic[ArrayT]):
     seq_probe_mask: at.Bool[ArrayT, "*sb st"] | None = None
     seq_probe_visible: at.Bool[ArrayT, "*sb st"] | None = None
 
+    # v3.4 fields (V34_PLAN_final.md).
+    # Marks the state-digit token positions within tokenized_prompt (same [*b, l] geometry).
+    # Used by the input-level state masking (plan 5.2) and the instruction-only conditioner
+    # context (plan 5.9). Emitted by the tokenizer for every memory-layout item.
+    token_state_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # Plan 5.2: True for segments whose state tokens are replaced by the learned null embedding
+    # at the input -- sampled ONCE PER SEGMENT in the data pipeline (train-only).
+    seq_state_masked: at.Bool[ArrayT, "*sb"] | None = None
+    # Plan 5.1: per-step subtask class index in the aux vocabulary (-1 = unknown/unlabeled).
+    seq_subtask_class: at.Int[ArrayT, "*sb st"] | None = None
+    # Section 6 probe-ladder supervision: the segment's side label (0/1 from the waiting-phase
+    # subtask, -1 when the segment has no side-bearing step) and the per-step OBSERVATION-phase
+    # masks (unshifted labels: is the frame inside the evidence / waiting phase).
+    seq_side_label: at.Int[ArrayT, "*sb"] | None = None
+    seq_evidence_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_waiting_mask: at.Bool[ArrayT, "*sb st"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -170,6 +187,12 @@ class Observation(Generic[ArrayT]):
             seq_probe_labels=data.get("seq_probe_labels"),
             seq_probe_mask=data.get("seq_probe_mask"),
             seq_probe_visible=data.get("seq_probe_visible"),
+            token_state_mask=data.get("token_state_mask"),
+            seq_state_masked=data.get("seq_state_masked"),
+            seq_subtask_class=data.get("seq_subtask_class"),
+            seq_side_label=data.get("seq_side_label"),
+            seq_evidence_mask=data.get("seq_evidence_mask"),
+            seq_waiting_mask=data.get("seq_waiting_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

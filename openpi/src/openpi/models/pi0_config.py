@@ -111,6 +111,75 @@ class Pi0Config(_model.BaseModelConfig):
     memory_probe_diagnostic: bool = False
     memory_probe_classes: int = 2
 
+    # ------------------------------------------------------------------------------------------
+    # v3.4 (V34_PLAN_final.md). All default-off so every v3.2/v3.3 config and checkpoint replays
+    # bit-identically; pi05_yam_mem_v34 turns them on together.
+    # ------------------------------------------------------------------------------------------
+    # 5.5: cosine (QK-normalized) attention in both memory compressors and the write-query
+    # conditioner, with a learned per-head temperature exp(lambda_h) initialized to
+    # sqrt(d_head) (unit-vector dot products have std ~1/sqrt(d_head)) and clamped <= 64.
+    memory_qk_norm: bool = False
+    # 5.5: raw (height, width) of the top camera BEFORE resize_with_pad to 224x224. Determines
+    # the static per-patch letterbox validity mask P_valid over the 16x16 SigLIP patch grid:
+    # padding patches are -inf-masked out of both compressors' softmaxes, so a letterbox band
+    # is mathematically incapable of becoming the write/read attention sink. None disables.
+    memory_letterbox_source_hw: tuple[int, int] | None = None
+    # 5.3: memory-token query rows in blocks memory_layer+1..end attend ONLY to the memory
+    # positions themselves (they stay K/V sources for everyone else). Without this, a memory
+    # token's late-block output is an attention summary of images/state -- a readout register
+    # -- even with zero injected content.
+    memory_blind_tokens: bool = False
+    # 5.4: decode the first causal token from the LAST VALID NON-MEMORY prefix position instead
+    # of the last memory token's output (which is exactly zero under blinding + a closed gate).
+    memory_reseed_ce: bool = False
+    # 5.6: how retrieved memory content is injected as the 16 memory tokens.
+    #   "gate":     memory_tokens = memory_gate * retrieved (v3.2/v3.3; measured injection RMS
+    #               ~62,600x below the residual stream -- numerically invisible).
+    #   "tanh_rms": memory_tokens = tanh(w) * retrieved * c / max(rms(retrieved), tau), with w
+    #               a zero-init [d_value] parameter (exact-zero start preserved), rms per token
+    #               over channels, c the residual-stream RMS measured at the actual v3.4 init,
+    #               and tau a floor so weak reads stay weak (non-amplifying).
+    memory_injection_mode: Literal["gate", "tanh_rms"] = "gate"
+    memory_injection_c: float = 12.4
+    memory_injection_tau: float = 0.02
+    # 5.9: context rows of the write-query conditioner. "instruction_state" is the v3.3
+    # behavior (all non-image prefix rows); "instruction_only" excludes the state-digit token
+    # positions -- state encodes phase strongly and the v3.3 writer collapsed to phase.
+    memory_conditioner_context: Literal["instruction_state", "instruction_only"] = "instruction_state"
+    # 5.2: probability that a memory-required training segment has its state-digit tokens
+    # replaced by a learned null embedding at the input, sampled ONCE PER SEGMENT (per-frame
+    # masking would let the model funnel state through the memory itself). Everything
+    # downstream of the masked input -- h8, read queries, writes, retrieval, CE -- uses the
+    # masked view (single-view default).
+    memory_state_mask_prob: float = 0.0
+    # 5.2 gold-standard variant: the full view drives memory-state evolution (write tokens)
+    # while a second state-masked forward produces the CE/flow and their own retrieval.
+    # ~2x prefix compute on masked segments.
+    memory_state_mask_dual_view: bool = False
+    # 5.1: weight of the task-general auxiliary demand -- decode the per-step subtask label
+    # from the POST-write memory through a frame-invariant key-space query bank Q_aux
+    # (16 x d_key, L2-normalized, consumed via read_key -- never through read()). The head and
+    # bank train in the MAIN optimizer: this loss is *supposed* to train the memory.
+    memory_aux_loss_weight: float = 0.0
+    memory_aux_num_classes: int = 7
+    # 5.1 A/B: "key" reads M_t(Q_aux) directly in key space (default -- fully decoupled from
+    # the production reader); "hidden" routes a hidden-space bank through project_q, co-training
+    # W_Q toward the stored key space.
+    memory_aux_query_space: Literal["key", "hidden"] = "key"
+    # 5.1 optional episode-vs-reset margin variant (off by default):
+    # L_dep = max(0, gamma - [log p(y|M_t) - stop_grad(log p(y|M_0))]).
+    memory_aux_margin_weight: float = 0.0
+    memory_aux_margin_gamma: float = 1.0
+    # Aux-vocab indices of the side-bearing (memory-required) classes, for the per-class-group
+    # accuracy split (phase vs side) in logging. Purely diagnostic.
+    memory_aux_side_class_ids: tuple[int, ...] = ()
+    # Section 6: online probe-ladder heads (rung 1: side from pooled write tokens on evidence
+    # frames; rung 4: side from pooled standard-read retrieval on waiting frames). Features are
+    # stop-gradient'ed and the heads are updated by a SEPARATE optimizer in train.py, so the
+    # probes measure but cannot train or perturb the main model (verified by a bit-identity
+    # unit test). Offline episode-split ladder runs live in the diagnostics package.
+    memory_ladder_probes: bool = False
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -160,6 +229,51 @@ class Pi0Config(_model.BaseModelConfig):
                 )
             if self.memory_probe_classes < 2:
                 raise ValueError("memory_probe_classes must be >= 2 for checkpoint-compatible probe heads.")
+            v34_features = {
+                "memory_qk_norm": self.memory_qk_norm,
+                "memory_letterbox_source_hw": self.memory_letterbox_source_hw is not None,
+                "memory_blind_tokens": self.memory_blind_tokens,
+                "memory_reseed_ce": self.memory_reseed_ce,
+                "memory_injection_mode='tanh_rms'": self.memory_injection_mode == "tanh_rms",
+                "memory_conditioner_context='instruction_only'": self.memory_conditioner_context
+                == "instruction_only",
+                "memory_state_mask_prob": self.memory_state_mask_prob > 0,
+                "memory_aux_loss_weight": self.memory_aux_loss_weight > 0,
+                "memory_ladder_probes": self.memory_ladder_probes,
+            }
+            if self.memory_architecture != "v32_layer8_dual_query":
+                enabled = [name for name, on in v34_features.items() if on]
+                if enabled:
+                    raise ValueError(f"v3.4 features require the v3.2 dual-query architecture: {enabled}.")
+            if self.memory_injection_mode not in ("gate", "tanh_rms"):
+                raise ValueError(f"unsupported memory_injection_mode: {self.memory_injection_mode!r}.")
+            if self.memory_injection_mode == "tanh_rms" and (
+                self.memory_injection_c <= 0 or self.memory_injection_tau <= 0
+            ):
+                raise ValueError("tanh_rms injection requires positive memory_injection_c and memory_injection_tau.")
+            if self.memory_conditioner_context not in ("instruction_state", "instruction_only"):
+                raise ValueError(f"unsupported memory_conditioner_context: {self.memory_conditioner_context!r}.")
+            if self.memory_conditioner_context == "instruction_only" and not self.memory_task_conditioned_write:
+                raise ValueError("memory_conditioner_context='instruction_only' requires memory_task_conditioned_write.")
+            if not 0.0 <= self.memory_state_mask_prob <= 1.0:
+                raise ValueError("memory_state_mask_prob must be in [0, 1].")
+            if self.memory_state_mask_dual_view and self.memory_state_mask_prob == 0:
+                raise ValueError("memory_state_mask_dual_view requires memory_state_mask_prob > 0.")
+            if self.memory_letterbox_source_hw is not None and (
+                len(self.memory_letterbox_source_hw) != 2 or min(self.memory_letterbox_source_hw) <= 0
+            ):
+                raise ValueError("memory_letterbox_source_hw must be a positive (height, width) pair.")
+            if self.memory_aux_loss_weight < 0 or self.memory_aux_margin_weight < 0:
+                raise ValueError("aux loss weights must be >= 0.")
+            if self.memory_aux_margin_weight > 0 and self.memory_aux_loss_weight == 0:
+                raise ValueError("the aux margin variant complements the aux CE; set memory_aux_loss_weight > 0.")
+            if self.memory_aux_loss_weight > 0:
+                if self.memory_aux_num_classes < 2:
+                    raise ValueError("memory_aux_num_classes must be >= 2.")
+                if any(not 0 <= c < self.memory_aux_num_classes for c in self.memory_aux_side_class_ids):
+                    raise ValueError("memory_aux_side_class_ids must index into [0, memory_aux_num_classes).")
+            if self.memory_aux_query_space not in ("key", "hidden"):
+                raise ValueError(f"unsupported memory_aux_query_space: {self.memory_aux_query_space!r}.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -217,6 +331,7 @@ class Pi0Config(_model.BaseModelConfig):
                         "tokenized_causal": jax.ShapeDtypeStruct([*lead, self.causal_token_len], jnp.int32),
                         "tokenized_causal_mask": jax.ShapeDtypeStruct([*lead, self.causal_token_len], bool),
                         "causal_fast_mask": jax.ShapeDtypeStruct([*lead, self.causal_token_len], bool),
+                        "token_state_mask": jax.ShapeDtypeStruct([*lead, self.max_token_len], bool),
                         "seq_step_mask": jax.ShapeDtypeStruct(lead, bool),
                         "seq_block_boundary": jax.ShapeDtypeStruct(lead, bool),
                         **(
@@ -226,6 +341,25 @@ class Pi0Config(_model.BaseModelConfig):
                                 "seq_probe_visible": jax.ShapeDtypeStruct(lead, bool),
                             }
                             if self.memory_probe_weight > 0 or self.memory_probe_diagnostic
+                            else {}
+                        ),
+                        **(
+                            {"seq_state_masked": jax.ShapeDtypeStruct([batch_size], bool)}
+                            if self.memory_state_mask_prob > 0
+                            else {}
+                        ),
+                        **(
+                            {"seq_subtask_class": jax.ShapeDtypeStruct(lead, jnp.int32)}
+                            if self.memory_aux_loss_weight > 0
+                            else {}
+                        ),
+                        **(
+                            {
+                                "seq_side_label": jax.ShapeDtypeStruct([batch_size], jnp.int32),
+                                "seq_evidence_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_waiting_mask": jax.ShapeDtypeStruct(lead, bool),
+                            }
+                            if self.memory_ladder_probes
                             else {}
                         ),
                     }

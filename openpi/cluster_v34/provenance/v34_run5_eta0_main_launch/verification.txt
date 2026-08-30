@@ -1,0 +1,10 @@
+CPU grouped suite: 108 passed, 1 deselected, 6 warnings, 48.45s
+Watcher + retention focused suite after final hardening: 45 passed, 6.46s
+Watcher focused suite after cancellation hardening: 36 passed
+Stage 0 child: 17024084.62 COMPLETED 0:0, ALL BATTERIES PASS
+Smoke child: 17024084.65 COMPLETED 0:0, elapsed 00:39:52
+Smoke checkpoint: v34_run5_eta0_smoke/120, finalized with no async errors
+Smoke TrainState step: 121
+Raw/EMA/Adam m0 w3+b3: exact FP32 zero
+Nonzero restore control raw/EMA w2 L2: 45.181725670553426 / 45.19276188781647
+Raw-vs-EMA w2 diff L2: 0.6518837654155717

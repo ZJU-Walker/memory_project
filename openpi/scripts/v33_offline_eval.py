@@ -152,7 +152,7 @@ class V33OfflineEval:
         )
         self._sample = nnx_utils.module_jit(
             self.model.sample_with_memory,
-            static_argnames=("stop_token", "max_decode_steps", "num_steps", "zero_read", "allow_write"),
+            static_argnames=("stop_token", "max_decode_steps", "num_steps", "zero_read", "allow_write", "write_mode"),
         )
 
     def _observation(self, row: dict[str, Any], frame: int, prompt: str):

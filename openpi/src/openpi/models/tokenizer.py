@@ -148,11 +148,37 @@ class FASTSubtaskTokenizer(FASTTokenizer):
     (knowledge-insulation-style co-training with the flow matching action expert). The extra
     `fast_mask` marks the FAST branch, which exists only at training time and must be hidden from
     the action expert (attention and positions) to avoid leaking the action targets.
+
+    v3.4 (plan 5.2/5.9): both tokenize entry points can additionally return a ``state_mask``
+    marking exactly the token positions whose surface text overlaps the state-digit span
+    (digits and their internal separators; not the constant "State:" literal or the ";"
+    terminator). Located via sentencepiece byte offsets on the SAME single-encode prefix, so
+    the token ids are untouched and the span is exact for any prompt.
     """
 
+    def _state_span_mask(self, prefix: str, state_str: str, prefix_tokens: list[int]) -> np.ndarray:
+        """Token-level mask over ``prefix_tokens`` (bos included) marking the state span."""
+        state_end = len(prefix.encode("utf-8")) - len(b";\n")
+        state_start = state_end - len(state_str.encode("utf-8"))
+        proto = self._paligemma_tokenizer.encode(prefix, out_type="immutable_proto")
+        pieces = list(proto.pieces)
+        if [p.id for p in pieces] != list(prefix_tokens[1:]):
+            # Failing loudly beats silently returning an empty mask: with an empty mask the
+            # state-null substitution and the instruction-only conditioner would silently see
+            # the real state again.
+            raise ValueError("sentencepiece proto tokenization diverged from encode(); cannot locate the state span.")
+        overlaps = [p.begin < state_end and p.end > state_start for p in pieces]
+        return np.asarray([False, *overlaps], dtype=bool)  # False for the bos token
+
     def tokenize(  # type: ignore[override]
-        self, prompt: str, state: np.ndarray, subtask: str | None, actions: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self,
+        prompt: str,
+        state: np.ndarray,
+        subtask: str | None,
+        actions: np.ndarray | None,
+        *,
+        return_state_mask: bool = False,
+    ) -> tuple[np.ndarray, ...]:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
@@ -160,6 +186,7 @@ class FASTSubtaskTokenizer(FASTTokenizer):
         state_str = " ".join(map(str, discretized_state))
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+        state_span = self._state_span_mask(prefix, state_str, prefix_tokens) if return_state_mask else None
 
         # Subtask segment, terminated by "\n" (the stop signal when generating the subtask).
         subtask_tokens = []
@@ -184,6 +211,9 @@ class FASTSubtaskTokenizer(FASTTokenizer):
         ar_mask = [0] * len(prefix_tokens) + [1] * (len(subtask_tokens) + len(fast_tokens))
         loss_mask = [False] * len(prefix_tokens) + [True] * (len(subtask_tokens) + len(fast_tokens))
         fast_mask = [False] * (len(prefix_tokens) + len(subtask_tokens)) + [True] * len(fast_tokens)
+        state_mask = None
+        if state_span is not None:
+            state_mask = state_span.tolist() + [False] * (len(subtask_tokens) + len(fast_tokens))
 
         # Pad tokens to max length
         tokens_len = len(tokens)
@@ -194,6 +224,8 @@ class FASTSubtaskTokenizer(FASTTokenizer):
             ar_mask = ar_mask + padding
             loss_mask = loss_mask + padding
             fast_mask = fast_mask + padding
+            if state_mask is not None:
+                state_mask = state_mask + padding
         else:
             if len(tokens) > self._max_len:
                 logging.warning(
@@ -205,33 +237,49 @@ class FASTSubtaskTokenizer(FASTTokenizer):
             ar_mask = ar_mask[: self._max_len]
             loss_mask = loss_mask[: self._max_len]
             fast_mask = fast_mask[: self._max_len]
+            if state_mask is not None:
+                state_mask = state_mask[: self._max_len]
 
-        return (
+        result = (
             np.asarray(tokens),
             np.asarray(token_mask),
             np.asarray(ar_mask),
             np.asarray(loss_mask),
             np.asarray(fast_mask),
         )
+        if return_state_mask:
+            return (*result, np.asarray(state_mask))
+        return result
 
     def tokenize_split(
-        self, prompt: str, state: np.ndarray, subtask: str, actions: np.ndarray, causal_len: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self,
+        prompt: str,
+        state: np.ndarray,
+        subtask: str,
+        actions: np.ndarray,
+        causal_len: int,
+        *,
+        return_state_mask: bool = False,
+    ) -> tuple[np.ndarray, ...]:
         """Memory-layout variant (Pi0Config.predict_with_memory): the ar=0 context and the causal
         subtask+FAST segment as two separate left-aligned buffers, matching the training/inference
         layout [images | context | memory | causal]. The context tokenization is byte-identical to
         the inference-time prompt; every valid causal token is a CE target.
 
         Returns (context_tokens[max_len], context_mask, causal_tokens[causal_len], causal_mask,
-        causal_fast_mask).
+        causal_fast_mask), plus context_state_mask[max_len] when ``return_state_mask``.
         """
         cleaned_text = prompt.lower().strip().replace("_", " ")
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         state_str = " ".join(map(str, discretized_state))
-        context = self._paligemma_tokenizer.encode(f"Task: {cleaned_text}, State: {state_str};\n", add_bos=True)
+        context_str = f"Task: {cleaned_text}, State: {state_str};\n"
+        context = self._paligemma_tokenizer.encode(context_str, add_bos=True)
+        state_span = self._state_span_mask(context_str, state_str, context) if return_state_mask else None
         if len(context) > self._max_len:
             logging.warning(f"Context length ({len(context)}) exceeds max length ({self._max_len}), truncating.")
             context = context[: self._max_len]
+            if state_span is not None:
+                state_span = state_span[: self._max_len]
 
         cleaned_subtask = subtask.lower().strip().replace("_", " ")
         subtask_tokens = self._paligemma_tokenizer.encode(cleaned_subtask + "\n")
@@ -261,6 +309,10 @@ class FASTSubtaskTokenizer(FASTTokenizer):
         causal_mask[: len(causal)] = True
         causal_fast_mask = np.zeros(causal_len, dtype=bool)
         causal_fast_mask[: len(causal)] = fast_flags
+        if return_state_mask:
+            context_state_mask = np.zeros(self._max_len, dtype=bool)
+            context_state_mask[: len(state_span)] = state_span
+            return context_tokens, context_mask, causal_tokens, causal_mask, causal_fast_mask, context_state_mask
         return context_tokens, context_mask, causal_tokens, causal_mask, causal_fast_mask
 
 

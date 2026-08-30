@@ -19,7 +19,12 @@ still ~0 the factorial cannot show anything, and knowing that costs seconds, not
 
 Outputs per episode: an H.264 MP4 (panels: top camera | TRUE | CF | |TRUE-CF|, video-fitted
 color scales), an NPZ with the head-averaged per-slot maps, and per-frame metrics inside the
-run-level JSON summary (per-phase aggregates are also printed as a table).
+run-level JSON summary (per-phase aggregates are also printed as a table). The metrics include
+the writer's fast-weight gradient norm before its inner clip, the resulting clip factor, and
+whether that frame saturated the clip. These are distinct from the outer optimizer gradient
+norm printed by ``scripts/train.py``. It also measures layer-8, raw-retrieval, and actual
+gated-injection RMS so a fixed read multiplier can be calibrated without conflating the raw
+retrieval with the current 2048-channel content gate.
 """
 
 # ruff: noqa: SLF001, I001 - this diagnostic deliberately reuses the private v3.1/v3.2 replay
@@ -56,7 +61,7 @@ from openpi.shared import nnx_utils
 from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
-SCHEMA_VERSION = "openpi.v33.writer_attention.v1"
+SCHEMA_VERSION = "openpi.v33.writer_attention.v2"
 _EPS = 1e-12
 
 
@@ -103,6 +108,113 @@ def pathway_scalars(raw_params: Any) -> dict[str, float]:
         "conditioner_output_proj_norm": float(np.linalg.norm(out_kernel)),
         "memory_gate_norm": float(np.linalg.norm(gate)),
     }
+
+
+def writer_clip_statistics(grad_norms: np.ndarray, max_grad_norm: float) -> dict[str, float]:
+    """Summarize the pre-clip fast-weight gradient norms from ``TitansMemory.write``."""
+    values = np.asarray(grad_norms, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError(f"grad_norms must be a non-empty vector, got {values.shape}")
+    if not np.all(np.isfinite(values)) or np.any(values < 0):
+        raise ValueError("grad_norms must contain finite nonnegative values")
+    if not math.isfinite(max_grad_norm) or max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be finite and positive")
+    clip_factors = np.minimum(1.0, max_grad_norm / (values + _EPS))
+    return {
+        "write_grad_norm_preclip_min": float(np.min(values)),
+        "write_grad_norm_preclip_median": float(np.median(values)),
+        "write_grad_norm_preclip_mean": float(np.mean(values)),
+        "write_grad_norm_preclip_p95": float(np.percentile(values, 95.0)),
+        "write_grad_norm_preclip_max": float(np.max(values)),
+        "write_clip_factor_median": float(np.median(clip_factors)),
+        "write_clip_saturation_fraction": float(np.mean(values > max_grad_norm)),
+    }
+
+
+def retrieval_scale_statistics(
+    h8_valid_rms: np.ndarray,
+    h8_valid_token_count: np.ndarray,
+    h8_image_rms: np.ndarray,
+    h8_context_valid_rms: np.ndarray,
+    retrieved_rms: np.ndarray,
+    memory_token_rms: np.ndarray,
+) -> dict[str, float | int | None]:
+    """Summarize the scale bridge from raw retrieval to the layer-8 residual stream.
+
+    ``retrieval_match_c`` would make ``c * retrieved`` match valid layer-8 prefix RMS.
+    Near-zero reads are excluded from ratios instead of becoming epsilon-divided outliers.
+    The caller selects carried-state rather than fresh-memory frames when that distinction is
+    important; a trained checkpoint's learnable initial memory need not read exactly zero.
+    """
+    h8 = np.asarray(h8_valid_rms, dtype=np.float64)
+    counts = np.asarray(h8_valid_token_count, dtype=np.float64)
+    image = np.asarray(h8_image_rms, dtype=np.float64)
+    context = np.asarray(h8_context_valid_rms, dtype=np.float64)
+    retrieved = np.asarray(retrieved_rms, dtype=np.float64)
+    injected = np.asarray(memory_token_rms, dtype=np.float64)
+    inputs = (h8, counts, image, context, retrieved, injected)
+    if h8.ndim != 1 or h8.size == 0 or any(values.shape != h8.shape for values in inputs[1:]):
+        raise ValueError(
+            "all retrieval-scale inputs must be equal non-empty vectors; "
+            f"got {[values.shape for values in inputs]}"
+        )
+    if not all(np.all(np.isfinite(values)) and np.all(values >= 0) for values in inputs):
+        raise ValueError("RMS inputs must contain finite nonnegative values")
+    if np.any(counts <= 0):
+        raise ValueError("h8_valid_token_count must be positive")
+
+    nonzero_retrieval = retrieved > _EPS
+    nonzero_injection = injected > _EPS
+    valid_h8 = h8 > _EPS
+    c_values = h8[nonzero_retrieval] / retrieved[nonzero_retrieval]
+    c_extra_values = h8[nonzero_injection] / injected[nonzero_injection]
+    injected_ratios = injected[valid_h8] / h8[valid_h8]
+    h8_energy_rms = float(np.sqrt(np.sum(np.square(h8) * counts) / np.sum(counts)))
+    retrieved_energy_rms = float(np.sqrt(np.mean(np.square(retrieved))))
+    injected_energy_rms = float(np.sqrt(np.mean(np.square(injected))))
+    out: dict[str, float | int | None] = {
+        "retrieval_scale_frame_count": int(h8.size),
+        "h8_valid_rms_median": float(np.median(h8)),
+        "h8_valid_rms_energy": h8_energy_rms,
+        "h8_image_rms_median": float(np.median(image)),
+        "h8_context_valid_rms_median": float(np.median(context)),
+        "retrieved_rms_median": float(np.median(retrieved)),
+        "retrieved_rms_energy": retrieved_energy_rms,
+        "memory_token_rms_median": float(np.median(injected)),
+        "memory_token_rms_energy": injected_energy_rms,
+        "retrieval_zero_fraction": float(np.mean(~nonzero_retrieval)),
+        "retrieval_match_c_count": int(c_values.size),
+        "retrieval_match_c_median": None,
+        "retrieval_match_c_p05": None,
+        "retrieval_match_c_p95": None,
+        "retrieval_match_c_energy": (
+            h8_energy_rms / retrieved_energy_rms if retrieved_energy_rms > _EPS else None
+        ),
+        "gated_match_c_extra_median": None,
+        "gated_match_c_extra_p05": None,
+        "gated_match_c_extra_p95": None,
+        "gated_match_c_extra_energy": h8_energy_rms / injected_energy_rms if injected_energy_rms > _EPS else None,
+        "memory_token_to_h8_ratio_median": None,
+    }
+    if c_values.size:
+        out.update(
+            {
+                "retrieval_match_c_median": float(np.median(c_values)),
+                "retrieval_match_c_p05": float(np.percentile(c_values, 5.0)),
+                "retrieval_match_c_p95": float(np.percentile(c_values, 95.0)),
+            }
+        )
+    if c_extra_values.size:
+        out.update(
+            {
+                "gated_match_c_extra_median": float(np.median(c_extra_values)),
+                "gated_match_c_extra_p05": float(np.percentile(c_extra_values, 5.0)),
+                "gated_match_c_extra_p95": float(np.percentile(c_extra_values, 95.0)),
+            }
+        )
+    if injected_ratios.size:
+        out["memory_token_to_h8_ratio_median"] = float(np.median(injected_ratios))
+    return out
 
 
 def head_mean(attention: np.ndarray) -> np.ndarray:
@@ -380,12 +492,18 @@ def slot_grid_from_npz(
 
 class V33WriterAttentionRunner:
     def __init__(self, options: Options):
+        init_started = time.monotonic()
+
+        def stage(message: str) -> None:
+            print(f"[startup +{time.monotonic() - init_started:.1f}s] {message}", flush=True)
+
         self.options = options
         if options.output_dir.exists():
             raise FileExistsError(f"refusing to overwrite output directory: {options.output_dir}")
         if not (options.checkpoint / "params").is_dir():
             raise FileNotFoundError(f"checkpoint has no params item: {options.checkpoint}")
 
+        stage("building config and tokenizers")
         self.train_config = _config.get_config(options.config)
         model_config = self.train_config.model
         if not getattr(model_config, "memory_task_conditioned_write", False):
@@ -407,9 +525,12 @@ class V33WriterAttentionRunner:
         if norm_stats is None:
             raise FileNotFoundError(f"no norm stats under any of: {[str(c) for c in candidates]}")
 
+        stage("restoring FP32 checkpoint parameters")
         raw_params = _model.restore_params(options.checkpoint / "params", dtype=jnp.float32)
+        stage("checkpoint parameters restored; building abstract model state")
         self.scalars = pathway_scalars(raw_params)
         abstract_state = nnx.state(nnx.eval_shape(model_config.create, jax.random.key(0))).to_pure_dict()
+        stage("aligning checkpoint tree and assembling model")
         self.model = model_config.load(_align_params(abstract_state, raw_params), remove_extra_params=False)
 
         input_transforms = [
@@ -424,8 +545,11 @@ class V33WriterAttentionRunner:
                 *self.data_config.model_transforms.inputs,
             ]
         )
+        stage("freezing diagnostic callables")
         self._qstep = nnx_utils.module_jit(self.model.v32_query_attention_step)
         self._write = nnx_utils.module_jit(self.model.memory.write)
+        self.max_grad_norm = float(self.model.memory.config.max_grad_norm)
+        stage("runner initialization complete")
 
     def _observation(self, row: dict[str, Any], raw_frame: int, prompt: str) -> tuple[_model.Observation, np.ndarray]:
         decode = _wc.WriterContributionRunner._decode_inline_image
@@ -473,6 +597,17 @@ class V33WriterAttentionRunner:
             query_cf = np.asarray(out_cf["write_queries"], dtype=np.float64)[0]
             query_base = np.asarray(self.model.write_query_compressor.query_bank.value, dtype=np.float64)
             js = js_divergence(true_map, cf_map)
+            next_memory_state, write_aux = self._write(memory_state, out_true["write_tokens"])
+            write_grad_norm = float(np.asarray(write_aux["grad_norm"])[0])
+            write_clip_factor = min(1.0, self.max_grad_norm / (write_grad_norm + _EPS))
+            h8_all_rms = float(np.asarray(out_true["h8_all_rms"])[0])
+            h8_valid_rms = float(np.asarray(out_true["h8_valid_rms"])[0])
+            h8_valid_token_count = int(np.asarray(out_true["h8_valid_token_count"])[0])
+            h8_image_rms = float(np.asarray(out_true["h8_image_rms"])[0])
+            h8_context_valid_rms = float(np.asarray(out_true["h8_context_valid_rms"])[0])
+            h8_top_rms = float(np.asarray(out_true["h8_top_rms"])[0])
+            retrieved_rms = float(np.asarray(out_true["retrieved_rms"])[0])
+            memory_token_rms = float(np.asarray(out_true["memory_token_rms"])[0])
 
             label = tasks[int(row["task_index"])]
             phase = (
@@ -487,6 +622,7 @@ class V33WriterAttentionRunner:
             frames.append(
                 {
                     "frame": raw_frame,
+                    "writes_before": len(frames),
                     "phase": phase,
                     "task": label,
                     "js_mean": float(js.mean()),
@@ -504,12 +640,36 @@ class V33WriterAttentionRunner:
                     "left_mass_read": left_half_mass(read_map),
                     "entropy_true": slot_entropy(true_map),
                     "write_norm": float(np.asarray(out_true["write_slot_norm"]).mean()),
+                    # ``grad_norm`` is the fast-weight MLP gradient after the 16-token loss
+                    # mean and before the per-sample inner clip. It is not the outer training
+                    # gradient norm. The clip is saturated exactly when this exceeds the
+                    # configured threshold (1.0 in v3.3).
+                    "write_grad_norm_preclip": write_grad_norm,
+                    "write_clip_factor": write_clip_factor,
+                    "write_clip_saturated": write_grad_norm > self.max_grad_norm,
+                    "write_surprise": float(np.asarray(write_aux["surprise"])[0]),
+                    "write_theta": float(np.asarray(write_aux["theta"])[0]),
+                    "write_eta": float(np.asarray(write_aux["eta"])[0]),
+                    "write_alpha": float(np.asarray(write_aux["alpha"])[0]),
+                    # Scale bridge for a fixed read-injection multiplier. ``h8_all_rms`` is
+                    # the literal static-shape tensor (including prompt padding), while
+                    # ``h8_valid_rms`` excludes masked padding and defines the reported c.
+                    "h8_all_rms": h8_all_rms,
+                    "h8_valid_rms": h8_valid_rms,
+                    "h8_valid_token_count": h8_valid_token_count,
+                    "h8_image_rms": h8_image_rms,
+                    "h8_context_valid_rms": h8_context_valid_rms,
+                    "h8_top_rms": h8_top_rms,
+                    "retrieved_rms": retrieved_rms,
+                    "memory_token_rms": memory_token_rms,
+                    "retrieval_match_c": h8_valid_rms / retrieved_rms if retrieved_rms > _EPS else None,
+                    "memory_token_to_h8_ratio": memory_token_rms / h8_valid_rms if h8_valid_rms > _EPS else None,
                 }
             )
             for key, value in (("true", true_map), ("cf", cf_map), ("base", base_map), ("read", read_map)):
                 maps[key].append(value.astype(np.float16))
             images.append(model_image)
-            memory_state = self._write(memory_state, out_true["write_tokens"])[0]
+            memory_state = next_memory_state
         if not frames:
             raise ValueError(f"episode {plan.episode}: no frames on the stride grid before the wait end")
         print(
@@ -568,13 +728,14 @@ class V33WriterAttentionRunner:
             video_frames.append(composite)
         return token_heatmap.encode_mp4(video_frames, path, self.options.video_fps)
 
-    @staticmethod
-    def _phase_table(all_frames: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-        table: dict[str, dict[str, float]] = {}
+    def _phase_table(self, all_frames: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        table: dict[str, dict[str, Any]] = {}
         for phase in ("approach", "evidence", "retention", "waiting"):
             rows = [f for f in all_frames if f["phase"] == phase]
             if not rows:
                 continue
+            carried_rows = [f for f in rows if f["writes_before"] > 0]
+            scale_rows = carried_rows or rows
             table[phase] = {
                 "frames": len(rows),
                 "js_mean": float(np.mean([f["js_mean"] for f in rows])),
@@ -583,6 +744,18 @@ class V33WriterAttentionRunner:
                 "delta_query_base_mean": float(np.mean([f["delta_query_base"] for f in rows])),
                 "left_mass_true_mean": float(np.mean([f["left_mass_true"] for f in rows])),
                 "entropy_true_mean": float(np.mean([f["entropy_true"] for f in rows])),
+                **writer_clip_statistics(
+                    np.asarray([f["write_grad_norm_preclip"] for f in rows]), self.max_grad_norm
+                ),
+                **retrieval_scale_statistics(
+                    np.asarray([f["h8_valid_rms"] for f in scale_rows]),
+                    np.asarray([f["h8_valid_token_count"] for f in scale_rows]),
+                    np.asarray([f["h8_image_rms"] for f in scale_rows]),
+                    np.asarray([f["h8_context_valid_rms"] for f in scale_rows]),
+                    np.asarray([f["retrieved_rms"] for f in scale_rows]),
+                    np.asarray([f["memory_token_rms"] for f in scale_rows]),
+                ),
+                "retrieval_scale_carried_only": bool(carried_rows),
             }
         return table
 
@@ -597,6 +770,7 @@ class V33WriterAttentionRunner:
             "schema": SCHEMA_VERSION,
             "checkpoint": str(self.options.checkpoint),
             "stride": self.stride,
+            "inner_clip_max_grad_norm": self.max_grad_norm,
             "pathway_scalars": self.scalars,
             "episodes": [],
         }
@@ -646,6 +820,20 @@ class V33WriterAttentionRunner:
             every_frame.extend(replay["frames"])
 
         report["phase_table"] = self._phase_table(every_frame)
+        report["writer_clip_summary"] = writer_clip_statistics(
+            np.asarray([frame["write_grad_norm_preclip"] for frame in every_frame]), self.max_grad_norm
+        )
+        carried_frames = [frame for frame in every_frame if frame["writes_before"] > 0]
+        scale_summary_frames = carried_frames or every_frame
+        report["retrieval_scale_summary"] = retrieval_scale_statistics(
+            np.asarray([frame["h8_valid_rms"] for frame in scale_summary_frames]),
+            np.asarray([frame["h8_valid_token_count"] for frame in scale_summary_frames]),
+            np.asarray([frame["h8_image_rms"] for frame in scale_summary_frames]),
+            np.asarray([frame["h8_context_valid_rms"] for frame in scale_summary_frames]),
+            np.asarray([frame["retrieved_rms"] for frame in scale_summary_frames]),
+            np.asarray([frame["memory_token_rms"] for frame in scale_summary_frames]),
+        )
+        report["retrieval_scale_summary"]["retrieval_scale_carried_only"] = bool(carried_frames)
         (self.options.output_dir / "summary.json").write_text(json.dumps(report, indent=2))
         print(
             f"\n{'phase':>10} {'frames':>7} {'js_mean':>9} {'js_max':>9} {'dQ_cf':>9} {'dQ_base':>9} {'left':>6} {'H':>6}"
@@ -655,6 +843,57 @@ class V33WriterAttentionRunner:
                 f"{phase:>10} {row['frames']:>7} {row['js_mean']:>9.4f} {row['js_max']:>9.4f} "
                 f"{row['delta_query_cf_mean']:>9.3f} {row['delta_query_base_mean']:>9.3f} "
                 f"{row['left_mass_true_mean']:>6.3f} {row['entropy_true_mean']:>6.3f}"
+            )
+        print(
+            f"\ninner writer clip (threshold={self.max_grad_norm:g}; grad norms are pre-clip)\n"
+            f"{'phase':>10} {'frames':>7} {'g_min':>10} {'g_p50':>10} {'g_p95':>10} "
+            f"{'g_max':>10} {'sat_frac':>9} {'clip_p50':>10}"
+        )
+        clip_rows = {"all": {"frames": len(every_frame), **report["writer_clip_summary"]}, **report["phase_table"]}
+        for phase, row in clip_rows.items():
+            print(
+                f"{phase:>10} {row['frames']:>7} {row['write_grad_norm_preclip_min']:>10.3g} "
+                f"{row['write_grad_norm_preclip_median']:>10.3g} "
+                f"{row['write_grad_norm_preclip_p95']:>10.3g} "
+                f"{row['write_grad_norm_preclip_max']:>10.3g} "
+                f"{row['write_clip_saturation_fraction']:>9.3f} "
+                f"{row['write_clip_factor_median']:>10.3g}"
+            )
+        print(
+            "\nread-injection RMS (first pre-write frame excluded when carried reads exist)\n"
+            f"{'phase':>10} {'used':>7} {'h8_p50':>10} {'image':>10} {'context':>10} "
+            f"{'ret_p50':>10} {'inj_p50':>10}"
+        )
+        scale_rows = {
+            "all": report["retrieval_scale_summary"],
+            **report["phase_table"],
+        }
+        for phase, row in scale_rows.items():
+            print(
+                f"{phase:>10} {row['retrieval_scale_frame_count']:>7} {row['h8_valid_rms_median']:>10.3g} "
+                f"{row['h8_image_rms_median']:>10.3g} {row['h8_context_valid_rms_median']:>10.3g} "
+                f"{row['retrieved_rms_median']:>10.3g} {row['memory_token_rms_median']:>10.3g}"
+            )
+        print(
+            "\nread-injection constants (c_raw replaces gate; c_extra multiplies gated retrieval)\n"
+            f"{'phase':>10} {'used':>7} {'c_p05':>10} {'c_p50':>10} {'c_p95':>10} "
+            f"{'c_energy':>10} {'c_extra':>10} {'inj/h8':>10}"
+        )
+        for phase, row in scale_rows.items():
+            c50 = row["retrieval_match_c_median"]
+            c05 = row["retrieval_match_c_p05"]
+            c95 = row["retrieval_match_c_p95"]
+            c_energy = row["retrieval_match_c_energy"]
+            c_extra = row["gated_match_c_extra_median"]
+            injected_ratio = row["memory_token_to_h8_ratio_median"]
+            print(
+                f"{phase:>10} {row['retrieval_scale_frame_count']:>7} "
+                f"{c05 if c05 is not None else float('nan'):>10.3g} "
+                f"{c50 if c50 is not None else float('nan'):>10.3g} "
+                f"{c95 if c95 is not None else float('nan'):>10.3g} "
+                f"{c_energy if c_energy is not None else float('nan'):>10.3g} "
+                f"{c_extra if c_extra is not None else float('nan'):>10.3g} "
+                f"{injected_ratio if injected_ratio is not None else float('nan'):>10.3g}"
             )
         print(f"wrote {self.options.output_dir}/summary.json")
         return report

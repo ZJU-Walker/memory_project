@@ -142,6 +142,35 @@ class DataConfig:
     # Memory-critical starts are drawn uniformly from this many frames before the evidence
     # phase (memory is blank shortly before the answer becomes visible).
     memory_critical_start_pad: int = 75
+    # v3.4: the ordered subtask vocabulary for the auxiliary demand loss (plan 5.1) -- the
+    # per-step subtask string is mapped to its index here (unknown -> -1, masked out). Must
+    # match the model's memory_aux_num_classes.
+    memory_subtask_vocab: tuple[str, ...] = ()
+    # v3.4: episodes excluded from ALL training sampling (full trajectories, slices,
+    # memory-critical starts), reserved for held-out evaluation (plan section 8).
+    heldout_episodes: tuple[int, ...] = ()
+    # v3.4.1 waiting-leak fix 1 (diagnostic_outputs/v34_leak_audit): the hand-labeled
+    # memory-required ("waiting") phase does not always contain a STATIONARY arm. It starts
+    # while the arm is still settling out of the reset phase (21 episodes; up to 44 frames) and
+    # in 30 episodes it runs past the moment the arm begins moving toward the target bin --
+    # most extremely episode 26, which has no execution label at all and spends 337 waiting
+    # frames performing the right-bin open. Motion toward a bin reveals the answer, so any
+    # memory supervision placed there is solvable without memory.
+    #
+    # When set, the phase table keeps only the LONGEST contiguous run inside each episode's
+    # waiting phase over which no per-frame joint step exceeds `memory_waiting_max_speed` and
+    # the total per-joint excursion stays within `memory_waiting_max_excursion`. Memory-critical
+    # endpoints can then only land on genuinely static frames, and waiting frames outside the
+    # run are dropped from the aux CE target and the ladder waiting mask (their observations
+    # and actions still train the policy normally -- only the memory supervision is withdrawn).
+    # None disables the trim and preserves the original label-derived bounds.
+    #
+    # Sizing (measured over all 60 episodes): the state stream quantizes at 3.8e-4 rad/frame and
+    # a typical waiting phase drifts ~0.01 rad in total, so 4e-3 rad/frame is ~10x the noise
+    # floor and 0.02 rad is ~2x the benign drift. That retains 83% of waiting frames
+    # (median window 59 -> 51 frames).
+    memory_waiting_max_speed: float | None = None
+    memory_waiting_max_excursion: float = 0.02
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -467,6 +496,13 @@ class LeRobotYamDataConfig(DataConfigFactory):
             getattr(model_config, "memory_probe_weight", 0) > 0
             or getattr(model_config, "memory_probe_diagnostic", False)
         )
+        # v3.4 supervision fields (V34_PLAN_final.md): needed by the aux demand (5.1), the
+        # per-segment state masking (5.2), and/or the probe-ladder heads (Section 6).
+        use_v34_labels = use_memory and (
+            getattr(model_config, "memory_aux_loss_weight", 0.0) > 0
+            or getattr(model_config, "memory_state_mask_prob", 0.0) > 0
+            or getattr(model_config, "memory_ladder_probes", False)
+        )
         if use_memory:
             # sequence bookkeeping (attached by MemoryEpisodeInfo / present on raw items)
             structure["frame_index"] = "frame_index"
@@ -476,9 +512,36 @@ class LeRobotYamDataConfig(DataConfigFactory):
                 structure["memory_window"] = "memory_window"
         if use_quiz:
             structure.update({key: key for key in ("quiz_side", "reveal_frame", "close_frame")})
+        if use_v34_labels:
+            if not base_config.subtask_from_task:
+                raise ValueError("v3.4 label transforms require subtask_from_task.")
+            structure["subtask_now"] = "subtask_now"
+            structure["episode_side"] = "episode_side"
+            if base_config.memory_waiting_max_speed is not None:
+                # v3.4.1 leak fix 1: the per-step static-waiting flags MemoryV34Labels consumes
+                # (and pops) to gate the aux target and the ladder waiting mask.
+                structure["subtask_valid"] = "subtask_valid"
+                structure["subtask_now_valid"] = "subtask_now_valid"
+            if getattr(model_config, "memory_aux_loss_weight", 0.0) > 0:
+                vocab = base_config.memory_subtask_vocab
+                if len(vocab) != getattr(model_config, "memory_aux_num_classes", 0):
+                    raise ValueError(
+                        f"memory_subtask_vocab has {len(vocab)} entries but the model expects "
+                        f"{getattr(model_config, 'memory_aux_num_classes', 0)} aux classes."
+                    )
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(structure)])
 
         input_transforms = [yam_policy.YamInputs(model_type=model_config.model_type)]
+        if use_v34_labels:
+            input_transforms.insert(
+                0,
+                _transforms.MemoryV34Labels(
+                    subtask_vocab=tuple(base_config.memory_subtask_vocab),
+                    evidence_subtasks=tuple(base_config.evidence_subtasks),
+                    memory_required_subtasks=tuple(base_config.memory_required_subtasks),
+                    state_mask_prob=getattr(model_config, "memory_state_mask_prob", 0.0),
+                ),
+            )
         if use_memory:
             input_transforms.insert(
                 0,
@@ -643,6 +706,17 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+    # v3.4 probe-ladder heads (Section 6): constant SGD learning rate of the ISOLATED probe
+    # optimizer. Probe-head gradients are zeroed out of the main AdamW/clip path (so they
+    # cannot scale main-model updates through the global clip norm) and applied here instead.
+    probe_lr: float = 1e-2
+
+    # v34_run1 postmortem: optional group pre-clip of the memory-path gradients (train.py's
+    # MEMORY_PATH_FILTER) applied BEFORE the shared global clip. The recurrent memory backward
+    # can spike orders of magnitude above the rest of the model; the group clip stops one bad
+    # chain from scaling every parameter's update toward zero through the global clip. None
+    # disables (pre-fix behavior).
+    memory_grad_clip: float | None = None
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -1442,6 +1516,145 @@ _CONFIGS = [
         save_interval=250,
         num_workers=12,
     ),
+    TrainConfig(
+        # v3.4: first end-to-end behavioral proof attempt that the memory
+        # loop closes. On top of the v3.3 recipe (task-conditioned writes, memory-critical
+        # sampling), all plan 5.x components:
+        #   5.1 aux demand -- subtask decoding from post-write memory via a frame-invariant
+        #       key-space query bank, class-balanced macro CE, weight 0.1;
+        #   5.2 state masking -- per-segment p=0.5 null-embedding substitution of the state
+        #       tokens on memory-required segments (single view);
+        #   5.3 blinded memory tokens; 5.4 CE re-seeded from the last valid non-memory token;
+        #   5.5 cosine-attention compressors at temperature sqrt(d_head) + the 480x640
+        #       letterbox patch-validity mask; 5.6 tanh(w)-gated RMS-pinned injection
+        #       (c and tau measured at the actual v3.4 init and recorded below);
+        #   5.7 unit-L2 memory MLP (He layer-0), validated by scripts/v34_stage0_memory_core.py;
+        #   5.9 instruction-only conditioner context; Section 6 online ladder probes (isolated
+        #       optimizer). Titans gates stay frozen (5.8).
+        # One held-out episode per (instruction x side) cell is excluded from ALL training
+        # sampling and reserved for the section-8 matched-swap evaluation.
+        # Fresh from official pi05_base -- never resume a v3.x checkpoint.
+        name="pi05_yam_mem_v34",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            max_token_len=80,
+            memory_layer=8,
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            memory_query_heads=8,
+            memory_task_conditioned_write=True,
+            causal_token_len=128,
+            bf16_vocab_projection=True,
+            simulated_delay=6,
+            memory_seq_steps=40,
+            memory_block_steps=25,
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
+            memory_probe_classes=2,
+            # plan 5.7: unit-L2 memory MLP (root fix for the saturated-clip constant-speed
+            # writer and the exponential fast-weight bloat).
+            # state_cotangent_clip (v34_run1 postmortem): outer training drove the recurrent
+            # backward expansive (~1.2x/step at ckpt 2750 vs contractive at init; 50-500x over
+            # a segment, 1e5+ at cycle peaks) -> explosion/collapse limit cycle every ~700
+            # steps. Healthy per-sample state cotangents measured 0.4-1.8 (depths 1-10,
+            # preserved run1 diagnostics); 10.0 never binds on legitimate credit and truncates
+            # only the expansive tail, direction preserved.
+            # kv_cotangent_clip (v34_run2 postmortem): with the state chain capped, the
+            # amplified backward escaped through the write's k/v inputs into the VLM (total
+            # grad_norm 48 at step 1400 with the memory group at 3.5). 1.0 caps what one write
+            # step may send toward the tower; healthy per-step per-sample values are estimated
+            # 0.1-0.5 from the healthy-phase memory-group norms.
+            memory=_memory.MemoryConfig(mlp_l2norm=True, state_cotangent_clip=10.0, kv_cotangent_clip=1.0),
+            # plan 5.5
+            memory_qk_norm=True,
+            memory_letterbox_source_hw=(480, 640),
+            # plan 5.3 / 5.4
+            memory_blind_tokens=True,
+            memory_reseed_ce=True,
+            # plan 5.6: measured on the actual v3.4 initialization (pi05_base graft) over
+            # 409 real frames: h8 valid RMS median 10.86
+            # (v3.3-ckpt prior was 12.4); post-write retrieved RMS median 0.0174 -> tau at
+            # half the median so genuine reads normalize to c while sub-floor noise stays
+            # small. Fresh reads and the injected tokens measured EXACTLY zero at init.
+            memory_injection_mode="tanh_rms",
+            memory_injection_c=10.86,
+            memory_injection_tau=0.0087,
+            # plan 5.9
+            memory_conditioner_context="instruction_only",
+            # plan 5.2 (single view; the dual-view gold standard stays available as an A/B)
+            memory_state_mask_prob=0.5,
+            memory_state_mask_dual_view=False,
+            # plan 5.1 (weight 0.1: shape, not dominate; margin variant off by default)
+            memory_aux_loss_weight=0.1,
+            memory_aux_num_classes=7,
+            memory_aux_query_space="key",
+            memory_aux_margin_weight=0.0,
+            # side-bearing classes within the vocab below: the two waiting labels
+            memory_aux_side_class_ids=(1, 6),
+            # Section 6 online rungs
+            memory_ladder_probes=True,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id="yam/bin_memory_0816_subtask",
+            base_config=DataConfig(
+                prompt_from_episode_meta=True,
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=15,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=14,
+                memory_sequence_buckets=(14, 27, 40),
+                evidence_subtasks=("inspect both bins",),
+                memory_required_subtasks=(
+                    "wait; target bin is left",
+                    "wait; target bin is right",
+                ),
+                memory_critical_prob=0.5,
+                memory_critical_start_pad=75,
+                # Aux vocabulary in dataset task_index order (meta/tasks.jsonl).
+                memory_subtask_vocab=(
+                    "open both lids",
+                    "wait; target bin is left",
+                    "open left bin",
+                    "close both lids and reset arms",
+                    "inspect both bins",
+                    "open right bin",
+                    "wait; target bin is right",
+                ),
+                # Held-out eval episodes: the last episode of each (instruction x side) cell --
+                # banana-L, banana-R, greybox-L, greybox-R. Excluded from all training
+                # sampling; the section-8 matched-swap evals run on exactly these.
+                heldout_episodes=(15, 29, 44, 59),
+            ),
+            assets=AssetsConfig(assets_dir="./assets/pi05_yam_0816"),
+        ),
+        # Only the Titans write gates stay frozen at their measured stable operating point.
+        freeze_filter=nnx_utils.PathRegex(r".*memory/gate.*"),
+        batch_size=12,
+        gradient_accumulation_steps=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # v34_run1 postmortem: group pre-clip of the memory-path gradients before the shared
+        # global clip. Measured per-batch memory-group norms at ckpt 2750 were 2-14 (median
+        # ~5) with the whole VLM at 1-2 -- the swings and spikes reached everyone's update
+        # through the global clip. 5.0 caps the spikes at the median operating point.
+        memory_grad_clip=5.0,
+        ema_decay=0.999,
+        probe_lr=1e-2,
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        save_interval=250,
+        num_workers=12,
+        fsdp_devices=4,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
@@ -1522,6 +1735,58 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# v34_run4 is the controlled blank-output intervention. It is cloned rather than duplicated so
+# every training/data/optimizer setting stays mechanically identical to v34; only the config
+# identity and the effective per-episode memory output initializer differ.
+_v34_run3_config = next(config for config in _CONFIGS if config.name == "pi05_yam_mem_v34")
+_CONFIGS.append(
+    dataclasses.replace(
+        _v34_run3_config,
+        name="pi05_yam_mem_v34_run4",
+        model=dataclasses.replace(
+            _v34_run3_config.model,
+            memory=dataclasses.replace(_v34_run3_config.model.memory, blank_initial_output=True),
+        ),
+    )
+)
+
+# v34_run5 is the single-variable momentum intervention selected by the checkpoint-2250
+# same-K/V replay. Clone run4 mechanically so the official base loader, blank episode output,
+# data order, objectives, clips, optimizer, and every other setting remain identical.
+_v34_run4_config = next(config for config in _CONFIGS if config.name == "pi05_yam_mem_v34_run4")
+_CONFIGS.append(
+    dataclasses.replace(
+        _v34_run4_config,
+        name="pi05_yam_mem_v34_run5_eta0",
+        model=dataclasses.replace(
+            _v34_run4_config.model,
+            memory=dataclasses.replace(_v34_run4_config.model.memory, eta_scale=0.0),
+        ),
+    )
+)
+
+# v34_run6 is the v3.4.1 waiting-leak fix 1: the memory-required phase is trimmed to each
+# episode's genuinely stationary core (see DataConfig.memory_waiting_max_speed and
+# diagnostic_outputs/v34_leak_audit). Cloned from run5 so eta_scale=0, the blank episode output,
+# the objectives, clips, and the optimizer stay identical -- the training DATA is the only
+# variable. It is a separate config on purpose: these are data settings, absent from checkpoint
+# arrays, so resuming run5 under a trimmed config would silently change its sampling mid-run.
+_v34_run5_config = next(config for config in _CONFIGS if config.name == "pi05_yam_mem_v34_run5_eta0")
+_CONFIGS.append(
+    dataclasses.replace(
+        _v34_run5_config,
+        name="pi05_yam_mem_v34_run6_staticwait",
+        data=dataclasses.replace(
+            _v34_run5_config.data,
+            base_config=dataclasses.replace(
+                _v34_run5_config.data.base_config,
+                memory_waiting_max_speed=4e-3,
+                memory_waiting_max_excursion=0.02,
+            ),
+        ),
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

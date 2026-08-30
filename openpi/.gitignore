@@ -166,4 +166,22 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-third_party/ß
+third_party/
+
+# Local experiment outputs and evidence archives. Keep these on the cluster,
+# but do not make ordinary source commits enormous or host-specific.
+diagnostic_checkpoints/
+diagnostic_outputs/
+cluster_v34/logs/
+cluster_v34/incidents/
+cluster_v34/__pycache__/
+cluster_v34/.snapshot_nfs_pytest/
+
+# Historical launch captures are retained locally as audit records. The
+# current run5 main-launch capture is intentionally not ignored because the
+# v3.4 diagnostic tools validate and load its source snapshot.
+cluster_v34/provenance/v34_run4_launch/
+cluster_v34/provenance/v34_run5_eta0_launch/
+
+# Allocation-specific, short-lived orchestration lanes.
+cluster_v34/run_evidence_visuals_*.sh

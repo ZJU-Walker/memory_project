@@ -34,6 +34,15 @@ def _sequence_item(valid_steps: int, *, max_steps: int = 60, offset: int = 0) ->
         "seq_probe_labels": np.zeros(max_steps, dtype=np.int32),
         "seq_probe_mask": mask,
         "seq_probe_visible": mask,
+        # v3.4 fields: per-step supervision is trimmed with the time axis; the per-SEGMENT
+        # scalars (seq_state_masked, seq_side_label) are deliberately absent from the
+        # registered temporal keys and pass through the collate untouched.
+        "token_state_mask": np.zeros((max_steps, 4), dtype=bool),
+        "seq_subtask_class": np.zeros(max_steps, dtype=np.int32),
+        "seq_evidence_mask": mask,
+        "seq_waiting_mask": np.zeros(max_steps, dtype=bool),
+        "seq_state_masked": np.bool_(),
+        "seq_side_label": np.int32(1),
     }
 
 

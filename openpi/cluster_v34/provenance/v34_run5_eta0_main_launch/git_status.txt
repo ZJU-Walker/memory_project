@@ -1,0 +1,44 @@
+## main...origin/main
+ M scripts/train.py
+ M scripts/train_test.py
+ M scripts/v33_offline_eval.py
+ M src/openpi/diagnostics/v33_writer_attention.py
+ M src/openpi/diagnostics/v33_writer_attention_test.py
+ M src/openpi/models/memory.py
+ M src/openpi/models/model.py
+ M src/openpi/models/pi0.py
+ M src/openpi/models/pi0_config.py
+ M src/openpi/models/pi0_v32_test.py
+ M src/openpi/models/tokenizer.py
+ M src/openpi/policies/yam_policy.py
+ M src/openpi/training/config.py
+ M src/openpi/training/config_test.py
+ M src/openpi/training/data_loader.py
+ M src/openpi/training/data_loader_test.py
+ M src/openpi/transforms.py
+?? ../.codex_diagnostics/
+?? ../V34_PLAN_final.md
+?? cluster_v34/
+?? conftest.py
+?? docs/v34_implementation.md
+?? scripts/v33_memory_interface.py
+?? scripts/v33_prompt_attention.py
+?? scripts/v33_prompt_attention_single_view.py
+?? scripts/v34_init_scale.py
+?? scripts/v34_probe_ladder.py
+?? scripts/v34_retention_eval.py
+?? scripts/v34_retention_eval_test.py
+?? scripts/v34_stage0_memory_core.py
+?? scripts/v34_stage0_memory_core_test.py
+?? src/openpi/diagnostics/v33_memory_interface.py
+?? src/openpi/diagnostics/v33_memory_interface_test.py
+?? src/openpi/diagnostics/v33_prompt_attention.py
+?? src/openpi/diagnostics/v33_prompt_attention_test.py
+?? src/openpi/diagnostics/v34_probe_ladder.py
+?? src/openpi/diagnostics/v34_probe_ladder_test.py
+?? src/openpi/models/memory_v34_test.py
+?? src/openpi/models/pi0_v34_test.py
+?? src/openpi/models/tokenizer_v34_test.py
+?? src/openpi/transforms_v34_test.py
+?? ../v33_explainer_site/
+?? ../v33_social_preview/

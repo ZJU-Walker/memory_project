@@ -361,6 +361,9 @@ class MemoryEpisodeInfo(DataTransformFn):
     # [num_episodes, 4] int32: memory-critical start window [lo, hi] and the memory-required
     # phase [memory_lo, memory_hi] (frames, inclusive); a row of -1 disables the branch.
     episode_memory_window: np.ndarray | None = None
+    # v3.4: the per-episode answer side (0=left, 1=right, -1=unlabeled), attached independently
+    # of the legacy quiz plumbing. Consumed by MemoryV34Labels for the probe-ladder labels.
+    episode_side_label: np.ndarray | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         episode = int(np.asarray(data["episode_index"]).item())
@@ -369,6 +372,8 @@ class MemoryEpisodeInfo(DataTransformFn):
             out["quiz_side"] = np.int32(self.episode_side[episode])
             out["reveal_frame"] = np.int32(self.episode_reveal[episode])
             out["close_frame"] = np.int32(self.episode_close[episode])
+        if self.episode_side_label is not None:
+            out["episode_side"] = np.int32(self.episode_side_label[episode])
         if self.episode_memory_window is not None:
             out["memory_window"] = self.episode_memory_window[episode].astype(np.int32)
         return out
@@ -390,13 +395,30 @@ class MemorySequenceSubtasks(DataTransformFn):
     episode_tasks: tuple
     # dataset_meta.tasks
     tasks: dict[int, str]
+    # v3.4.1 leak fix 1: per-episode per-frame booleans, False on waiting-labeled frames whose
+    # arm is not actually stationary (data_loader._trim_waiting_to_static). Empty = no trim.
+    episode_waiting_valid: tuple = ()
 
     def __call__(self, data: DataDict) -> DataDict:
         episode = int(np.asarray(data["episode_index"]).item())
         frame = int(np.asarray(data["frame_index"]).item())
         ep_tasks = self.episode_tasks[episode]
         idx = np.minimum(frame + np.arange(self.steps) * self.stride + self.lookahead, len(ep_tasks) - 1)
-        return {**data, "subtask": [self.tasks[int(ep_tasks[i])] for i in idx]}
+        # v3.4 also carries the UNSHIFTED per-step labels ("what phase is the observation in"),
+        # consumed by MemoryV34Labels for the probe-ladder evidence/waiting frame masks.
+        idx_now = np.minimum(frame + np.arange(self.steps) * self.stride, len(ep_tasks) - 1)
+        out = {
+            **data,
+            "subtask": [self.tasks[int(ep_tasks[i])] for i in idx],
+            "subtask_now": [self.tasks[int(ep_tasks[i])] for i in idx_now],
+        }
+        if self.episode_waiting_valid:
+            # Same shift convention as the labels they gate: `subtask_valid` follows the
+            # lookahead-shifted CE/aux target, `subtask_now_valid` the observation's own phase.
+            valid = self.episode_waiting_valid[episode]
+            out["subtask_valid"] = valid[idx]
+            out["subtask_now_valid"] = valid[idx_now]
+        return out
 
 
 def memory_critical_endpoint(
@@ -507,6 +529,91 @@ class BuildMemorySequence(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MemoryV34Labels(DataTransformFn):
+    """Per-segment v3.4 supervision fields (V34_PLAN_final.md 5.1, 5.2, Section 6).
+
+    Runs after BuildMemorySequence on training sequence samples (identified by the per-step
+    "subtask" list); inference items pass through untouched. Emits:
+
+      * "seq_subtask_class" [T] int32: the LOOKAHEAD-SHIFTED subtask label's index in
+        ``subtask_vocab`` (-1 = unknown) -- the aux-demand CE target (plan 5.1), the same label
+        space the causal CE trains on;
+      * "seq_evidence_mask"/"seq_waiting_mask" [T] bool from the UNSHIFTED labels
+        ("subtask_now"): is the step's OBSERVATION inside the evidence / waiting phase --
+        the probe-ladder frame selectors (Section 6 rungs 1 and 4);
+      * "seq_side_label" int32: the episode's answer side (0/1; -1 unlabeled), preferring the
+        loader-attached "episode_side" and falling back to the side named by any shifted
+        waiting label in the window;
+      * "seq_state_masked" bool (plan 5.2, when ``state_mask_prob`` > 0): drawn ONCE PER
+        SEGMENT, and only for memory-required segments -- windows containing at least one
+        valid step whose shifted CE label is a waiting label. Per-frame draws would let the
+        model funnel state through the memory (write arm-lean at an unmasked frame, read it at
+        a masked one); segment-level masking removes the within-segment funnel.
+    """
+
+    subtask_vocab: tuple[str, ...]
+    evidence_subtasks: tuple[str, ...]
+    memory_required_subtasks: tuple[str, ...]
+    state_mask_prob: float = 0.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        subtask = data.get("subtask")
+        if not isinstance(subtask, list):
+            data.pop("subtask_now", None)
+            data.pop("episode_side", None)
+            data.pop("subtask_valid", None)
+            data.pop("subtask_now_valid", None)
+            return data
+        subtask = [str(s) for s in subtask]
+        subtask_now = [str(s) for s in data.pop("subtask_now", subtask)]
+        if len(subtask_now) != len(subtask):
+            raise ValueError(f"subtask/subtask_now length mismatch: {len(subtask)} vs {len(subtask_now)}.")
+
+        vocab = {label: index for index, label in enumerate(self.subtask_vocab)}
+        subtask_class = np.asarray([vocab.get(s, -1) for s in subtask], dtype=np.int32)
+        evidence = set(self.evidence_subtasks)
+        waiting = list(self.memory_required_subtasks)
+        evidence_mask = np.asarray([s in evidence for s in subtask_now], dtype=bool)
+        waiting_mask = np.asarray([s in waiting for s in subtask_now], dtype=bool)
+
+        # v3.4.1 leak fix 1: withdraw memory supervision from waiting frames whose arm is
+        # moving (data_loader._trim_waiting_to_static). The aux target becomes unknown (-1, so
+        # the step is masked out of the class-balanced CE) and the frame leaves the ladder's
+        # waiting pool. Evidence frames are never gated -- motion there is the demonstration.
+        shifted_valid = data.pop("subtask_valid", None)
+        now_valid = data.pop("subtask_now_valid", None)
+        if shifted_valid is not None:
+            shifted_valid = np.asarray(shifted_valid, dtype=bool)
+            subtask_class = np.where(shifted_valid, subtask_class, np.int32(-1))
+        if now_valid is not None:
+            waiting_mask = waiting_mask & np.asarray(now_valid, dtype=bool)
+
+        data["seq_subtask_class"] = subtask_class
+        data["seq_evidence_mask"] = evidence_mask
+        data["seq_waiting_mask"] = waiting_mask
+
+        side = int(np.asarray(data.pop("episode_side", -1)).item())
+        if side < 0:
+            for s in subtask:
+                if s in waiting:
+                    side = waiting.index(s)
+                    break
+        data["seq_side_label"] = np.int32(side)
+
+        if self.state_mask_prob > 0:
+            step_mask = np.asarray(data.get("seq_step_mask", np.ones(len(subtask), dtype=bool)))
+            shifted_waiting = np.asarray([s in waiting for s in subtask], dtype=bool)
+            if shifted_valid is not None:
+                # A segment whose only waiting targets were dropped as non-static is no longer
+                # memory-required, so it must not draw the plan-5.2 state mask either.
+                shifted_waiting = shifted_waiting & shifted_valid
+            memory_required_segment = bool(np.any(shifted_waiting & step_mask[: len(shifted_waiting)]))
+            drawn = memory_required_segment and (np.random.random() < self.state_mask_prob)
+            data["seq_state_masked"] = np.bool_(drawn)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeMemorySubtaskInputs(DataTransformFn):
     """Tokenizer for the memory co-training layout [images | context | memory | causal].
 
@@ -528,8 +635,12 @@ class TokenizeMemorySubtaskInputs(DataTransformFn):
 
         state = data["state"]
         if subtask is None:
-            # inference: pure ar=0 context, same as the no-label FAST subtask path
-            tokens, token_mask, ar_mask, loss_mask, fast_mask = self.tokenizer.tokenize(prompt, state, None, None)
+            # inference: pure ar=0 context, same as the no-label FAST subtask path. The state
+            # mask ships along so the v3.4 instruction-only conditioner sees the identical
+            # context selection at inference and training.
+            tokens, token_mask, ar_mask, loss_mask, fast_mask, state_mask = self.tokenizer.tokenize(
+                prompt, state, None, None, return_state_mask=True
+            )
             return {
                 **data,
                 "tokenized_prompt": tokens,
@@ -537,6 +648,7 @@ class TokenizeMemorySubtaskInputs(DataTransformFn):
                 "token_ar_mask": ar_mask,
                 "token_loss_mask": loss_mask,
                 "token_fast_mask": fast_mask,
+                "token_state_mask": state_mask,
             }
 
         if isinstance(subtask, str):
@@ -545,10 +657,14 @@ class TokenizeMemorySubtaskInputs(DataTransformFn):
         if state.ndim != 2:
             raise ValueError("memory sequence training expects per-step state [T, s]")
         steps = [
-            self.tokenizer.tokenize_split(prompt, state[k], str(subtask[k]), actions[k], self.causal_len)
+            self.tokenizer.tokenize_split(
+                prompt, state[k], str(subtask[k]), actions[k], self.causal_len, return_state_mask=True
+            )
             for k in range(state.shape[0])
         ]
-        context, context_mask, causal, causal_mask, causal_fast = (np.stack(x) for x in zip(*steps, strict=True))
+        context, context_mask, causal, causal_mask, causal_fast, context_state = (
+            np.stack(x) for x in zip(*steps, strict=True)
+        )
         return {
             **data,
             "tokenized_prompt": context,
@@ -557,6 +673,7 @@ class TokenizeMemorySubtaskInputs(DataTransformFn):
             "token_ar_mask": np.zeros(context.shape, dtype=np.int32),
             "token_loss_mask": np.zeros(context.shape, dtype=bool),
             "token_fast_mask": np.zeros(context.shape, dtype=bool),
+            "token_state_mask": context_state,
             "tokenized_causal": causal,
             "tokenized_causal_mask": causal_mask,
             "causal_fast_mask": causal_fast,
