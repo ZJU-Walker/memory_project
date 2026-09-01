@@ -19,3 +19,9 @@ v35/
 v4/
 .tools/
 openpi_test_mem/
+
+# Local plans, handoff notes, and generated reports; keep outside the codebase.
+/RUN6_PLAN*.md
+/V35_CURRENT_STATUS_HANDOFF_FOR_CLAUDE*.md
+/V35_PLAN_FOR_CLAUDE_REVIEW*.md
+/openpi/reports/
