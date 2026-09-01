@@ -81,3 +81,53 @@ Pass the resulting project-relative path to `scripts/v35_train.py` as
 the restored raw parameter tree and requires an exact match to Gate D. A later
 crash-resume (for example at 5,000) is allowed only if that checkpoint already contains
 the byte-identical continuation authorization.
+
+## Private Hugging Face transfer
+
+Code is synchronized through GitHub. The frozen v3.6/v4 data and the optional
+authorized r6 resume state are stored in two private Hugging Face repositories:
+
+- dataset `kewalk123/bin_memory_0830_0831_v36_subtask`, revision
+  `bd97941eca402f8be854ee8a0a3bbad14df37292`;
+- model/artifacts `kewalk123/openpi-v36-r6-resume`, revision
+  `0321e3e7f58b993201ad1dc2b41a2c8c5cff0dad`.
+
+The dataset revision contains the exact 78 frozen payload files (41,632,438,815
+bytes), plus the Hub-managed `.gitattributes`. Its dataset-tree identity is
+`43cf91f5a18ec411d26f926a5d3ace3d8a235f0e8201b9c3ef816f094d145e93`.
+The artifact revision contains finalized checkpoint 0, all linked r6
+authorization evidence, manifests, and norm assets. It deliberately excludes
+`bootstrap_raw_state`, failed experiments, caches, W&B data, and the downloadable
+official Pi0.5 base.
+
+On a new cluster, log in without putting a token in a command or repository, then
+download both revisions to temporary directories:
+
+```bash
+cd /path/to/memory_project
+source openpi/cluster_v35/env.sh
+openpi/.venv/bin/huggingface-cli login
+
+openpi/.venv/bin/huggingface-cli download \
+  kewalk123/bin_memory_0830_0831_v36_subtask \
+  --repo-type dataset \
+  --revision bd97941eca402f8be854ee8a0a3bbad14df37292 \
+  --local-dir v35/tmp/hf_dataset
+
+openpi/.venv/bin/huggingface-cli download \
+  kewalk123/openpi-v36-r6-resume \
+  --revision 0321e3e7f58b993201ad1dc2b41a2c8c5cff0dad \
+  --local-dir v35/tmp/hf_r6
+```
+
+Copy only `data/` and `meta/` from the dataset download into
+`data/lerobot/yam/bin_memory_0830_0831_v36_subtask`, excluding the Hub-created
+`.cache/`. Copy the project-relative `data/` and `v35/` trees from `hf_r6` into
+the project root. Verify the manifest, inventory, norm, and authorization hashes
+shown in the private model card before launch.
+
+The r6 authorization freezes source aggregate
+`2a85920d230920b14452e482ebe7b25d2f9cfa974717386ad86490d21257f24c`.
+A restored checkpoint is usable only when the current source/runtime matches that
+identity and the production `verify-only` command succeeds before any optimizer
+update. A successful Hub download alone is not authorization.
