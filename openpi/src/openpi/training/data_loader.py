@@ -2373,6 +2373,16 @@ _SEQUENCE_TIME_KEYS = frozenset(
         "seq_subtask_class",
         "seq_evidence_mask",
         "seq_waiting_mask",
+        # v3.5 per-step memory supervision masks share the sampled-step time axis and must
+        # trim with it. The per-sequence scalars (seq_sparse_skip_o, episode/collection/
+        # object/cell IDs) are deliberately not listed.
+        "seq_write_mask",
+        "seq_decision_mask",
+        "seq_occlusion_mask",
+        "seq_read_state_valid",
+        "seq_read_credit_reachable",
+        "seq_decay_gap_before",
+        "seq_use_pressure_mask",
     }
 )
 
