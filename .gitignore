@@ -26,6 +26,10 @@ openpi_test_mem/
 /V35_PLAN_FOR_CLAUDE_REVIEW*.md
 /openpi/reports/
 
+# Historical memory handoffs, plans, diagnostics, and status reports stay local.
+/V[0-9]*.md
+/openpi/docs/v*.md
+
 # v4 worktree-local read-only links into the main project.
 /data
 /v35_readonly
