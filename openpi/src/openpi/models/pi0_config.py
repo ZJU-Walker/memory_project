@@ -142,6 +142,13 @@ class Pi0Config(_model.BaseModelConfig):
     memory_injection_mode: Literal["gate", "tanh_rms"] = "gate"
     memory_injection_c: float = 12.4
     memory_injection_tau: float = 0.02
+    # Effective tanh-gate value at fresh initialization. Zero preserves v3.4 exactly. The
+    # fresh-base v3.5 branch uses 0.5 (stored parameter atanh(0.5)) so the consumer path is
+    # open from step 0 without borrowing a memory-specific leaf from an older run.
+    memory_injection_gate_init: float = 0.0
+    # Optimizer-level invariant for the fresh-base v3.5 pilot. train.py enforces this even if a
+    # custom TrainConfig forgets to include the leaf in its freeze_filter.
+    memory_freeze_injection_gate: bool = False
     # 5.9: context rows of the write-query conditioner. "instruction_state" is the v3.3
     # behavior (all non-image prefix rows); "instruction_only" excludes the state-digit token
     # positions -- state encodes phase strongly and the v3.3 writer collapsed to phase.
@@ -179,6 +186,38 @@ class Pi0Config(_model.BaseModelConfig):
     # probes measure but cannot train or perturb the main model (verified by a bit-identity
     # unit test). Offline episode-split ladder runs live in the diagnostics package.
     memory_ladder_probes: bool = False
+
+    # --------------------------------------------------------------------------------------
+    # v3.5 (V35_PLAN_FOR_CLAUDE_REVIEW.md). This branch is deliberately default-off: an
+    # existing v3.4 config constructs the same modules and follows the same scan/augmentation
+    # paths as before.
+    # --------------------------------------------------------------------------------------
+    # Enables the v3.5 E-only pooled delta transition and D-only side objectives. The memory
+    # core has its own explicit write-rule/association-mode checks; this model-level switch
+    # controls the sequence semantics and auxiliary heads. At inference, sample_with_memory
+    # also requires explicit `v35_transition_valid` and `v35_write_mask` inputs; omitted phase
+    # metadata is a strict state no-op instead of inheriting v3.4's every-frame write default.
+    memory_v35_enabled: bool = False
+    # Predict prompt-conditioned target side from the pooled write value on eligible E steps
+    # and from the mean raw (pre-injection, pre-write) retrieval on state-valid D steps.
+    memory_write_side_loss_weight: float = 0.0
+    memory_read_side_loss_weight: float = 0.0
+    # Backward-only, per-example cap on the cotangent entering either side feature. This is
+    # separate from the core k/v guard because these heads consume pooled features directly.
+    memory_side_feature_cotangent_clip: float | None = None
+    # Stable manifest cell vocabulary for (collection, object, side). The approved 0816+0830
+    # protocol has 2 x 2 x 2 = 8 cells; keeping the size static makes exact scatter reductions
+    # compatible with JIT and gradient accumulation.
+    memory_num_side_cells: int = 8
+    # Reuse one sampled augmentation transform across all T frames of a sample/camera while
+    # retaining independent transforms across samples and cameras.
+    memory_time_consistent_augmentation: bool = False
+    # Training is fail-closed until a train-74-only calibration has fixed c/tau. The artifact
+    # identifier (normally its SHA-256) is serialized with the launch config; component tests
+    # and the calibration program may construct an uncalibrated model.
+    memory_v35_calibrated: bool = False
+    memory_v35_calibration_id: str | None = None
+    memory_v35_calibration_path: str | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -235,11 +274,11 @@ class Pi0Config(_model.BaseModelConfig):
                 "memory_blind_tokens": self.memory_blind_tokens,
                 "memory_reseed_ce": self.memory_reseed_ce,
                 "memory_injection_mode='tanh_rms'": self.memory_injection_mode == "tanh_rms",
-                "memory_conditioner_context='instruction_only'": self.memory_conditioner_context
-                == "instruction_only",
+                "memory_conditioner_context='instruction_only'": self.memory_conditioner_context == "instruction_only",
                 "memory_state_mask_prob": self.memory_state_mask_prob > 0,
                 "memory_aux_loss_weight": self.memory_aux_loss_weight > 0,
                 "memory_ladder_probes": self.memory_ladder_probes,
+                "memory_v35_enabled": self.memory_v35_enabled,
             }
             if self.memory_architecture != "v32_layer8_dual_query":
                 enabled = [name for name, on in v34_features.items() if on]
@@ -251,10 +290,16 @@ class Pi0Config(_model.BaseModelConfig):
                 self.memory_injection_c <= 0 or self.memory_injection_tau <= 0
             ):
                 raise ValueError("tanh_rms injection requires positive memory_injection_c and memory_injection_tau.")
+            if not -1.0 < self.memory_injection_gate_init < 1.0:
+                raise ValueError("memory_injection_gate_init must lie strictly inside (-1, 1).")
+            if self.memory_injection_mode != "tanh_rms" and self.memory_injection_gate_init != 0.0:
+                raise ValueError("memory_injection_gate_init is only meaningful for tanh_rms injection.")
             if self.memory_conditioner_context not in ("instruction_state", "instruction_only"):
                 raise ValueError(f"unsupported memory_conditioner_context: {self.memory_conditioner_context!r}.")
             if self.memory_conditioner_context == "instruction_only" and not self.memory_task_conditioned_write:
-                raise ValueError("memory_conditioner_context='instruction_only' requires memory_task_conditioned_write.")
+                raise ValueError(
+                    "memory_conditioner_context='instruction_only' requires memory_task_conditioned_write."
+                )
             if not 0.0 <= self.memory_state_mask_prob <= 1.0:
                 raise ValueError("memory_state_mask_prob must be in [0, 1].")
             if self.memory_state_mask_dual_view and self.memory_state_mask_prob == 0:
@@ -274,6 +319,54 @@ class Pi0Config(_model.BaseModelConfig):
                     raise ValueError("memory_aux_side_class_ids must index into [0, memory_aux_num_classes).")
             if self.memory_aux_query_space not in ("key", "hidden"):
                 raise ValueError(f"unsupported memory_aux_query_space: {self.memory_aux_query_space!r}.")
+            if self.memory_write_side_loss_weight < 0 or self.memory_read_side_loss_weight < 0:
+                raise ValueError("v3.5 side-loss weights must be >= 0.")
+            if self.memory_side_feature_cotangent_clip is not None and self.memory_side_feature_cotangent_clip <= 0:
+                raise ValueError("memory_side_feature_cotangent_clip must be positive or None.")
+            if self.memory_num_side_cells < 1:
+                raise ValueError("memory_num_side_cells must be >= 1.")
+            if not self.memory_v35_enabled and (
+                self.memory_write_side_loss_weight > 0
+                or self.memory_read_side_loss_weight > 0
+                or self.memory_time_consistent_augmentation
+            ):
+                raise ValueError("v3.5 side losses and time-consistent augmentation require memory_v35_enabled=True.")
+            if self.memory_v35_calibrated and (
+                not self.memory_v35_calibration_id or not self.memory_v35_calibration_path
+            ):
+                raise ValueError("a calibrated v3.5 config requires calibration ID and artifact path provenance.")
+            if not self.memory_v35_calibrated and (
+                self.memory_v35_calibration_id is not None or self.memory_v35_calibration_path is not None
+            ):
+                raise ValueError("v3.5 calibration ID/path are valid only when memory_v35_calibrated=True.")
+            if self.memory_v35_enabled:
+                if self.memory_num_side_cells != 8:
+                    raise ValueError("v3.5 Revision 5 freezes memory_num_side_cells=8.")
+                if self.memory_architecture != "v32_layer8_dual_query":
+                    raise ValueError("v3.5 requires the v3.2 layer-8 dual-query architecture.")
+                if self.memory.write_rule != "delta_output" or self.memory.association_mode != "pooled_frame":
+                    raise ValueError("v3.5 requires pooled-frame delta_output memory.")
+                if self.memory.delta_rate != 1.0:
+                    raise ValueError("v3.5 Revision 4 freezes memory.delta_rate=1.0.")
+                # Compare in FP32: the memory core computes decay in float32, and checkpoint
+                # identities record the fp32 runtime value (0.009999999776…), which is the
+                # same frozen constant under runtime arithmetic.
+                if float(jnp.float32(self.memory.alpha_step)) != float(jnp.float32(0.01)):
+                    raise ValueError("v3.5 Revision 4 freezes memory.alpha_step=0.01 per 15-frame step.")
+                if not self.memory.blank_initial_output:
+                    raise ValueError("v3.5 requires blank_initial_output=True for an exact-zero reset memory.")
+                if self.memory_injection_mode != "tanh_rms":
+                    raise ValueError("v3.5 calibration and pinning require memory_injection_mode='tanh_rms'.")
+                if self.memory_injection_gate_init != 0.5:
+                    raise ValueError("fresh-base v3.5 requires memory_injection_gate_init=0.5.")
+                if not self.memory_freeze_injection_gate:
+                    raise ValueError("fresh-base v3.5 requires memory_freeze_injection_gate=True.")
+                if self.memory_aux_loss_weight != 0:
+                    raise ValueError("v3.5 disables the legacy seven-way memory auxiliary loss.")
+                if self.memory_write_side_loss_weight == 0 or self.memory_read_side_loss_weight == 0:
+                    raise ValueError("v3.5 requires nonzero write-side and read-side loss weights.")
+                if not self.memory_time_consistent_augmentation:
+                    raise ValueError("v3.5 requires time-consistent sequence augmentation.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -360,6 +453,31 @@ class Pi0Config(_model.BaseModelConfig):
                                 "seq_waiting_mask": jax.ShapeDtypeStruct(lead, bool),
                             }
                             if self.memory_ladder_probes
+                            else {}
+                        ),
+                        **(
+                            {
+                                # Current-frame masks and sparse-clock metadata. All per-step
+                                # fields share [batch, T]; identity/cell fields are per sample.
+                                **(
+                                    {"seq_side_label": jax.ShapeDtypeStruct([batch_size], jnp.int32)}
+                                    if not self.memory_ladder_probes
+                                    else {}
+                                ),
+                                "seq_write_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_decision_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_read_state_valid": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_read_credit_reachable": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_decay_gap_before": jax.ShapeDtypeStruct(lead, jnp.int32),
+                                "seq_use_pressure_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_occlusion_mask": jax.ShapeDtypeStruct(lead, bool),
+                                "seq_sparse_skip_o": jax.ShapeDtypeStruct([batch_size], bool),
+                                "seq_episode_index": jax.ShapeDtypeStruct([batch_size], jnp.int32),
+                                "seq_collection_id": jax.ShapeDtypeStruct([batch_size], jnp.int32),
+                                "seq_object_id": jax.ShapeDtypeStruct([batch_size], jnp.int32),
+                                "seq_memory_cell": jax.ShapeDtypeStruct([batch_size], jnp.int32),
+                            }
+                            if self.memory_v35_enabled
                             else {}
                         ),
                     }

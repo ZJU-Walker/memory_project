@@ -158,6 +158,25 @@ class Observation(Generic[ArrayT]):
     seq_evidence_mask: at.Bool[ArrayT, "*sb st"] | None = None
     seq_waiting_mask: at.Bool[ArrayT, "*sb st"] | None = None
 
+    # v3.5 Revision 4 current-frame memory protocol.  These are absent for every legacy data
+    # config.  Reads occur before the current transition, so `seq_decay_gap_before[..., t]` is
+    # applied before reading step t and state-valid/reachable refer only to earlier E commits.
+    seq_write_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_decision_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_occlusion_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_read_state_valid: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_read_credit_reachable: at.Bool[ArrayT, "*sb st"] | None = None
+    seq_decay_gap_before: at.Int[ArrayT, "*sb st"] | None = None
+    seq_use_pressure_mask: at.Bool[ArrayT, "*sb st"] | None = None
+    # Sparse family and stable manifest metadata are scalar per sampled sequence (batched as
+    # [batch]).  `seq_memory_cell` is the stable lexicographic ID of
+    # (collection, object, target-side) used for episode-first macro losses.
+    seq_sparse_skip_o: at.Bool[ArrayT, "*sb"] | None = None
+    seq_episode_index: at.Int[ArrayT, "*sb"] | None = None
+    seq_collection_id: at.Int[ArrayT, "*sb"] | None = None
+    seq_object_id: at.Int[ArrayT, "*sb"] | None = None
+    seq_memory_cell: at.Int[ArrayT, "*sb"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -193,6 +212,18 @@ class Observation(Generic[ArrayT]):
             seq_side_label=data.get("seq_side_label"),
             seq_evidence_mask=data.get("seq_evidence_mask"),
             seq_waiting_mask=data.get("seq_waiting_mask"),
+            seq_write_mask=data.get("seq_write_mask"),
+            seq_decision_mask=data.get("seq_decision_mask"),
+            seq_occlusion_mask=data.get("seq_occlusion_mask"),
+            seq_read_state_valid=data.get("seq_read_state_valid"),
+            seq_read_credit_reachable=data.get("seq_read_credit_reachable"),
+            seq_decay_gap_before=data.get("seq_decay_gap_before"),
+            seq_use_pressure_mask=data.get("seq_use_pressure_mask"),
+            seq_sparse_skip_o=data.get("seq_sparse_skip_o"),
+            seq_episode_index=data.get("seq_episode_index"),
+            seq_collection_id=data.get("seq_collection_id"),
+            seq_object_id=data.get("seq_object_id"),
+            seq_memory_cell=data.get("seq_memory_cell"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -270,6 +301,19 @@ def preprocess_observation(
     return dataclasses.replace(observation, images=out_images, image_masks=out_masks)
 
 
+def _merge_structural_none_leaves(expected: dict, got: at.Params) -> at.Params:
+    """Reinsert `None` leaves that the expected tree records but a restored tree lacks."""
+    if not isinstance(expected, dict) or not isinstance(got, dict):
+        return got
+    merged = dict(got)
+    for key, value in expected.items():
+        if value is None and key not in merged:
+            merged[key] = None
+        elif isinstance(value, dict) and key in merged:
+            merged[key] = _merge_structural_none_leaves(value, merged[key])
+    return merged
+
+
 @dataclasses.dataclass(frozen=True)
 class BaseModelConfig(abc.ABC):
     """Configuration shared by all models. Specific models should inherit from this class, and implement the `create`
@@ -296,9 +340,14 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        expected_pure = state.to_pure_dict()
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+            params = ocp.transform_utils.intersect_trees(expected_pure, params)
+        # Orbax drops the structural `None` leaves of bias-free NNX linears on save, so a
+        # restored raw params tree is missing exactly those keys; reinsert them where the
+        # expected tree records None. Missing real-array keys still fail the strict check.
+        params = _merge_structural_none_leaves(expected_pure, params)
+        at.check_pytree_equality(expected=expected_pure, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 

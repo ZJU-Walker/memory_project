@@ -421,6 +421,159 @@ class MemorySequenceSubtasks(DataTransformFn):
         return out
 
 
+# The first four columns are the frozen v3.3/v3.4 contract.  v3.5 appends metadata to the same
+# array so it survives LeRobot's repack step without adding dataset columns or changing dynamic
+# timestamp offsets.
+V35_MEMORY_WINDOW_SIZE = 13
+V35_WINDOW_FINAL_E_LIMIT = 4
+V35_WINDOW_OCCLUSION_LO = 5
+V35_WINDOW_OCCLUSION_HI = 6
+V35_WINDOW_EXECUTE_START = 7
+V35_WINDOW_EPISODE_INDEX = 8
+V35_WINDOW_COLLECTION_ID = 9
+V35_WINDOW_OBJECT_ID = 10
+V35_WINDOW_CELL_ID = 11
+V35_WINDOW_MARKER = 12
+V35_WINDOW_MARKER_VALUE = 35
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryCriticalLayout:
+    """Exact dense/sparse representation selected for one critical start frame."""
+
+    endpoint: int
+    keep_indices: np.ndarray
+    decay_gap_before: np.ndarray
+    sparse_skip_o: bool
+    sampled_e_count: int
+    n_delay: int
+
+
+def is_v35_memory_window(window: np.ndarray | None) -> bool:
+    return bool(
+        window is not None
+        and len(window) == V35_MEMORY_WINDOW_SIZE
+        and int(window[V35_WINDOW_MARKER]) == V35_WINDOW_MARKER_VALUE
+    )
+
+
+def memory_critical_is_sparse(frame_index: int, window: np.ndarray) -> bool:
+    """Stable 50/50 family assignment for v3.5 eligible starts.
+
+    The sampler subsequently balances family x manifest cell x episode.  Assignment is a pure
+    function of the raw start and episode window, so the transform can reproduce it in worker
+    processes without hidden RNG state.
+    """
+    if not is_v35_memory_window(window):
+        return False
+    return (int(frame_index) - int(window[0])) % 2 == 0
+
+
+def memory_critical_layout(
+    frame_index: int, window: np.ndarray, *, stride: int, lookahead: int, num_steps: int
+) -> MemoryCriticalLayout:
+    """Return the exact v3.5 natural or sparse E->D layout for a critical start.
+
+    Every accepted layout contains the per-grid final eligible E anchor and at least one strict
+    D step.  Sparse layouts keep the last one or two E samples plus D samples, and encode the
+    omitted valid non-E transitions on the first D step.  Any missing anchor/D candidate raises
+    instead of silently yielding a state-invalid training example.
+    """
+    if not is_v35_memory_window(window):
+        endpoint = memory_critical_endpoint(
+            frame_index, window, stride=stride, lookahead=lookahead, num_steps=num_steps
+        )
+        keep = np.arange(endpoint + 1, dtype=np.int32)
+        return MemoryCriticalLayout(
+            endpoint=endpoint,
+            keep_indices=keep,
+            decay_gap_before=np.zeros(len(keep), np.int32),
+            sparse_skip_o=False,
+            sampled_e_count=0,
+            n_delay=0,
+        )
+
+    evidence_start = int(window[1])
+    memory_lo, memory_hi = int(window[2]), int(window[3])
+    final_e_limit = int(window[V35_WINDOW_FINAL_E_LIMIT])
+    step_frames = int(frame_index) + np.arange(num_steps, dtype=np.int64) * int(stride)
+
+    eligible_e = np.nonzero((step_frames >= evidence_start) & (step_frames <= final_e_limit))[0]
+    if len(eligible_e) == 0:
+        raise ValueError(
+            f"v3.5 critical start {frame_index} has no sampled E frame in "
+            f"[{evidence_start}, {final_e_limit}] at stride {stride}."
+        )
+
+    in_d = (step_frames >= memory_lo) & (step_frames <= memory_hi)
+    decision = np.nonzero(in_d & (step_frames <= memory_hi - lookahead))[0]
+    if len(decision) == 0:
+        decision = np.nonzero(in_d)[0]
+    if len(decision) == 0:
+        raise ValueError(
+            f"v3.5 critical start {frame_index} has no strict-D grid frame in "
+            f"[{memory_lo}, {memory_hi}] at stride {stride}."
+        )
+
+    endpoint = int(decision[int(frame_index) % len(decision)])
+    final_e = int(eligible_e[-1])
+    if endpoint <= final_e:
+        raise ValueError(f"v3.5 critical start {frame_index} orders D step {endpoint} before final E step {final_e}.")
+
+    sparse = memory_critical_is_sparse(frame_index, window)
+    if not sparse:
+        keep = np.arange(endpoint + 1, dtype=np.int32)
+        first_d = int(np.nonzero(in_d)[0][0])
+        return MemoryCriticalLayout(
+            endpoint=endpoint,
+            keep_indices=keep,
+            decay_gap_before=np.zeros(len(keep), dtype=np.int32),
+            sparse_skip_o=False,
+            sampled_e_count=len(eligible_e),
+            n_delay=first_d - final_e - 1,
+        )
+
+    # Keep one or two latest eligible E samples and all strict D samples through the selected
+    # endpoint.  O and any pre-D neutral steps are represented by one exact gap before the first
+    # D read; subsequent kept D steps are dense and therefore have gap zero.
+    keep_e = eligible_e[-2:].astype(np.int32)
+    keep_d = np.nonzero(in_d & (np.arange(num_steps) <= endpoint))[0].astype(np.int32)
+    if len(keep_d) == 0:
+        raise ValueError(f"v3.5 sparse critical start {frame_index} has no D step through endpoint {endpoint}.")
+    first_d = int(keep_d[0])
+    omitted = np.arange(final_e + 1, first_d, dtype=np.int32)
+    occlusion_lo = int(window[V35_WINDOW_OCCLUSION_LO])
+    occlusion_hi = int(window[V35_WINDOW_OCCLUSION_HI])
+    omitted_frames = step_frames[omitted]
+    if np.any((omitted_frames < occlusion_lo) | (omitted_frames > occlusion_hi)):
+        # This check deliberately rejects a residue whose next sampled transition still falls
+        # in the five-frame semantic-E tail.  Although that tail cannot write, Revision 4
+        # permits analytic skipping only across sampled transitions belonging entirely to O.
+        # It likewise rejects an unlabeled/reset gap between O and strict D.  Because the
+        # episode table derives a contiguous [O_lo, O_hi] directly from current-frame labels,
+        # this is available to the sampler before a worker fetches the raw item.
+        raise ValueError(
+            f"v3.5 sparse critical start {frame_index} skipped sampled frames "
+            f"{omitted_frames.tolist()} outside the O-only interval [{occlusion_lo}, {occlusion_hi}]."
+        )
+    keep = np.concatenate([keep_e, keep_d]).astype(np.int32)
+    if np.any(np.diff(keep) <= 0):
+        raise ValueError(f"v3.5 sparse critical start {frame_index} produced non-increasing sparse indices.")
+    gaps = np.zeros(len(keep), dtype=np.int32)
+    gaps[len(keep_e)] = first_d - final_e - 1
+    return MemoryCriticalLayout(
+        endpoint=endpoint,
+        keep_indices=keep,
+        decay_gap_before=gaps,
+        sparse_skip_o=True,
+        # Report commits actually present in the compacted sequence, not all E frames that
+        # existed on the discarded dense grid.  The sparse protocol deliberately retains at
+        # most the final two anchors.
+        sampled_e_count=len(keep_e),
+        n_delay=first_d - final_e - 1,
+    )
+
+
 def memory_critical_endpoint(
     frame_index: int, window: np.ndarray, *, stride: int, lookahead: int, num_steps: int
 ) -> int:
@@ -437,6 +590,29 @@ def memory_critical_endpoint(
       3. the last grid step before the waiting phase -- observation still neutral, target
          already memory-required.
     """
+    if is_v35_memory_window(window):
+        # Kept separate from the legacy fallback tiers: a v3.5 D-bearing window without both a
+        # final eligible E anchor and a strict D grid point is a data gate failure.
+        evidence_start = int(window[1])
+        memory_lo, memory_hi = int(window[2]), int(window[3])
+        final_e_limit = int(window[V35_WINDOW_FINAL_E_LIMIT])
+        step_frames = frame_index + np.arange(num_steps) * stride
+        eligible_e = np.nonzero((step_frames >= evidence_start) & (step_frames <= final_e_limit))[0]
+        eligible_d = np.nonzero(
+            (step_frames >= memory_lo) & (step_frames <= memory_hi) & (step_frames <= memory_hi - lookahead)
+        )[0]
+        if len(eligible_d) == 0:
+            eligible_d = np.nonzero((step_frames >= memory_lo) & (step_frames <= memory_hi))[0]
+        if len(eligible_e) == 0 or len(eligible_d) == 0:
+            raise ValueError(
+                f"v3.5 critical start {frame_index} lacks final-E or strict-D grid coverage "
+                f"(E={len(eligible_e)}, D={len(eligible_d)})."
+            )
+        endpoint = int(eligible_d[frame_index % len(eligible_d)])
+        if endpoint <= int(eligible_e[-1]):
+            raise ValueError(f"v3.5 critical start {frame_index} has D before its final eligible E anchor.")
+        return endpoint
+
     memory_lo, memory_hi = int(window[2]), int(window[3])
     step_frames = frame_index + np.arange(num_steps) * stride
     in_wait = (step_frames >= memory_lo) & (step_frames <= memory_hi)
@@ -481,6 +657,42 @@ class BuildMemorySequence(DataTransformFn):
     action_horizon: int
     block_steps: int
     subtask_lookahead: int = 0
+    # Required for v3.5's second, item-level proof that every analytically omitted transition
+    # is semantic O.  Empty preserves the legacy constructor/output path.
+    occlusion_subtasks: tuple[str, ...] = ()
+
+    @staticmethod
+    def _compact_sparse_fields(data: DataDict, keep: np.ndarray, num_steps: int) -> None:
+        """Compact known T-leading raw fields and pad back to the fixed fetched length.
+
+        LeRobot still fetches the ordinary dense offset grid.  Sparse skip-O is represented
+        after fetch, so no per-item dynamic timestamp table or cross-sample state is required.
+        Padding repeats the last kept payload only as storage; `seq_step_mask=False` makes those
+        steps strict no-ops and every v3.5 supervision mask clears them.
+        """
+        if len(keep) == 0:
+            raise ValueError("cannot compact a sparse memory sequence with no kept steps.")
+        padded = np.concatenate([keep, np.full(num_steps - len(keep), keep[-1], dtype=np.int32)])
+        for key in (
+            "observation/image",
+            "observation/left_wrist_image",
+            "observation/right_wrist_image",
+            "observation/state",
+            "actions",
+            "subtask_valid",
+            "subtask_now_valid",
+        ):
+            if key in data:
+                value = np.asarray(data[key])
+                if value.ndim == 0 or value.shape[0] != num_steps:
+                    raise ValueError(f"v3.5 sparse field {key!r} does not have leading T={num_steps}: {value.shape}.")
+                data[key] = value[padded]
+        for key in ("subtask", "subtask_now"):
+            if key in data:
+                value = data[key]
+                if not isinstance(value, list) or len(value) != num_steps:
+                    raise ValueError(f"v3.5 sparse field {key!r} must be a list of length {num_steps}.")
+                data[key] = [value[int(i)] for i in padded]
 
     def __call__(self, data: DataDict) -> DataDict:
         if "frame_index" not in data:
@@ -495,19 +707,91 @@ class BuildMemorySequence(DataTransformFn):
         state = np.asarray(data["observation/state"], dtype=np.float32)
         data["observation/state"] = state
         num_steps = state.shape[0]
-        data["actions"] = np.asarray(data["actions"], dtype=np.float32).reshape(
-            num_steps, self.action_horizon, -1
-        )
+        data["actions"] = np.asarray(data["actions"], dtype=np.float32).reshape(num_steps, self.action_horizon, -1)
 
         step_frames = frame_index + np.arange(num_steps) * self.stride
         data["seq_step_mask"] = step_frames < episode_length
 
+        v35 = is_v35_memory_window(window)
+        if v35:
+            # Stable manifest metadata is carried in the extended window for every sequence
+            # family, including ordinary full/slice samples.
+            data["seq_episode_index"] = np.int32(window[V35_WINDOW_EPISODE_INDEX])
+            data["seq_collection_id"] = np.int32(window[V35_WINDOW_COLLECTION_ID])
+            data["seq_object_id"] = np.int32(window[V35_WINDOW_OBJECT_ID])
+            data["seq_memory_cell"] = np.int32(window[V35_WINDOW_CELL_ID])
+
         memory_critical = window is not None and window[0] >= 0 and window[0] <= frame_index <= window[1]
         if memory_critical:
-            t_q = memory_critical_endpoint(
-                frame_index, window, stride=self.stride, lookahead=self.subtask_lookahead, num_steps=num_steps
+            if v35:
+                layout = memory_critical_layout(
+                    frame_index, window, stride=self.stride, lookahead=self.subtask_lookahead, num_steps=num_steps
+                )
+                if layout.sparse_skip_o:
+                    gap_slot = int(np.nonzero(layout.decay_gap_before > 0)[0][0]) if layout.n_delay > 0 else -1
+                    if gap_slot >= 0:
+                        previous = int(layout.keep_indices[gap_slot - 1])
+                        current = int(layout.keep_indices[gap_slot])
+                        omitted = np.arange(previous + 1, current, dtype=np.int32)
+                        if not np.asarray(data["seq_step_mask"], dtype=bool)[omitted].all():
+                            raise ValueError("v3.5 sparse skip interval contains padding/invalid steps.")
+                        if not self.occlusion_subtasks:
+                            raise ValueError("v3.5 sparse skipping requires explicit occlusion_subtasks validation.")
+                        if "subtask_now" not in data:
+                            raise ValueError("v3.5 sparse skipping requires unshifted current-frame subtask labels.")
+                        allowed_o = set(self.occlusion_subtasks)
+                        invalid_labels = [
+                            (int(i), str(data["subtask_now"][int(i)]))
+                            for i in omitted
+                            if str(data["subtask_now"][int(i)]) not in allowed_o
+                        ]
+                        if invalid_labels:
+                            # A distinct reset label is non-O and is rejected here.  Critical
+                            # windows never receive stochastic TBPTT/reset fences, so together
+                            # these checks prove the omitted span is valid, O-only, non-writing,
+                            # and reset-free before compaction.
+                            raise ValueError(
+                                "v3.5 sparse skip interval must be semantic O-only and reset-free; "
+                                f"invalid sampled steps={invalid_labels}."
+                            )
+                    self._compact_sparse_fields(data, layout.keep_indices, num_steps)
+                    step_frames = np.concatenate(
+                        [
+                            step_frames[layout.keep_indices],
+                            np.full(num_steps - len(layout.keep_indices), step_frames[layout.keep_indices[-1]]),
+                        ]
+                    )
+                    data["seq_step_mask"] = np.arange(num_steps) < len(layout.keep_indices)
+                    decay_gap = np.zeros(num_steps, dtype=np.int32)
+                    decay_gap[: len(layout.decay_gap_before)] = layout.decay_gap_before
+                    data["seq_decay_gap_before"] = decay_gap
+                else:
+                    data["seq_step_mask"] = data["seq_step_mask"] & (np.arange(num_steps) <= layout.endpoint)
+                    data["seq_decay_gap_before"] = np.zeros(num_steps, dtype=np.int32)
+                data["seq_sparse_skip_o"] = np.bool_(layout.sparse_skip_o)
+            else:
+                t_q = memory_critical_endpoint(
+                    frame_index, window, stride=self.stride, lookahead=self.subtask_lookahead, num_steps=num_steps
+                )
+                data["seq_step_mask"] = data["seq_step_mask"] & (np.arange(num_steps) <= t_q)
+        elif v35:
+            data["seq_decay_gap_before"] = np.zeros(num_steps, dtype=np.int32)
+            data["seq_sparse_skip_o"] = np.zeros((), dtype=bool)
+
+        if v35:
+            valid = np.asarray(data["seq_step_mask"], dtype=bool)
+            final_e_limit = int(window[V35_WINDOW_FINAL_E_LIMIT])
+            execute_start = int(window[V35_WINDOW_EXECUTE_START])
+            occlusion_lo = int(window[V35_WINDOW_OCCLUSION_LO])
+            occlusion_hi = int(window[V35_WINDOW_OCCLUSION_HI])
+            # Private selectors are consumed by MemoryV34Labels after it forms masks from the
+            # unshifted current-frame labels.  They are never exposed as alternative labels.
+            data["_v35_write_tail_valid"] = valid & (step_frames <= final_e_limit)
+            data["_v35_action_overlaps_execute"] = (
+                valid & (step_frames <= execute_start) & (step_frames + self.action_horizon - 1 >= execute_start)
             )
-            data["seq_step_mask"] = data["seq_step_mask"] & (np.arange(num_steps) <= t_q)
+            data["seq_occlusion_mask"] = valid & (step_frames >= occlusion_lo) & (step_frames <= occlusion_hi)
+            data["_v35_enabled"] = np.ones((), dtype=bool)
 
         boundary = np.zeros(num_steps, dtype=bool)
         if self.block_steps > 0 and not memory_critical:
@@ -519,9 +803,7 @@ class BuildMemorySequence(DataTransformFn):
             side = int(np.asarray(data.pop("quiz_side")).item())
             reveal = int(np.asarray(data.pop("reveal_frame")).item())
             close = int(np.asarray(data.pop("close_frame")).item())
-            quizzable = (
-                data["seq_step_mask"] & (step_frames >= reveal) & (reveal >= frame_index) & (side >= 0)
-            )
+            quizzable = data["seq_step_mask"] & (step_frames >= reveal) & (reveal >= frame_index) & (side >= 0)
             data["seq_probe_labels"] = np.full(num_steps, side, dtype=np.int32)
             data["seq_probe_mask"] = quizzable
             data["seq_probe_visible"] = quizzable & (step_frames < close)
@@ -563,6 +845,9 @@ class MemoryV34Labels(DataTransformFn):
             data.pop("episode_side", None)
             data.pop("subtask_valid", None)
             data.pop("subtask_now_valid", None)
+            data.pop("_v35_enabled", None)
+            data.pop("_v35_write_tail_valid", None)
+            data.pop("_v35_action_overlaps_execute", None)
             return data
         subtask = [str(s) for s in subtask]
         subtask_now = [str(s) for s in data.pop("subtask_now", subtask)]
@@ -599,6 +884,70 @@ class MemoryV34Labels(DataTransformFn):
                     side = waiting.index(s)
                     break
         data["seq_side_label"] = np.int32(side)
+
+        # v3.5 Revision 4 fields are opt-in through the extended memory-window marker.  Legacy
+        # configs therefore retain their exact output tree and supervision semantics.
+        v35 = bool(np.asarray(data.pop("_v35_enabled", False)).item())
+        if v35:
+            step_mask = np.asarray(data.get("seq_step_mask", np.ones(len(subtask), dtype=bool)), dtype=bool)
+            if step_mask.shape != (len(subtask),):
+                raise ValueError(f"v3.5 seq_step_mask must have shape {(len(subtask),)}, got {step_mask.shape}.")
+            tail_valid = np.asarray(data.pop("_v35_write_tail_valid"), dtype=bool)
+            action_overlap = np.asarray(data.pop("_v35_action_overlaps_execute"), dtype=bool)
+            if tail_valid.shape != step_mask.shape or action_overlap.shape != step_mask.shape:
+                raise ValueError("v3.5 raw-frame selectors must have the same shape as seq_step_mask.")
+
+            write_mask = evidence_mask & tail_valid & step_mask
+            decision_mask = waiting_mask & step_mask
+            block_boundary = np.asarray(data.get("seq_block_boundary", np.zeros(len(subtask), dtype=bool)), dtype=bool)
+            decay_gap = np.asarray(
+                data.get("seq_decay_gap_before", np.zeros(len(subtask), dtype=np.int32)), dtype=np.int32
+            )
+            if block_boundary.shape != step_mask.shape or decay_gap.shape != step_mask.shape:
+                raise ValueError("v3.5 boundary/gap fields must have the same shape as seq_step_mask.")
+            if np.any(decay_gap < 0):
+                raise ValueError("seq_decay_gap_before cannot be negative.")
+            if np.any((decay_gap > 0) & (~step_mask | write_mask)):
+                raise ValueError("analytic gaps may precede only valid non-E/read steps.")
+
+            # Read happens before the current transition.  A fence cuts gradient reach at this
+            # step's entry but does not erase memory content; the current step's E write becomes
+            # available only to later reads.  Analytic skip-O decay is differentiable and does
+            # not itself break either state validity or reachability.
+            state_valid = np.zeros(len(subtask), dtype=bool)
+            credit_reachable = np.zeros(len(subtask), dtype=bool)
+            have_state = False
+            have_reachable_write = False
+            for t in range(len(subtask)):
+                if not step_mask[t]:
+                    continue
+                if block_boundary[t]:
+                    have_reachable_write = False
+                state_valid[t] = have_state
+                credit_reachable[t] = have_reachable_write
+                if write_mask[t]:
+                    have_state = True
+                    have_reachable_write = True
+
+            state_invalid_d = decision_mask & ~state_valid
+            if np.any(state_invalid_d):
+                raise ValueError(
+                    "v3.5 D-bearing sequence lacks a prior final-eligible E anchor at steps "
+                    f"{np.nonzero(state_invalid_d)[0].tolist()}; sampler must not silently grade it."
+                )
+
+            data["seq_write_mask"] = write_mask
+            data["seq_decision_mask"] = decision_mask
+            data["seq_read_state_valid"] = state_valid
+            data["seq_read_credit_reachable"] = credit_reachable
+            data["seq_use_pressure_mask"] = decision_mask & state_valid & action_overlap
+
+            # Padding is a no-op in both dense and sparse layouts, including analytic decay.
+            data["seq_decay_gap_before"] = np.where(step_mask, decay_gap, 0).astype(np.int32)
+        elif "_v35_write_tail_valid" in data or "_v35_action_overlaps_execute" in data:
+            # Private selectors can only be emitted together with the marker; fail closed if a
+            # future repack accidentally separates them.
+            raise ValueError("v3.5 selectors were present without a v3.5 memory-window marker.")
 
         if self.state_mask_prob > 0:
             step_mask = np.asarray(data.get("seq_step_mask", np.ones(len(subtask), dtype=bool)))

@@ -25,6 +25,7 @@ import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
+import openpi.shared.project_paths as _project_paths
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -68,6 +69,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional explicit local LeRobot dataset directory. None preserves the legacy
+    # Hugging Face/LeRobot cache lookup; v3.5 pins this inside memory_project.
+    lerobot_dataset_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -172,12 +176,83 @@ class DataConfig:
     memory_waiting_max_speed: float | None = None
     memory_waiting_max_excursion: float = 0.02
 
+    # v3.5 data protocol (all defaults preserve the v3.4 loader exactly).  The v3.5 switch is
+    # intentionally data-side rather than inferred from model flags: a checkpoint/config graft
+    # must not silently change which raw frames are allowed to write or read memory.
+    memory_v35_enabled: bool = False
+    # Last N raw evidence frames are transition-contaminated and cannot commit.  Revision 4
+    # freezes N=5; zero is the legacy behavior.
+    memory_e_tail_guard_frames: int = 0
+    # Exact semantic labels used to validate the O phase and locate the first side-specific
+    # execute frame whose overlap with an action chunk defines use-pressure.
+    memory_occlusion_subtasks: tuple[str, ...] = ()
+    memory_execute_subtasks: tuple[str, ...] = ()
+    # Fraction of the memory-critical branch represented as sparse E -> analytic skip-O -> D
+    # sequences.  Revision 4 freezes an equal natural/sparse mixture.
+    memory_sparse_skip_o_prob: float = 0.0
+    # Strict stationary-D detection must inspect the complete state vector.  None keeps the
+    # legacy detector dimension-agnostic; v3.5 requires 14.
+    memory_waiting_state_dim: int | None = None
+    # Versioned episode manifest.  Each converted episode has a stable_id plus collection,
+    # object, target_side, split, and episode_index.  The loader consumes only the requested
+    # split and validates split_seed without hard-coding episode numbers.
+    memory_episode_manifest_path: str | None = None
+    # Exact bytes of the frozen manifest. Training refuses a v3.5 launch until supplied.
+    memory_episode_manifest_sha256: str | None = None
+    memory_manifest_split: str | None = None
+    memory_manifest_split_seed: int | None = None
+    # Production Gate-A population lock. Synthetic component tests leave this false; the
+    # registered v3.5 launch must set it true and then satisfy 70 = 54/8/8 and eight cells.
+    memory_v35_frozen_population: bool = False
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    def __post_init__(self) -> None:
+        if self.memory_e_tail_guard_frames < 0:
+            raise ValueError("memory_e_tail_guard_frames must be nonnegative.")
+        if not 0.0 <= self.memory_sparse_skip_o_prob <= 1.0:
+            raise ValueError("memory_sparse_skip_o_prob must lie in [0, 1].")
+        if self.memory_waiting_state_dim is not None and self.memory_waiting_state_dim <= 0:
+            raise ValueError("memory_waiting_state_dim must be positive when set.")
+        if self.memory_manifest_split_seed is not None and self.memory_manifest_split_seed < 0:
+            raise ValueError("memory_manifest_split_seed must be nonnegative when set.")
+        if not self.memory_v35_enabled:
+            return
+        if self.memory_stride_frames != 15:
+            raise ValueError("v3.5 Revision 4 requires memory_stride_frames=15.")
+        if self.memory_e_tail_guard_frames != 5:
+            raise ValueError("v3.5 Revision 4 requires memory_e_tail_guard_frames=5.")
+        if self.memory_waiting_state_dim != 14:
+            raise ValueError("v3.5 Revision 4 requires strict stationary-D checks over all 14 state dimensions.")
+        if self.memory_waiting_max_speed is None:
+            raise ValueError("v3.5 data requires memory_waiting_max_speed for strict D eligibility.")
+        if not self.evidence_subtasks or not self.memory_required_subtasks:
+            raise ValueError("v3.5 data requires explicit evidence_subtasks and memory_required_subtasks.")
+        if not self.memory_occlusion_subtasks or not self.memory_execute_subtasks:
+            raise ValueError("v3.5 data requires explicit occlusion and execute subtask labels.")
+        evidence = set(self.evidence_subtasks)
+        occlusion = set(self.memory_occlusion_subtasks)
+        if evidence & occlusion:
+            raise ValueError(
+                "v3.5 analytic skip requires disjoint evidence and occlusion labels so O is provably non-writing."
+            )
+        if self.memory_sparse_skip_o_prob != 0.5:
+            raise ValueError("v3.5 Revision 4 requires a 50/50 natural/skip-O critical mixture.")
+        if self.memory_episode_manifest_path is None or self.memory_manifest_split is None:
+            raise ValueError("v3.5 data requires a versioned episode manifest and an explicit active split.")
+        if self.memory_manifest_split_seed is None:
+            raise ValueError("v3.5 data requires an explicit manifest split seed.")
+        if self.memory_v35_frozen_population:
+            digest = self.memory_episode_manifest_sha256
+            if digest is not None and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError("v3.5 frozen population requires the exact lower-case manifest SHA256.")
+            if self.memory_manifest_split_seed != 36:
+                raise ValueError("v36 freezes split_seed=36.")
 
 
 class GroupFactory(Protocol):
@@ -499,7 +574,8 @@ class LeRobotYamDataConfig(DataConfigFactory):
         # v3.4 supervision fields (V34_PLAN_final.md): needed by the aux demand (5.1), the
         # per-segment state masking (5.2), and/or the probe-ladder heads (Section 6).
         use_v34_labels = use_memory and (
-            getattr(model_config, "memory_aux_loss_weight", 0.0) > 0
+            base_config.memory_v35_enabled
+            or getattr(model_config, "memory_aux_loss_weight", 0.0) > 0
             or getattr(model_config, "memory_state_mask_prob", 0.0) > 0
             or getattr(model_config, "memory_ladder_probes", False)
         )
@@ -550,6 +626,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
                     action_horizon=model_config.action_horizon,
                     block_steps=model_config.memory_block_steps,
                     subtask_lookahead=base_config.subtask_lookahead,
+                    occlusion_subtasks=tuple(base_config.memory_occlusion_subtasks),
                 ),
             )
         data_transforms = _transforms.Group(inputs=input_transforms, outputs=[yam_policy.YamOutputs()])
@@ -749,6 +826,11 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Opt-in exact rung semantics: save an initialization snapshot at 0 and label every later
+    # checkpoint by completed optimizer updates. False preserves legacy loop-index labels.
+    checkpoint_by_completed_updates: bool = False
+    # Optional exact completed-update rungs. Empty preserves the legacy periodic policy.
+    checkpoint_steps: tuple[int, ...] = ()
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -756,6 +838,12 @@ class TrainConfig:
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
     resume: bool = False
+
+    # Canonical self-hashed v3.5 launch decisions. Paths must remain relative to
+    # memory_project so the same bytes and semantic config identity survive a cluster copy.
+    # Legacy/non-v3.5 recipes ignore both fields.
+    v35_pilot_authorization_path: str | None = None
+    v35_continuation_authorization_path: str | None = None
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
@@ -796,6 +884,13 @@ class TrainConfig:
                 f"Batch size {self.batch_size} must be divisible by gradient accumulation steps "
                 f"{self.gradient_accumulation_steps}."
             )
+        if self.checkpoint_steps:
+            if not self.checkpoint_by_completed_updates:
+                raise ValueError("checkpoint_steps requires checkpoint_by_completed_updates=True.")
+            if tuple(sorted(set(self.checkpoint_steps))) != self.checkpoint_steps:
+                raise ValueError("checkpoint_steps must be strictly increasing and unique.")
+            if self.checkpoint_steps[0] <= 0 or self.checkpoint_steps[-1] > self.num_train_steps:
+                raise ValueError("checkpoint_steps must lie in [1, num_train_steps].")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1653,6 +1748,159 @@ _CONFIGS = [
         num_train_steps=20_000,
         save_interval=250,
         num_workers=12,
+        fsdp_devices=4,
+    ),
+    TrainConfig(
+        # v3.5 Revision 5: start from the official fresh Pi05 base. Every memory-specific
+        # module (core, compressors/conditioner, slot/state embeddings, detached ladder, and
+        # live E/D side heads) is freshly initialized; no v3.4/run5 leaf is grafted.
+        #
+        # This registered config is intentionally calibration-locked. After the 54-episode
+        # training split is frozen, the calibration command must override c/tau and set
+        # memory_v35_calibrated + its artifact hash before train.py will create a run.
+        name="pi05_yam_mem_v35",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_subtask=True,
+            predict_with_memory=True,
+            max_token_len=80,
+            memory_layer=8,
+            memory_architecture="v32_layer8_dual_query",
+            memory_write_source="query_compressed",
+            memory_query_tokens=16,
+            memory_query_heads=8,
+            memory_task_conditioned_write=True,
+            causal_token_len=128,
+            bf16_vocab_projection=True,
+            simulated_delay=6,
+            memory_seq_steps=40,
+            memory_block_steps=25,
+            memory_probe_weight=0.0,
+            memory_probe_diagnostic=False,
+            memory_probe_classes=2,
+            memory=_memory.MemoryConfig(
+                mlp_l2norm=True,
+                blank_initial_output=True,
+                drift_radius=None,
+                state_cotangent_clip=10.0,
+                kv_cotangent_clip=1.0,
+                write_rule="delta_output",
+                association_mode="pooled_frame",
+                delta_rate=1.0,
+                alpha_step=0.01,
+            ),
+            memory_qk_norm=True,
+            memory_letterbox_source_hw=(480, 640),
+            memory_blind_tokens=True,
+            memory_reseed_ce=True,
+            memory_injection_mode="tanh_rms",
+            # Safe placeholders for model construction/calibration only. train.py refuses to
+            # train until both are replaced by the train-54 artifact and the lock below opens.
+            memory_injection_c=1.0,
+            memory_injection_tau=0.02,
+            memory_injection_gate_init=0.5,
+            memory_freeze_injection_gate=True,
+            memory_conditioner_context="instruction_only",
+            memory_state_mask_prob=0.5,
+            memory_state_mask_dual_view=False,
+            memory_aux_loss_weight=0.0,
+            memory_ladder_probes=True,
+            memory_v35_enabled=True,
+            memory_write_side_loss_weight=0.3,
+            memory_read_side_loss_weight=0.3,
+            memory_side_feature_cotangent_clip=1.0,
+            memory_num_side_cells=8,
+            memory_time_consistent_augmentation=True,
+            memory_v35_calibrated=False,
+            memory_v35_calibration_id=None,
+            memory_v35_calibration_path=None,
+        ),
+        data=LeRobotYamDataConfig(
+            repo_id=_project_paths.V35_REPO_ID,
+            base_config=DataConfig(
+                prompt_from_episode_meta=True,
+                subtask_from_task=True,
+                subtask_lookahead=15,
+                memory_stride_frames=15,
+                memory_slice_prob=0.5,
+                memory_min_slice_steps=14,
+                memory_sequence_buckets=(14, 27, 40),
+                evidence_subtasks=("inspect both bins",),
+                memory_required_subtasks=(
+                    "wait; target bin is left",
+                    "wait; target bin is right",
+                ),
+                memory_critical_prob=0.5,
+                memory_critical_start_pad=75,
+                memory_subtask_vocab=(
+                    "open both lids",
+                    "wait; target bin is left",
+                    "open left bin",
+                    "close both lids and reset arms",
+                    "inspect both bins",
+                    "open right bin",
+                    "wait; target bin is right",
+                ),
+                heldout_episodes=(),
+                memory_waiting_max_speed=4e-3,
+                memory_waiting_max_excursion=0.02,
+                memory_v35_enabled=True,
+                memory_e_tail_guard_frames=5,
+                memory_occlusion_subtasks=("close both lids and reset arms",),
+                memory_execute_subtasks=("open left bin", "open right bin"),
+                memory_sparse_skip_o_prob=0.5,
+                memory_waiting_state_dim=14,
+                memory_episode_manifest_path=str(_project_paths.project_path(_project_paths.V35_FROZEN_MANIFEST)),
+                memory_episode_manifest_sha256=("9085fe50d7b02ea65930f3647ce0413e0583a66d430484e06c60812c52af8442"),
+                memory_manifest_split="train",
+                memory_manifest_split_seed=36,
+                memory_v35_frozen_population=True,
+                lerobot_dataset_root=str(_project_paths.project_path(_project_paths.V35_DATASET_DIR)),
+            ),
+            # Norm statistics must be generated from the manifest's 54 training episodes only.
+            assets=AssetsConfig(assets_dir=str(_project_paths.project_path(_project_paths.V35_ASSETS_DIR))),
+        ),
+        assets_base_dir=str(_project_paths.project_path(_project_paths.V35_ASSETS_ROOT)),
+        checkpoint_base_dir=str(_project_paths.project_path(_project_paths.V35_CHECKPOINTS_DIR)),
+        # Delta mode ignores the Titans learned gates. The tanh injection gate starts at an
+        # explicit effective value 0.5 and stays frozen after train-only c/tau calibration.
+        freeze_filter=nnx_utils.PathRegex(r".*(memory/gate|memory_gate|memory_inject_w).*"),
+        batch_size=12,
+        gradient_accumulation_steps=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            # Keep the frozen full-budget schedule so an approved resume continues the same run.
+            decay_steps=10_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        memory_grad_clip=5.0,
+        # Raw parameters are primary; a reset EMA has no useful meaning in the 1k pilot.
+        ema_decay=None,
+        probe_lr=1e-2,
+        weight_loader=weight_loaders.AuditedPartialCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            # Shared official-base leaves must never include a v3.5 subsystem parameter.
+            matched_allowlist=(
+                r"(?!.*(?:memory|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_)).+",
+            ),
+            # Every target-only leaf must be an explicitly named memory/subtask-interface leaf.
+            fresh_init_allowlist=(
+                r".*(?:memory|query_compressor|query_conditioner|state_null_embedding|probe_head|ladder_).*",
+            ),
+        ),
+        # This registered recipe is the preregistered pilot only. Continuing to 2.5k or 10k
+        # requires an explicit resume after the fixed 1k gate outcome.
+        num_train_steps=1_000,
+        save_interval=250,
+        checkpoint_by_completed_updates=True,
+        checkpoint_steps=(250, 500, 1_000),
+        keep_period=250,
+        v35_pilot_authorization_path="v35/diagnostics/authorization/pilot.json",
+        # Exact same-run continuation snapshots host transform RNG and the sequence sampler
+        # at accepted-update boundaries. Worker prefetch would consume unseen future batches.
+        num_workers=0,
         fsdp_devices=4,
     ),
     #

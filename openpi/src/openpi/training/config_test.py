@@ -1,11 +1,32 @@
 import dataclasses
+import pathlib
 
 import pytest
 
+from openpi.shared import project_paths
 from openpi.training import config as _config
 from openpi.training import weight_loaders
 
 _PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
+
+
+def test_v35_local_paths_follow_the_portable_memory_project_contract() -> None:
+    config = _config.get_config("pi05_yam_mem_v35")
+    root = project_paths.memory_project_root()
+
+    assert config.data.repo_id == project_paths.V35_REPO_ID
+    assert pathlib.Path(config.data.base_config.lerobot_dataset_root) == project_paths.project_path(
+        project_paths.V35_DATASET_DIR
+    )
+    assert pathlib.Path(config.data.base_config.memory_episode_manifest_path) == project_paths.project_path(
+        project_paths.V35_FROZEN_MANIFEST
+    )
+    assert pathlib.Path(config.data.assets.assets_dir) == project_paths.project_path(project_paths.V35_ASSETS_DIR)
+    assert pathlib.Path(config.assets_base_dir) == root / "v35/assets"
+    assert pathlib.Path(config.checkpoint_base_dir) == project_paths.project_path(project_paths.V35_CHECKPOINTS_DIR)
+    assert config.v35_pilot_authorization_path == "v35/diagnostics/authorization/pilot.json"
+    assert config.v35_continuation_authorization_path is None
+    assert "/iris/u/kewalk/memory_project" not in pathlib.Path(_config.__file__).read_text()
 
 
 def test_yam_v3_and_v31_start_from_the_same_pi05_base_parameters() -> None:

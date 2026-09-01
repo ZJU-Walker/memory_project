@@ -14,3 +14,8 @@ openpi/training_logs/
 openpi/writer_contribution_results/
 .ssh_known_hosts
 *.pdf
+# Run artifacts and scratch (never commit: v3.5/v36 diagnostics runs are 300G+)
+v35/
+v4/
+.tools/
+openpi_test_mem/

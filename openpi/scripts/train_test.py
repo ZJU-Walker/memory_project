@@ -1,8 +1,11 @@
 # ruff: noqa: I001, SLF001
 
 import dataclasses
+import hashlib
+import json
 import os
 import pathlib
+import types
 
 # The backend must be selected before importing Flax/JAX; setting it afterwards is not an
 # effective CPU interlock and can make this test module unexpectedly claim a training GPU.
@@ -20,6 +23,187 @@ from openpi.shared import nnx_utils
 from openpi.training import config as _config
 from openpi.training import optimizer as _optimizer
 from openpi.training import utils as training_utils
+from openpi.training import weight_loaders as _weight_loaders
+
+
+def test_v35_bootstrap_zero_creates_wandb_identity_then_resumes_it(monkeypatch, tmp_path):
+    checkpoint_dir = tmp_path / "checkpoints" / "run"
+    checkpoint_dir.mkdir(parents=True)
+    config = types.SimpleNamespace(
+        checkpoint_dir=checkpoint_dir,
+        exp_name="run",
+        project_name="openpi",
+    )
+    calls = []
+    fake_wandb = types.SimpleNamespace(
+        run=types.SimpleNamespace(id="fresh-run-id", log_code=lambda *_: None),
+        init=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(train, "wandb", fake_wandb)
+    monkeypatch.setattr(train.dataclasses, "asdict", lambda _: {})
+
+    train.init_wandb(config, resuming=True, allow_new_run_from_bootstrap_zero=True)
+    assert (checkpoint_dir / "wandb_id.txt").read_text() == "fresh-run-id"
+    assert calls[0]["name"] == "run"
+
+    train.init_wandb(config, resuming=True)
+    assert calls[1] == {"id": "fresh-run-id", "resume": "must", "project": "openpi"}
+
+
+def _calibrated_v35_config(
+    monkeypatch,
+    tmp_path: pathlib.Path,
+    *,
+    source_sha256: str = "0" * 64,
+    include_videos: bool = True,
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    project_root = tmp_path / "memory_project"
+    (project_root / "openpi/src/openpi").mkdir(parents=True)
+    (project_root / "openpi/pyproject.toml").touch()
+    monkeypatch.setenv("MEMORY_PROJECT_ROOT", str(project_root))
+    config = _config.get_config("pi05_yam_mem_v35")
+    stable_ids = [f"train-{index:03d}" for index in range(54)]
+    manifest = {
+        "schema_version": 1,
+        "split_seed": 36,
+        "episodes": [
+            {"stable_id": stable_id, "split": "train", "include": True, "episode_index": index}
+            for index, stable_id in enumerate(stable_ids)
+        ],
+    }
+    manifest_path = project_root / "data/episode_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    membership = [{"split": "train", "stable_id": stable_id} for stable_id in stable_ids]
+    membership_sha256 = hashlib.sha256(train._calibration_canonical_json(membership).encode()).hexdigest()
+    dataset_protocol_sha256 = "3" * 64
+    raw_gate = np.full((4,), np.arctanh(np.float32(0.5)), dtype=np.float32)
+    payload = {
+        "schema_version": "openpi.v35.injection-calibration.v1",
+        "status": "pass",
+        "provenance": {
+            "source_sha256": source_sha256,
+            "dataset_sha256": dataset_protocol_sha256,
+            "split_sha256": manifest_sha256,
+            "observed_membership_sha256": membership_sha256,
+        },
+        "population": {"split": "train", "episode_count": 54, "stable_ids": stable_ids},
+        "parameters": {"alpha_step": 0.01, "memory_injection_c": 3.0, "memory_injection_tau": 0.04},
+        "gate": {
+            "target_effective_tanh_gate": 0.5,
+            "open_channel_count": config.model.memory.d_value,
+            "raw_w_sha256": hashlib.sha256(raw_gate.tobytes(order="C")).hexdigest(),
+        },
+        "gates": {"passes": True, "all_episodes_train": True, "fixed_effective_gate_is_0_5": True},
+    }
+    digest = hashlib.sha256(train._calibration_canonical_json(payload).encode()).hexdigest()
+    artifact = {"artifact_sha256": digest, "calibration_id": f"sha256:{digest}", "payload": payload}
+    calibration_path = project_root / "v35/diagnostics/calibration.json"
+    calibration_path.parent.mkdir(parents=True)
+    calibration_path.write_text(json.dumps(artifact), encoding="utf-8")
+    model = dataclasses.replace(
+        config.model,
+        memory_v35_calibrated=True,
+        memory_v35_calibration_id=f"sha256:{digest}",
+        memory_v35_calibration_path=str(calibration_path),
+        memory_injection_c=3.0,
+        memory_injection_tau=0.04,
+    )
+    base_data = dataclasses.replace(
+        config.data.base_config,
+        lerobot_dataset_root=str(project_root / "data/lerobot" / config.data.repo_id),
+        memory_episode_manifest_path=str(manifest_path),
+        memory_episode_manifest_sha256=manifest_sha256,
+    )
+    assets_dir = project_root / "v35/assets/pi05_yam_0830_0831_v36"
+    norm_dir = assets_dir / config.data.repo_id
+    norm_dir.mkdir(parents=True)
+    norm_payload = "{}\n"
+    (norm_dir / "norm_stats.json").write_text(norm_payload, encoding="utf-8")
+    frame_counts = [2] * 54
+    selected_frames = sum(frame_counts)
+    dataset_root = (project_root / "data/lerobot" / config.data.repo_id).resolve()
+    data_dir = dataset_root / "data" / "chunk-000"
+    video_dir = dataset_root / "videos" / "chunk-000" / "observation.images.top"
+    meta_dir = dataset_root / "meta"
+    data_dir.mkdir(parents=True)
+    if include_videos:
+        video_dir.mkdir(parents=True)
+    meta_dir.mkdir(parents=True)
+    (meta_dir / "info.json").write_bytes(b'{"fixture":true}\n')
+    for index in range(54):
+        stem = f"episode_{index:06d}"
+        (data_dir / f"{stem}.parquet").write_bytes(f"data-{index}".encode())
+        if include_videos:
+            (video_dir / f"{stem}.mp4").write_bytes(f"video-{index}".encode())
+    storage_paths = sorted(
+        [*data_dir.rglob("*"), *(video_dir.rglob("*") if include_videos else ()), *meta_dir.rglob("*")],
+        key=lambda path: path.relative_to(dataset_root).as_posix(),
+    )
+    storage_records = [
+        {
+            "path": path.relative_to(dataset_root).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in storage_paths
+        if path.is_file()
+    ]
+    storage_sha256 = hashlib.sha256(train._canonical_json(storage_records).encode()).hexdigest()
+    provenance = {
+        "schema_version": 2,
+        "status": "complete",
+        "repo_id": config.data.repo_id,
+        "manifest": {
+            "path_relative": manifest_path.relative_to(project_root).as_posix(),
+            "sha256": manifest_sha256,
+            "active_split": "train",
+            "split_seed": 36,
+        },
+        "selection": {
+            "dataset_num_episodes": 54,
+            "selected_num_episodes": 54,
+            "selected_episode_indices": list(range(54)),
+            "selected_stable_ids": stable_ids,
+            "selected_episode_frame_counts": frame_counts,
+            "selected_num_frames": selected_frames,
+            "dataset_episode_frame_protocol_sha256": dataset_protocol_sha256,
+        },
+        "train_storage": {
+            "root_contract": "memory_project-relative-v1",
+            "root_relative": dataset_root.relative_to(project_root).as_posix(),
+            "sha256": storage_sha256,
+            "files": storage_records,
+            "selected_episode_indices": list(range(54)),
+            "scope": "selected train episode parquet, optional videos, plus structural meta files",
+        },
+        "computation": {
+            "protocol": "raw-train-rows-delta-action-horizon-v1",
+            "requested_batch_size": config.batch_size,
+            "num_batches_including_partial_final_batch": (selected_frames + config.batch_size - 1) // config.batch_size,
+            "processed_base_rows": selected_frames,
+            "drop_last_rows": 0,
+        },
+        "norm_stats": {"file": "norm_stats.json", "sha256": hashlib.sha256(norm_payload.encode()).hexdigest()},
+    }
+    (norm_dir / "norm_stats_provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    data = dataclasses.replace(
+        config.data,
+        base_config=base_data,
+        assets=dataclasses.replace(config.data.assets, assets_dir=str(assets_dir)),
+    )
+    # These fixture-level unit tests exercise calibration/storage/identity helpers directly;
+    # main() separately requires the production pilot authorization path.
+    return dataclasses.replace(
+        config,
+        model=model,
+        data=data,
+        assets_base_dir=str(project_root / "v35/assets"),
+        checkpoint_base_dir=str(project_root / "v35/checkpoints"),
+        v35_pilot_authorization_path=None,
+    )
 
 
 def test_training_identity_log_includes_config_and_effective_eta_scale(caplog):
@@ -39,6 +223,330 @@ def test_console_metric_filter_keeps_aux_phase_but_hides_only_position_suffixes(
     assert not train._is_per_position_metric("diagnostic/some_prefix_metric")
     assert train._is_per_position_metric("diagnostic/probe_accuracy_by_step_p0")
     assert train._is_per_position_metric("diagnostic/probe_accuracy_by_step_p39")
+
+
+def test_v35_cell_macro_is_episode_first_and_equal_over_present_cells():
+    # Cell means are 1 and 3; the absent third cell is excluded rather than counted as zero.
+    value = train._v35_cell_macro_ce(
+        jnp.asarray([2.0, 9.0, 0.0]),
+        jnp.asarray([2.0, 3.0, 0.0]),
+    )
+    assert float(value) == pytest.approx(2.0)
+
+
+def _valid_v35_runtime_guard_fixture():
+    config = _config.get_config("pi05_yam_mem_v35")
+    observation = types.SimpleNamespace(
+        seq_step_mask=jnp.asarray([[True, True, True]]),
+        seq_write_mask=jnp.asarray([[True, False, False]]),
+        seq_decision_mask=jnp.asarray([[False, False, True]]),
+        seq_read_state_valid=jnp.asarray([[False, True, True]]),
+        seq_read_credit_reachable=jnp.asarray([[False, True, True]]),
+        seq_decay_gap_before=jnp.asarray([[0, 0, 2]], dtype=jnp.int32),
+        seq_use_pressure_mask=jnp.asarray([[False, False, True]]),
+        seq_memory_cell=jnp.asarray([3], dtype=jnp.int32),
+        seq_side_label=jnp.asarray([1], dtype=jnp.int32),
+    )
+    one_episode = jnp.zeros((config.model.memory_num_side_cells,), dtype=jnp.float32).at[3].set(1.0)
+    info = {
+        "diagnostic/v35_write_eligible_count": jnp.asarray(1.0),
+        "diagnostic/v35_commit_success_count": jnp.asarray(1.0),
+        "diagnostic/v35_write_feature_term_count": jnp.asarray(1.0),
+        "diagnostic/v35_read_state_valid_count": jnp.asarray(1.0),
+        "diagnostic/v35_read_feature_term_count": jnp.asarray(1.0),
+        "diagnostic/v35_transition_count": jnp.asarray(3.0),
+        "diagnostic/v35_write_episode_count": one_episode,
+        "diagnostic/v35_read_episode_count": one_episode,
+        "diagnostic/v35_degenerate_write_count": jnp.asarray(0.0),
+        "diagnostic/v35_state_invalid_d_count": jnp.asarray(0.0),
+        "diagnostic/v35_state_valid_mismatch_count": jnp.asarray(0.0),
+        "diagnostic/v35_reachable_mismatch_count": jnp.asarray(0.0),
+        "diagnostic/v35_invalid_gap_count": jnp.asarray(0.0),
+        "diagnostic/v35_padding_gap_count": jnp.asarray(0.0),
+        "diagnostic/v35_illegal_write_decision_overlap_count": jnp.asarray(0.0),
+        "diagnostic/v35_invalid_cell_count": jnp.asarray(0.0),
+    }
+    return config, observation, info
+
+
+def test_v35_runtime_guard_reconciles_valid_effective_batch_exactly():
+    config, observation, info = _valid_v35_runtime_guard_fixture()
+    violations = train._v35_runtime_guard_vector(config, observation, info)
+    np.testing.assert_array_equal(violations, np.zeros(len(train._V35_RUNTIME_GUARD_NAMES), dtype=bool))
+
+
+def test_v35_runtime_guard_names_commit_and_runtime_failures():
+    config, observation, info = _valid_v35_runtime_guard_fixture()
+    info["diagnostic/v35_commit_success_count"] = jnp.asarray(0.0)
+    info["diagnostic/v35_degenerate_write_count"] = jnp.asarray(1.0)
+    violations = np.asarray(train._v35_runtime_guard_vector(config, observation, info))
+    failed = {name for name, value in zip(train._V35_RUNTIME_GUARD_NAMES, violations, strict=True) if value}
+    assert failed == {"commit_count_mismatch", "degenerate_write"}
+
+
+def test_v35_runtime_guard_checkify_throws_named_error_before_accepting_update():
+    violations = jnp.zeros((len(train._V35_RUNTIME_GUARD_NAMES),), dtype=bool)
+    bad_index = train._V35_RUNTIME_GUARD_NAMES.index("credit_reachable_mismatch")
+    violations = violations.at[bad_index].set(True)
+    checked = train.checkify.checkify(train._check_v35_runtime_guard)
+    error, _ = checked(violations)
+    with pytest.raises(Exception, match="credit_reachable_mismatch"):
+        error.throw()
+
+
+def test_v35_registered_config_is_fresh_base_and_calibration_locked(monkeypatch, tmp_path: pathlib.Path):
+    config = _config.get_config("pi05_yam_mem_v35")
+    assert isinstance(config.weight_loader, _config.weight_loaders.AuditedPartialCheckpointWeightLoader)
+    assert config.weight_loader.params_path == "gs://openpi-assets/checkpoints/pi05_base/params"
+    assert config.model.memory_injection_gate_init == 0.5
+    assert config.ema_decay is None
+    with pytest.raises(ValueError, match="train-only injection calibration"):
+        train._validate_v35_training_ready(config)
+    calibrated = _calibrated_v35_config(monkeypatch, tmp_path)
+    train._validate_v35_training_ready(calibrated)
+    norm_path = pathlib.Path(calibrated.data.assets.assets_dir) / calibrated.data.repo_id / "norm_stats.json"
+    norm_path.write_text('{"heldout_leak": true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="norm_stats.json bytes"):
+        train._validate_v35_training_ready(calibrated)
+
+
+def test_v35_norm_storage_seal_rechecks_train_files_but_not_heldout_media(monkeypatch, tmp_path: pathlib.Path):
+    config = _calibrated_v35_config(monkeypatch, tmp_path)
+    dataset_root = pathlib.Path(config.data.base_config.lerobot_dataset_root)
+    heldout_data = dataset_root / "data" / "chunk-000" / "episode_000074.parquet"
+    heldout_video = dataset_root / "videos" / "chunk-000" / "observation.images.top" / "episode_000074.mp4"
+    heldout_data.write_bytes(b"heldout-data")
+    heldout_video.write_bytes(b"heldout-video")
+
+    train._validate_v35_training_ready(config)
+    heldout_video.write_bytes(b"changed-heldout-video")
+    train._validate_v35_training_ready(config)
+
+    train_data = dataset_root / "data" / "chunk-000" / "episode_000000.parquet"
+    train_data.write_bytes(b"changed-train-data")
+    with pytest.raises(ValueError, match="file list/size/SHA256"):
+        train._validate_v35_training_ready(config)
+
+
+def test_v35_norm_storage_seal_allows_embedded_images_and_ignores_transfer_bundle(monkeypatch, tmp_path: pathlib.Path):
+    config = _calibrated_v35_config(monkeypatch, tmp_path, include_videos=False)
+    transfer_bundle = pathlib.Path(config.data.base_config.lerobot_dataset_root) / "meta/v35_training_bundle"
+    transfer_bundle.mkdir()
+    (transfer_bundle / "TRANSFER_MANIFEST.json").write_text('{"portable": true}')
+
+    train._validate_v35_training_ready(config)
+
+
+def test_v35_norm_provenance_requires_raw_train_row_protocol(monkeypatch, tmp_path: pathlib.Path):
+    config = _calibrated_v35_config(monkeypatch, tmp_path)
+    provenance_path = pathlib.Path(config.data.assets.assets_dir) / config.data.repo_id / "norm_stats_provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    provenance["computation"]["protocol"] = "transformed-dataset-v1"
+    provenance_path.write_text(json.dumps(provenance))
+
+    with pytest.raises(ValueError, match="frozen train-only split"):
+        train._validate_v35_training_ready(config)
+
+
+def test_v35_checkpoint_rungs_are_completed_update_counts_and_legacy_is_unchanged():
+    v35 = _config.get_config("pi05_yam_mem_v35")
+    assert v35.num_workers == 0
+    assert train._step_labels_and_save_decision(v35, loop_step=0, start_step=0) == (1, False, 1)
+    assert train._step_labels_and_save_decision(v35, loop_step=249, start_step=0) == (250, True, 250)
+    assert train._step_labels_and_save_decision(v35, loop_step=749, start_step=0) == (750, False, 750)
+    assert train._step_labels_and_save_decision(v35, loop_step=999, start_step=0) == (1_000, True, 1_000)
+
+    legacy = _config.get_config("pi05_yam_mem_v34")
+    assert train._step_labels_and_save_decision(legacy, loop_step=250, start_step=0) == (250, True, 250)
+
+
+def test_v35_cumulative_gate_d_counters_survive_multiple_accepted_updates():
+    telemetry = train._new_v35_cumulative_telemetry()
+
+    def info(*, severe, write_bind, write_terms, read_bind, read_terms, grad_max):
+        return {
+            "diagnostic/v35_pre_shared_clip_update_count": jnp.asarray(1.0),
+            "diagnostic/v35_pre_shared_clip_severe_count": jnp.asarray(severe, dtype=jnp.float32),
+            "diagnostic/v35_write_feature_clip_bind_sum": jnp.asarray(write_bind, dtype=jnp.float32),
+            "diagnostic/v35_write_feature_term_count": jnp.asarray(write_terms, dtype=jnp.float32),
+            "diagnostic/v35_read_feature_clip_bind_sum": jnp.asarray(read_bind, dtype=jnp.float32),
+            "diagnostic/v35_read_feature_term_count": jnp.asarray(read_terms, dtype=jnp.float32),
+            "diagnostic/v35_pre_shared_clip_grad_norm_max": jnp.asarray(grad_max, dtype=jnp.float32),
+        }
+
+    train._accumulate_v35_cumulative_telemetry(
+        telemetry,
+        info(severe=0, write_bind=2, write_terms=10, read_bind=1, read_terms=8, grad_max=3.0),
+        completed_updates=1,
+    )
+    train._accumulate_v35_cumulative_telemetry(
+        telemetry,
+        info(severe=1, write_bind=3, write_terms=12, read_bind=2, read_terms=9, grad_max=12.0),
+        completed_updates=2,
+    )
+
+    assert telemetry == {
+        "schema_version": 1,
+        "accepted_update_count": 2,
+        "finite_accepted_update_count": 2,
+        "pre_shared_severe_clip_count": 1,
+        "pre_shared_update_count": 2,
+        "write_feature_cap_bind_numerator": 5,
+        "write_feature_cap_bind_denominator": 22,
+        "read_feature_cap_bind_numerator": 3,
+        "read_feature_cap_bind_denominator": 17,
+        "pre_shared_grad_norm_max": 12.0,
+    }
+    train._validate_v35_cumulative_telemetry(telemetry, completed_updates=2)
+
+
+def test_v35_checkpoint_protocol_requires_exact_branch_targets_and_rungs():
+    pilot = _config.get_config("pi05_yam_mem_v35")
+    train._validate_v35_checkpoint_protocol(pilot, resuming=False)
+
+    with pytest.raises(ValueError, match="exact completed-update"):
+        train._validate_v35_checkpoint_protocol(
+            dataclasses.replace(pilot, checkpoint_steps=(250, 500)),
+            resuming=False,
+        )
+    with pytest.raises(ValueError, match="frozen 1,000-update pilot"):
+        train._validate_v35_checkpoint_protocol(
+            dataclasses.replace(
+                pilot,
+                num_train_steps=2_500,
+                checkpoint_steps=(250, 500, 1_000, 2_500),
+            ),
+            resuming=False,
+        )
+
+    extension = dataclasses.replace(
+        pilot,
+        resume=True,
+        num_train_steps=2_500,
+        checkpoint_steps=(250, 500, 1_000, 2_500),
+    )
+    train._validate_v35_checkpoint_protocol(extension, resuming=True, latest_step=1_000)
+    full = dataclasses.replace(
+        pilot,
+        resume=True,
+        num_train_steps=10_000,
+        checkpoint_steps=(250, 500, 1_000, 2_500, 5_000, 10_000),
+    )
+    train._validate_v35_checkpoint_protocol(full, resuming=True, latest_step=1_000)
+    train._validate_v35_checkpoint_protocol(full, resuming=True, latest_step=2_500)
+    with pytest.raises(ValueError, match="separately sealed external rung"):
+        train._validate_v35_checkpoint_protocol(full, resuming=True, latest_step=5_000)
+
+    with pytest.raises(ValueError, match="exact completed-update"):
+        train._validate_v35_checkpoint_protocol(
+            dataclasses.replace(full, checkpoint_steps=(250, 500, 1_000, 2_500, 10_000)),
+            resuming=True,
+            latest_step=2_500,
+        )
+    with pytest.raises(ValueError, match="may resume only"):
+        train._validate_v35_checkpoint_protocol(full, resuming=True, latest_step=500)
+
+
+def test_v35_frozen_cast_keeps_injection_gate_fp32_and_validates_effective_value():
+    class TinyGate(nnx.Module):
+        def __init__(self):
+            self.memory_inject_w = nnx.Param(jnp.full((4,), jnp.arctanh(0.5), dtype=jnp.float32))
+            self.memory_gate = nnx.Param(jnp.ones((4,), dtype=jnp.float32))
+
+    config = _config.get_config("pi05_yam_mem_v35")
+    params = train._cast_frozen_params(config, nnx.state(TinyGate()))
+    assert params["memory_inject_w"].value.dtype == jnp.float32
+    assert params["memory_gate"].value.dtype == jnp.bfloat16
+    train._validate_v35_initialized_gate(config, params)
+
+    bad_model = TinyGate()
+    bad_model.memory_inject_w.value = jnp.zeros((4,), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="does not match"):
+        train._validate_v35_initialized_gate(config, nnx.state(bad_model))
+
+
+def test_v35_initialization_identity_hashes_actual_step0_tree_and_binds_calibration(
+    monkeypatch,
+    tmp_path: pathlib.Path,
+):
+    class TinyGate(nnx.Module):
+        def __init__(self):
+            self.memory_inject_w = nnx.Param(jnp.full((4,), jnp.arctanh(0.5), dtype=jnp.float32))
+            self.memory_gate = nnx.Param(jnp.ones((4,), dtype=jnp.float32))
+
+    template = _config.get_config("pi05_yam_mem_v35")
+    params = train._cast_frozen_params(template, nnx.state(TinyGate()))
+    step0_sha256 = _weight_loaders.parameter_tree_sha256(params.to_pure_dict())
+    config = dataclasses.replace(
+        _calibrated_v35_config(monkeypatch, tmp_path / "inputs", source_sha256=step0_sha256),
+        exp_name="identity-test",
+        checkpoint_base_dir=str(pathlib.Path(os.environ["MEMORY_PROJECT_ROOT"]) / "v35/checkpoints"),
+    )
+    checkpoint_dir = pathlib.Path(config.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True)
+    graft = {"tree_hashes": {"source_sha256": "1" * 64, "target_schema_sha256": "2" * 64}}
+    graft["manifest_sha256"] = hashlib.sha256(train._canonical_json(graft).encode()).hexdigest()
+    (checkpoint_dir / "initialization_graft_manifest.json").write_text(json.dumps(graft), encoding="utf-8")
+
+    identity_path = train._write_v35_initialization_identity(config, params)
+
+    assert identity_path is not None
+    identity = json.loads(identity_path.read_text())
+    assert identity["initialization_seed"] == config.seed
+    assert identity["actual_step0_parameter_tree_sha256"] == step0_sha256
+    assert identity["calibration_id"] == config.model.memory_v35_calibration_id
+    assert identity["effective_gate_min"] == pytest.approx(0.5)
+    assert identity["memory_calibration"] == {
+        # Artifact-boundary alpha is the FP32 runtime value, not the float64 config literal.
+        "alpha_step": float(np.float32(0.01)),
+        "memory_injection_c": 3.0,
+        "memory_injection_tau": 0.04,
+    }
+    assert set(identity["artifact_hashes"]) == {
+        "calibration_artifact_sha256",
+        "episode_manifest_sha256",
+        "norm_stats_provenance_sha256",
+        "norm_stats_sha256",
+        "train_storage_sha256",
+        "initialization_graft_manifest_file_sha256",
+        "initialization_graft_manifest_self_sha256",
+    }
+    unsigned_identity = {key: value for key, value in identity.items() if key != "identity_sha256"}
+    assert identity["identity_sha256"] == hashlib.sha256(train._canonical_json(unsigned_identity).encode()).hexdigest()
+
+    provenance = train._snapshot_v35_checkpoint_provenance(config, identity_path)
+    assert set(provenance) == set(train._V35_CHECKPOINT_PROVENANCE_FILENAMES.values())
+    assert provenance["v35_initialization_manifest.json"] == identity_path.read_bytes()
+
+    checkpoint_assets = checkpoint_dir / "1000" / "assets"
+    checkpoint_assets.mkdir(parents=True)
+    for name, contents in provenance.items():
+        (checkpoint_assets / name).write_bytes(contents)
+    resumed = dataclasses.replace(
+        config,
+        resume=True,
+        num_train_steps=2_500,
+        checkpoint_steps=(250, 500, 1_000, 2_500),
+    )
+    train._validate_v35_resume_checkpoint_assets(
+        resumed,
+        checkpoint_step=1_000,
+        identity_path=identity_path,
+    )
+
+    embedded_calibration = checkpoint_assets / "v35_calibration_artifact.json"
+    embedded_calibration.write_bytes(embedded_calibration.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="not byte-identical"):
+        train._validate_v35_resume_checkpoint_assets(
+            resumed,
+            checkpoint_step=1_000,
+            identity_path=identity_path,
+        )
+
+    identity["config_name"] = "tampered"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    with pytest.raises(ValueError, match="self-hash is invalid"):
+        train._validate_v35_root_identity(resumed, identity_path)
 
 
 class _ToyModel(_model.BaseModel):
@@ -67,9 +575,7 @@ class _ToyModel(_model.BaseModel):
             "write_grad_norm_sum": jnp.sum(jnp.where(valid, synthetic_write_norm, 0.0), axis=1),
             "write_valid_count": jnp.sum(valid.astype(jnp.float32), axis=1),
             "write_clip_count": jnp.sum((valid & (synthetic_write_norm > 0.5)).astype(jnp.float32), axis=1),
-            "write_severe_clip_count": jnp.sum(
-                (valid & (synthetic_write_norm > 0.9)).astype(jnp.float32), axis=1
-            ),
+            "write_severe_clip_count": jnp.sum((valid & (synthetic_write_norm > 0.9)).astype(jnp.float32), axis=1),
             "write_grad_norm_max": jnp.max(jnp.where(valid, synthetic_write_norm, 0.0), axis=1),
         }
 
@@ -578,13 +1084,9 @@ def test_v34_memory_grad_group_clip():
     # a clip far above the actual norm is bit-exact with the clip disabled
     _, state_loose, _ = _v34_toy_setup(ladder_scale=0.0)
     _, state_off, _ = _v34_toy_setup(ladder_scale=0.0)
-    new_loose, info_loose = train.train_step(
-        dataclasses.replace(config, memory_grad_clip=1e9), rng, state_loose, batch
-    )
+    new_loose, info_loose = train.train_step(dataclasses.replace(config, memory_grad_clip=1e9), rng, state_loose, batch)
     new_off, info_off = train.train_step(dataclasses.replace(config, memory_grad_clip=None), rng, state_off, batch)
     assert "memory_grad_norm" in info_loose
     assert "memory_grad_norm" not in info_off
     for name in ("kernel", "memory_gain"):
-        np.testing.assert_array_equal(
-            np.asarray(new_loose.params[name].value), np.asarray(new_off.params[name].value)
-        )
+        np.testing.assert_array_equal(np.asarray(new_loose.params[name].value), np.asarray(new_off.params[name].value))

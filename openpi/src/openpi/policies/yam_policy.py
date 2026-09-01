@@ -86,6 +86,20 @@ class YamInputs(transforms.DataTransformFn):
             "seq_side_label",
             "seq_evidence_mask",
             "seq_waiting_mask",
+            # v3.5 Revision 4 current-frame masks, sparse-clock metadata, and stable manifest
+            # cells.  They are absent for legacy configs.
+            "seq_write_mask",
+            "seq_decision_mask",
+            "seq_occlusion_mask",
+            "seq_read_state_valid",
+            "seq_read_credit_reachable",
+            "seq_decay_gap_before",
+            "seq_use_pressure_mask",
+            "seq_sparse_skip_o",
+            "seq_episode_index",
+            "seq_collection_id",
+            "seq_object_id",
+            "seq_memory_cell",
         ):
             if key in data:
                 inputs[key] = data[key]

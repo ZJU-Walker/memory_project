@@ -138,8 +138,7 @@ def validate_phase_schema(segments: list[dict]) -> list[str]:
     order = [phase["key"] for phase in MEMORY_PHASES]
     seen = [order.index(_phase_of(seg["task"])["key"]) for seg in segments]
     problems.extend(
-        f"segment {i + 1} ({segments[i]['task']!r}) goes backwards in phase order "
-        f"after {segments[i - 1]['task']!r}"
+        f"segment {i + 1} ({segments[i]['task']!r}) goes backwards in phase order after {segments[i - 1]['task']!r}"
         for i in range(1, len(seen))
         if seen[i] < seen[i - 1]
     )
@@ -173,9 +172,16 @@ def probe_video(path: str) -> tuple[int, float]:
     """
     out = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=nb_frames,avg_frame_rate",
-            "-of", "json", path,
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_frames,avg_frame_rate",
+            "-of",
+            "json",
+            path,
         ],
         capture_output=True,
         text=True,
@@ -189,9 +195,17 @@ def probe_video(path: str) -> tuple[int, float]:
     if num_frames <= 0:
         counted = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-count_packets", "-show_entries", "stream=nb_read_packets",
-                "-of", "csv=p=0", path,
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+                path,
             ],
             capture_output=True,
             text=True,
@@ -231,8 +245,8 @@ def episode_length(demo: pathlib.Path) -> int:
     return min(lengths)
 
 
-def load_segments(demo: pathlib.Path) -> list[dict]:
-    path = demo / LABEL_FILE
+def load_segments(demo: pathlib.Path, label_file: str = LABEL_FILE) -> list[dict]:
+    path = demo / label_file
     return json.loads(path.read_text()) if path.exists() else []
 
 
@@ -256,10 +270,16 @@ def validate_segments(segments: list[dict], num_frames: int, subtasks: list[str]
     return problems + validate_phase_schema(segments)
 
 
-def save_segments(demo: pathlib.Path, segments: list[dict], num_frames: int, subtasks: list[str]) -> dict:
+def save_segments(
+    demo: pathlib.Path,
+    segments: list[dict],
+    num_frames: int,
+    subtasks: list[str],
+    label_file: str = LABEL_FILE,
+) -> dict:
     """Write the label file atomically; report completeness without blocking partial saves."""
     problems = validate_segments(segments, num_frames, subtasks)
-    path = demo / LABEL_FILE
+    path = demo / label_file
     if not segments:
         path.unlink(missing_ok=True)
         return {"ok": True, "complete": False, "problems": problems}
@@ -276,6 +296,8 @@ class LabelerState:
     data_dir: pathlib.Path
     subtasks: list[str]
     memory_mode: bool = False
+    label_file: str = LABEL_FILE
+    excluded_demos: frozenset[str] = frozenset()
 
     def subtasks_for(self, side: str) -> list[str]:
         """Labels offered for a demo; in memory mode the sided phases follow ``side``."""
@@ -298,7 +320,9 @@ class LabelerState:
         """
         summaries = []
         for demo in find_demos(self.data_dir):
-            segments = load_segments(demo)
+            if demo.name in self.excluded_demos:
+                continue
+            segments = load_segments(demo, self.label_file)
             covered = segments[-1]["end"] + 1 if segments else 0
             summaries.append(
                 {
@@ -315,7 +339,7 @@ class LabelerState:
         demo = self.data_dir / name
         num_frames = episode_length(demo)
         _, fps = probe_video(str(demo / TOP_MP4))
-        segments = load_segments(demo)
+        segments = load_segments(demo, self.label_file)
         side = self.side_of_segments(segments) or side
         return {
             "name": demo.name,
@@ -356,13 +380,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif route == "/api/demos":
-            self._send_json(
-                {"data_dir": str(self.state.data_dir), "demos": self.state.demo_summaries()}
-            )
+            self._send_json({"data_dir": str(self.state.data_dir), "demos": self.state.demo_summaries()})
         elif route == "/api/demo":
-            self._send_json(
-                self.state.demo_detail(query["name"][0], query.get("side", ["left"])[0])
-            )
+            self._send_json(self.state.demo_detail(query["name"][0], query.get("side", ["left"])[0]))
         elif route == "/video":
             self._serve_video(query["demo"][0], query["cam"][0])
         else:
@@ -396,7 +416,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Validate against every allowed label, not just the current side's five, so a
         # mixed-side episode is reported by the phase check rather than as "unknown subtask".
         vocabulary = all_memory_subtasks() if self.state.memory_mode else self.state.subtasks
-        result = save_segments(demo, payload["segments"], episode_length(demo), vocabulary)
+        result = save_segments(
+            demo,
+            payload["segments"],
+            episode_length(demo),
+            vocabulary,
+            self.state.label_file,
+        )
         self._send_json(result)
 
     def _serve_video(self, demo_name: str, camera: str) -> None:
@@ -412,7 +438,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         size = path.stat().st_size
         start, end = 0, size - 1
         status = 200
-        if (range_header := self.headers.get("Range")):
+        if range_header := self.headers.get("Range"):
             match = re.match(r"bytes=(\d*)-(\d*)", range_header)
             if match:
                 start = int(match.group(1) or 0)
@@ -842,23 +868,43 @@ def main() -> int:
         help="use the five-phase bin-memory schema with a per-episode left/right side",
     )
     parser.add_argument("--subtasks", nargs="+", default=list(DEFAULT_SUBTASKS))
+    parser.add_argument(
+        "--label-file",
+        default=LABEL_FILE,
+        help="label filename inside each demo (use a versioned overlay without replacing canonical labels)",
+    )
+    parser.add_argument(
+        "--exclude-demos",
+        nargs="*",
+        default=[],
+        help="demo directory names to hide from this review session",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
 
     if not args.data_dir.is_dir():
         parser.error(f"no such directory: {args.data_dir}")
-    demos = find_demos(args.data_dir)
+    excluded_demos = frozenset(args.exclude_demos)
+    demos = [demo for demo in find_demos(args.data_dir) if demo.name not in excluded_demos]
     if not demos:
         parser.error(f"no demo* folders in {args.data_dir}")
     if len(args.subtasks) > 9:
         parser.error("at most 9 subtasks (hotkeys 1-9)")
+    if pathlib.Path(args.label_file).name != args.label_file:
+        parser.error("--label-file must be a filename, not a path")
 
     Handler.state = LabelerState(
-        data_dir=args.data_dir, subtasks=args.subtasks, memory_mode=args.memory_task
+        data_dir=args.data_dir,
+        subtasks=args.subtasks,
+        memory_mode=args.memory_task,
+        label_file=args.label_file,
+        excluded_demos=excluded_demos,
     )
-    labeled = sum(1 for d in demos if (d / LABEL_FILE).exists())
-    print(f"{len(demos)} demos in {args.data_dir} ({labeled} already have {LABEL_FILE})")
+    labeled = sum(1 for d in demos if (d / args.label_file).exists())
+    print(f"{len(demos)} demos in {args.data_dir} ({labeled} already have {args.label_file})")
+    if excluded_demos:
+        print(f"excluded from this review session: {', '.join(sorted(excluded_demos))}")
     if args.memory_task:
         print("memory-task schema (pick the episode's side with , / . or the buttons):")
         for i, phase in enumerate(MEMORY_PHASES):

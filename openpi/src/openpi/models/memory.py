@@ -39,12 +39,19 @@ v3.4 additions (V34_PLAN_final.md):
     analytic backprop hard-coded SiLU-only layers and would silently misreport every
     per-token gradient once L2Norm layers exist. `jax.grad`, one token at a time, stays
     correct under any future MLP change (validated against direct `jax.grad` in tests).
+
+v3.5 Revision-4 opt-in branch:
+  * ``delta_output/pooled_frame`` reduces each frame to one normalized association, decays only
+    the output matrix, and applies a differentiable direct rank-one residual assignment.
+  * Hidden fast leaves remain fixed; output bias and all momentum remain exact zero. Fixed-alpha
+    write-free gaps can therefore be collapsed analytically without changing forward dynamics.
+  * Pooling, hidden features, fast state, commits, analytic decay, and raw reads stay FP32.
 """
 
 import dataclasses
 import functools
 import math
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import flax.nnx as nnx
 import jax
@@ -115,9 +122,47 @@ class MemoryConfig:
     # direction-preserving construction. None disables.
     kv_cotangent_clip: float | None = None
 
+    # v3.5 (Revision 4): an explicitly opt-in, one-association-per-frame direct-delta rule.
+    # The legacy values remain the defaults so existing configs/checkpoints take exactly the
+    # same branch and preserve their forward/backward numerics.
+    write_rule: Literal["gradient", "delta_output"] = "gradient"
+    association_mode: Literal["tokens", "pooled_frame"] = "tokens"
+    delta_rate: float = 1.0
+
+    # Fixed forgetting rate per *sampled memory step* (15 raw frames in the v3.5 pilot).  This
+    # is deliberately not produced by the learned gate.  Keeping it static makes a skipped
+    # write-free interval exactly collapsible to ``(1 - alpha_step) ** n``.
+    alpha_step: float = 0.01
+
+    # A degenerate pooled association or hidden feature must not be made to look valid by the
+    # epsilon in L2 normalization / the rank-one denominator.  Such samples receive decay only
+    # and expose an explicit telemetry bit.
+    association_norm_floor: float = 1e-6
+    hidden_norm_sq_floor: float = 1e-6
+
     def __post_init__(self) -> None:
         if not math.isfinite(self.eta_scale) or not 0.0 <= self.eta_scale <= 1.0:
             raise ValueError(f"eta_scale must be finite and in [0, 1], got {self.eta_scale!r}.")
+        if self.write_rule not in ("gradient", "delta_output"):
+            raise ValueError(f"Unknown write_rule {self.write_rule!r}.")
+        if self.association_mode not in ("tokens", "pooled_frame"):
+            raise ValueError(f"Unknown association_mode {self.association_mode!r}.")
+        if self.write_rule == "gradient" and self.association_mode != "tokens":
+            raise ValueError("write_rule='gradient' requires association_mode='tokens'.")
+        if self.write_rule == "delta_output" and self.association_mode != "pooled_frame":
+            raise ValueError("write_rule='delta_output' requires association_mode='pooled_frame'.")
+        if self.write_rule == "delta_output" and self.drift_radius is not None:
+            raise ValueError("drift_radius is incompatible with write_rule='delta_output'.")
+        if not math.isfinite(self.delta_rate) or not 0.0 <= self.delta_rate <= 1.0:
+            raise ValueError(f"delta_rate must be finite and in [0, 1], got {self.delta_rate!r}.")
+        if not math.isfinite(self.alpha_step) or not 0.0 <= self.alpha_step < 1.0:
+            raise ValueError(f"alpha_step must be finite and in [0, 1), got {self.alpha_step!r}.")
+        if not math.isfinite(self.association_norm_floor) or self.association_norm_floor <= 0.0:
+            raise ValueError(
+                f"association_norm_floor must be finite and positive, got {self.association_norm_floor!r}."
+            )
+        if not math.isfinite(self.hidden_norm_sq_floor) or self.hidden_norm_sq_floor <= 0.0:
+            raise ValueError(f"hidden_norm_sq_floor must be finite and positive, got {self.hidden_norm_sq_floor!r}.")
 
     @property
     def dims(self) -> tuple[int, ...]:
@@ -226,7 +271,11 @@ class TitansMemory(nnx.Module):
         """
         value = self.m0[name].value
         output_layer = self._num_layers - 1
-        if self.config.blank_initial_output and name in (f"w{output_layer}", f"b{output_layer}"):
+        blank_output = self.config.blank_initial_output and name in (f"w{output_layer}", f"b{output_layer}")
+        # Output bias is not part of the v3.5 fast state.  Enforce the invariant even if a
+        # grafted checkpoint contains a nonzero legacy b3 and blank_initial_output was omitted.
+        delta_output_bias = self.config.write_rule == "delta_output" and name == f"b{output_layer}"
+        if blank_output or delta_output_bias:
             # zeros_like preserves the parameter leaf's FSDP placement while the explicit dtype
             # keeps the per-sample fast-state contract independent of checkpoint precision.
             return jnp.zeros_like(value, dtype=jnp.float32)
@@ -238,8 +287,41 @@ class TitansMemory(nnx.Module):
         for i in range(self._num_layers):
             for name in (f"w{i}", f"b{i}"):
                 value = self._initial_fast_leaf(name)
+                if self.config.write_rule == "delta_output":
+                    # Checkpoint parameters may be stored in BF16, but v3.5 fast state never is.
+                    value = value.astype(jnp.float32)
                 fast[name] = jnp.broadcast_to(value, (batch_size, *value.shape))
         return MemoryState(fast_weights=fast, momentum=jax.tree.map(jnp.zeros_like, fast))
+
+    @property
+    def _output_weight_name(self) -> str:
+        return f"w{self._num_layers - 1}"
+
+    @property
+    def _output_bias_name(self) -> str:
+        return f"b{self._num_layers - 1}"
+
+    def _hidden(self, fast_weights: dict[str, at.Array], k: at.Array) -> at.Array:
+        """FP32 memory hidden features immediately before the output matrix.
+
+        This deliberately lives beside (rather than refactoring) :meth:`_forward`: the legacy
+        forward retains its exact operation sequence, while the v3.5 branch gets an explicit
+        boundary at which only the final matrix is fast.
+        """
+        x = k.astype(jnp.float32)
+        if self.config.mlp_l2norm:
+            x = _l2_norm(x)
+        # FP32 dtype alone is not enough on Ampere/Hopper GPUs: default matmul precision is
+        # TF32, which breaks the exact-arithmetic fast-weight contract (rank-one commit and
+        # retrieval residuals inflate from ~1e-7 to ~1e-3).
+        with jax.default_matmul_precision("highest"):
+            for i in range(self._num_layers - 1):
+                w = fast_weights[f"w{i}"].astype(jnp.float32)
+                b = fast_weights[f"b{i}"].astype(jnp.float32)
+                x = jax.nn.silu(x @ w + b)
+                if self.config.mlp_l2norm:
+                    x = _l2_norm(x)
+        return x.astype(jnp.float32)
 
     def _forward(self, fast_weights: dict[str, at.Array], k: at.Array) -> at.Array:
         """The memory MLP under the given (unbatched) fast weights: [n, d_key] -> [n, d_value].
@@ -252,12 +334,15 @@ class TitansMemory(nnx.Module):
         """
         l2norm = self.config.mlp_l2norm
         x = _l2_norm(k) if l2norm else k
-        for i in range(self._num_layers):
-            x = x @ fast_weights[f"w{i}"] + fast_weights[f"b{i}"]
-            if i < self._num_layers - 1:
-                x = jax.nn.silu(x)
-                if l2norm:
-                    x = _l2_norm(x)
+        # Raw retrieval shares the fast-weight FP32 exact-arithmetic contract; TF32 (the GPU
+        # default for float32 matmuls) must not leak in here.
+        with jax.default_matmul_precision("highest"):
+            for i in range(self._num_layers):
+                x = x @ fast_weights[f"w{i}"] + fast_weights[f"b{i}"]
+                if i < self._num_layers - 1:
+                    x = jax.nn.silu(x)
+                    if l2norm:
+                        x = _l2_norm(x)
         return x
 
     def _keys_values(self, h: at.Array) -> tuple[at.Array, at.Array, at.Array]:
@@ -289,11 +374,241 @@ class TitansMemory(nnx.Module):
         return _l2_norm(jax.nn.silu(self.w_q(h.astype(jnp.float32))))
 
     @at.typecheck
-    def read_key(
-        self, state: MemoryState, q_key: at.Float[at.Array, "b n dk"]
-    ) -> at.Float[at.Array, "b n dv"]:
+    def read_key(self, state: MemoryState, q_key: at.Float[at.Array, "b n dk"]) -> at.Float[at.Array, "b n dv"]:
         """Memory-MLP forward on ALREADY-PROJECTED key-space queries (no W_Q projection)."""
-        return jax.vmap(self._forward)(state.fast_weights, q_key.astype(jnp.float32))
+        fast_weights = state.fast_weights
+        if self.config.write_rule == "delta_output":
+            # Raw retrieval is an FP32 contract even when the surrounding model/checkpoint is
+            # BF16.  A correctly constructed v3.5 state is already FP32; the casts also make
+            # restore boundaries robust without perturbing the legacy branch.
+            fast_weights = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), fast_weights)
+        return jax.vmap(self._forward)(fast_weights, q_key.astype(jnp.float32))
+
+    @at.typecheck
+    def hidden_key(self, state: MemoryState, q_key: at.Float[at.Array, "b n dk"]) -> at.Float[at.Array, "b n dh"]:
+        """FP32 pre-output features for key-space query-alignment telemetry."""
+        fast_weights = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), state.fast_weights)
+        return jax.vmap(self._hidden)(fast_weights, q_key.astype(jnp.float32))
+
+    @at.typecheck
+    def pool_kv(
+        self,
+        k: at.Float[at.Array, "b n dk"],
+        v: at.Float[at.Array, "b n dv"],
+    ) -> dict[str, at.Array]:
+        """Reduce a frame's token associations to one safe, normalized FP32 pair.
+
+        The means are formed independently, then L2-normalized.  Unlike ``_l2_norm`` alone,
+        this boundary records the true pre-normalization norms and treats a non-finite or
+        near-zero mean as invalid.  Invalid vectors become exact zeros; the commit path uses
+        ``association_valid`` to perform decay only rather than manufacture a direction from
+        the normalization epsilon.
+        """
+        if k.shape[1] == 0:
+            raise ValueError("Cannot pool an empty token axis.")
+        k_mean = jnp.mean(k.astype(jnp.float32), axis=1)
+        v_mean = jnp.mean(v.astype(jnp.float32), axis=1)
+        k_pre_norm = jnp.sqrt(jnp.sum(jnp.square(k_mean), axis=-1))
+        v_pre_norm = jnp.sqrt(jnp.sum(jnp.square(v_mean), axis=-1))
+        floor = jnp.asarray(self.config.association_norm_floor, dtype=jnp.float32)
+        key_valid = jnp.all(jnp.isfinite(k_mean), axis=-1) & jnp.isfinite(k_pre_norm) & (k_pre_norm >= floor)
+        value_valid = jnp.all(jnp.isfinite(v_mean), axis=-1) & jnp.isfinite(v_pre_norm) & (v_pre_norm >= floor)
+        k_safe = jnp.where(key_valid[:, None], k_mean, jnp.zeros_like(k_mean))
+        v_safe = jnp.where(value_valid[:, None], v_mean, jnp.zeros_like(v_mean))
+        pooled_key = _l2_norm(k_safe).astype(jnp.float32)
+        pooled_value = _l2_norm(v_safe).astype(jnp.float32)
+        return {
+            "pooled_key": pooled_key,
+            "pooled_value": pooled_value,
+            "pooled_key_pre_norm": k_pre_norm.astype(jnp.float32),
+            "pooled_value_pre_norm": v_pre_norm.astype(jnp.float32),
+            "pooled_key_post_norm": jnp.linalg.norm(pooled_key, axis=-1).astype(jnp.float32),
+            "pooled_value_post_norm": jnp.linalg.norm(pooled_value, axis=-1).astype(jnp.float32),
+            "pooled_key_valid": key_valid,
+            "pooled_value_valid": value_valid,
+            "association_valid": key_valid & value_valid,
+        }
+
+    def _guard_delta_state(self, state: MemoryState) -> MemoryState:
+        """Apply the recurrent cotangent guard, then enforce the v3.5 FP32 boundary."""
+        if self.config.state_cotangent_clip is not None:
+            fast, momentum = _clip_state_cotangent(
+                (state.fast_weights, state.momentum), self.config.state_cotangent_clip
+            )
+            state = MemoryState(fast_weights=fast, momentum=momentum)
+        return MemoryState(
+            fast_weights=jax.tree.map(lambda leaf: leaf.astype(jnp.float32), state.fast_weights),
+            momentum=jax.tree.map(lambda leaf: leaf.astype(jnp.float32), state.momentum),
+        )
+
+    def _canonical_delta_state(self, state: MemoryState, w3: at.Array) -> MemoryState:
+        """Build a v3.5 state: hidden leaves fixed, b3 and every momentum leaf exact zero."""
+        fast_weights = {}
+        for name, leaf in state.fast_weights.items():
+            if name == self._output_weight_name:
+                fast_weights[name] = w3.astype(jnp.float32)
+            elif name == self._output_bias_name:
+                fast_weights[name] = jnp.zeros_like(leaf, dtype=jnp.float32)
+            else:
+                fast_weights[name] = leaf.astype(jnp.float32)
+        momentum = jax.tree.map(lambda leaf: jnp.zeros_like(leaf, dtype=jnp.float32), fast_weights)
+        return MemoryState(fast_weights=fast_weights, momentum=momentum)
+
+    def _delta_decay_factor(self, n_steps: at.Array) -> at.Array:
+        """Fixed-alpha FP32 decay factor, excluded from outer differentiation."""
+        rho = jnp.asarray(1.0 - self.config.alpha_step, dtype=jnp.float32)
+        return jax.lax.stop_gradient(jnp.power(rho, n_steps.astype(jnp.float32)))
+
+    def analytic_decay(self, state: MemoryState, n_steps: int | at.Array) -> tuple[MemoryState, dict[str, at.Array]]:
+        """Collapse ``n_steps`` valid non-write transitions exactly in delta-output mode.
+
+        ``n_steps`` may be an integer scalar or one integer per batch sample.  A Python negative
+        value is rejected immediately.  A dynamically traced negative value cannot raise from
+        compiled JAX code, so it fails closed to a no-op for that sample and reports
+        ``decay_gap_valid=False``.  Callers remain responsible for proving that a skipped span
+        contains no write/reset/invalid transition.
+        """
+        if self.config.write_rule != "delta_output":
+            raise ValueError("analytic_decay is valid only for write_rule='delta_output'.")
+        gap = jnp.asarray(n_steps)
+        if not jnp.issubdtype(gap.dtype, jnp.integer):
+            raise TypeError(f"n_steps must have integer dtype, got {gap.dtype}.")
+        if gap.ndim == 0:
+            if isinstance(n_steps, int) and not isinstance(n_steps, bool) and n_steps < 0:
+                raise ValueError(f"n_steps must be non-negative, got {n_steps}.")
+            gap = jnp.broadcast_to(gap, (next(iter(state.fast_weights.values())).shape[0],))
+        elif gap.shape != (next(iter(state.fast_weights.values())).shape[0],):
+            raise ValueError(f"n_steps must be an integer scalar or shape [batch], got shape {gap.shape}.")
+
+        state = self._guard_delta_state(state)
+        gap_valid = gap >= 0
+        safe_gap = jnp.maximum(gap, jnp.zeros_like(gap))
+        decay_factor = self._delta_decay_factor(safe_gap)
+        old_w3 = state.fast_weights[self._output_weight_name]
+        new_w3 = _per_sample(decay_factor, old_w3) * old_w3
+        new_state = self._canonical_delta_state(state, new_w3)
+        batch_size = old_w3.shape[0]
+        alpha = jnp.full((batch_size,), self.config.alpha_step, dtype=jnp.float32)
+        zeros = jnp.zeros((batch_size,), dtype=jnp.float32)
+        aux = {
+            "decay_steps": gap,
+            "decay_gap_valid": gap_valid,
+            "decay_factor": decay_factor.astype(jnp.float32),
+            "commit_applied": jnp.zeros((batch_size,), dtype=jnp.bool_),
+            "surprise": zeros,
+            "grad_norm": zeros,
+            "clip_factor": jnp.ones((batch_size,), dtype=jnp.float32),
+            "theta": zeros,
+            "eta": zeros,
+            "alpha": alpha,
+            "delta_rate": jnp.full((batch_size,), self.config.delta_rate, dtype=jnp.float32),
+            "delta_w3_norm": zeros,
+            "w3_norm": jnp.linalg.norm(new_w3, axis=(-2, -1)).astype(jnp.float32),
+            "w3_maxabs": jnp.max(jnp.abs(new_w3), axis=(-2, -1)).astype(jnp.float32),
+        }
+        return new_state, aux
+
+    @at.typecheck
+    def delta_write_kv(
+        self,
+        state: MemoryState,
+        k: at.Float[at.Array, "b n dk"],
+        v: at.Float[at.Array, "b n dv"],
+    ) -> tuple[MemoryState, dict[str, at.Array]]:
+        """Decay then directly commit one pooled association into the output matrix.
+
+        This is a *transition* API.  A causal sequence caller must perform any current-step
+        read before invoking it.  The update is fully differentiable through the pooled K/V,
+        hidden features, residual, and incoming w3; only fixed optimizer-like scalars are
+        stop-gradient.  Degenerate samples perform the decay but no content update.
+        """
+        if self.config.write_rule != "delta_output" or self.config.association_mode != "pooled_frame":
+            raise ValueError("delta_write_kv requires write_rule='delta_output' and association_mode='pooled_frame'.")
+        k = k.astype(jnp.float32)
+        v = v.astype(jnp.float32)
+        state = self._guard_delta_state(state)
+        if self.config.kv_cotangent_clip is not None:
+            k, v = _clip_state_cotangent((k, v), self.config.kv_cotangent_clip)
+
+        pooled = self.pool_kv(k, v)
+        pooled_key = pooled["pooled_key"]
+        pooled_value = pooled["pooled_value"]
+        hidden = self.hidden_key(state, pooled_key[:, None, :])[:, 0, :]
+        hidden_norm_sq = jnp.sum(jnp.square(hidden), axis=-1)
+
+        batch_size = hidden.shape[0]
+        alpha = jnp.full((batch_size,), self.config.alpha_step, dtype=jnp.float32)
+        rho = self._delta_decay_factor(jnp.ones((batch_size,), dtype=jnp.int32))
+        old_w3 = state.fast_weights[self._output_weight_name].astype(jnp.float32)
+        decayed_w3 = _per_sample(rho, old_w3) * old_w3
+
+        # Compute raw telemetry first, then sanitize only the arithmetic feeding a candidate
+        # update.  This prevents NaN*False from contaminating an otherwise fail-closed sample.
+        raw_prediction = jnp.einsum("bh,bhd->bd", hidden, decayed_w3, precision=jax.lax.Precision.HIGHEST)
+        raw_pre_residual = pooled_value - raw_prediction
+        state_finite = jnp.all(jnp.isfinite(decayed_w3), axis=(-2, -1))
+        hidden_finite = jnp.all(jnp.isfinite(hidden), axis=-1) & jnp.isfinite(hidden_norm_sq)
+        residual_finite = jnp.all(jnp.isfinite(raw_pre_residual), axis=-1)
+        hidden_valid = hidden_finite & (
+            hidden_norm_sq >= jnp.asarray(self.config.hidden_norm_sq_floor, dtype=jnp.float32)
+        )
+        base_valid = pooled["association_valid"] & state_finite & hidden_valid & residual_finite
+
+        hidden_safe = jnp.where(jnp.isfinite(hidden), hidden, jnp.zeros_like(hidden))
+        residual_safe = jnp.where(jnp.isfinite(raw_pre_residual), raw_pre_residual, jnp.zeros_like(raw_pre_residual))
+        denominator = jnp.where(hidden_valid, hidden_norm_sq, jnp.ones_like(hidden_norm_sq))
+        rate = jax.lax.stop_gradient(jnp.asarray(self.config.delta_rate, dtype=jnp.float32))
+        candidate_delta = (
+            rate
+            * jnp.einsum("bh,bd->bhd", hidden_safe, residual_safe, precision=jax.lax.Precision.HIGHEST)
+            / denominator[:, None, None]
+        )
+        delta_finite = jnp.all(jnp.isfinite(candidate_delta), axis=(-2, -1))
+        commit_applied = base_valid & delta_finite
+        delta_w3 = jnp.where(commit_applied[:, None, None], candidate_delta, jnp.zeros_like(candidate_delta))
+        new_w3 = decayed_w3 + delta_w3
+        new_state = self._canonical_delta_state(state, new_w3)
+
+        post_prediction = jnp.einsum("bh,bhd->bd", hidden_safe, new_w3, precision=jax.lax.Precision.HIGHEST)
+        post_residual = pooled_value - post_prediction
+        pre_residual = jnp.where(residual_finite[:, None], raw_pre_residual, residual_safe)
+        pre_residual_norm = jnp.linalg.norm(pre_residual, axis=-1).astype(jnp.float32)
+        post_residual_norm = jnp.linalg.norm(post_residual, axis=-1).astype(jnp.float32)
+        residual_ratio = post_residual_norm / jnp.maximum(pre_residual_norm, jnp.asarray(1e-12, jnp.float32))
+        relative_commit_residual = post_residual_norm / (
+            pooled["pooled_value_post_norm"] + jnp.asarray(1e-8, jnp.float32)
+        )
+        zeros = jnp.zeros((batch_size,), dtype=jnp.float32)
+        aux = {
+            **pooled,
+            "hidden": hidden.astype(jnp.float32),
+            "hidden_norm": jnp.sqrt(hidden_norm_sq).astype(jnp.float32),
+            "hidden_norm_sq": hidden_norm_sq.astype(jnp.float32),
+            "hidden_valid": hidden_valid,
+            "state_finite": state_finite,
+            "pre_residual": pre_residual.astype(jnp.float32),
+            "post_residual": post_residual.astype(jnp.float32),
+            "pre_residual_norm": pre_residual_norm,
+            "post_residual_norm": post_residual_norm,
+            # post/pre verifies the delta-rate identity; post/||v_bar|| is the production
+            # mixed-precision commit-quality gate.  Keep both definitions explicit.
+            "residual_ratio": residual_ratio.astype(jnp.float32),
+            "relative_commit_residual": relative_commit_residual.astype(jnp.float32),
+            "commit_applied": commit_applied,
+            "surprise": jnp.sum(jnp.square(pre_residual), axis=-1).astype(jnp.float32),
+            # Compatibility telemetry: this rule has no inner loss gradient or momentum gate.
+            "grad_norm": zeros,
+            "clip_factor": jnp.ones((batch_size,), dtype=jnp.float32),
+            "theta": jnp.full((batch_size,), self.config.delta_rate, dtype=jnp.float32),
+            "eta": zeros,
+            "alpha": alpha,
+            "delta_rate": jnp.full((batch_size,), self.config.delta_rate, dtype=jnp.float32),
+            "decay_factor": rho,
+            "delta_w3_norm": jnp.linalg.norm(delta_w3, axis=(-2, -1)).astype(jnp.float32),
+            "w3_norm": jnp.linalg.norm(new_w3, axis=(-2, -1)).astype(jnp.float32),
+            "w3_maxabs": jnp.max(jnp.abs(new_w3), axis=(-2, -1)).astype(jnp.float32),
+        }
+        return new_state, aux
 
     def _drift_trust_region(self, fast_weights: dict[str, at.Array]) -> dict[str, at.Array]:
         """Optional guardrail (plan 5.7): rescale ||fast - m0|| onto the drift_radius sphere."""
@@ -337,14 +652,21 @@ class TitansMemory(nnx.Module):
         ("surprise"), the pre-clip gradient norm, the clip multiplier actually applied, and the
         gates.
         """
+        if self.config.write_rule == "delta_output":
+            # The learned gates are intentionally irrelevant in v3.5.  This compatibility
+            # dispatch lets existing key-space callers switch rules through static config while
+            # the explicit delta_write_kv API makes the causal read-before-transition boundary
+            # visible to new sequence code.
+            if zero_gradient:
+                return self.analytic_decay(state, 1)
+            return self.delta_write_kv(state, k, v)
+
         k = k.astype(jnp.float32)
         v = v.astype(jnp.float32)
 
         if self.config.state_cotangent_clip is not None:
             # Backward-only guardrail on the recurrent chain; the forward values are identical.
-            fast, mom = _clip_state_cotangent(
-                (state.fast_weights, state.momentum), self.config.state_cotangent_clip
-            )
+            fast, mom = _clip_state_cotangent((state.fast_weights, state.momentum), self.config.state_cotangent_clip)
             state = MemoryState(fast_weights=fast, momentum=mom)
         if self.config.kv_cotangent_clip is not None:
             # Backward-only guardrail on what one write may send toward the VLM tokens.
@@ -425,6 +747,8 @@ class TitansMemory(nnx.Module):
         selecting tokens.  Individual gradient norms must not be summed to recover the frame
         ``grad_norm`` because different token-gradient vectors can align or cancel.
         """
+        if self.config.write_rule != "gradient" or self.config.association_mode != "tokens":
+            raise ValueError("token_write_diagnostics is defined only for the gradient/tokens write rule.")
         _, k, v = self._keys_values(h)
 
         def per_sample(fast_weights, k_sample, v_sample):
@@ -456,15 +780,18 @@ class TitansMemory(nnx.Module):
         gates from the mean raw token, and delegate to :meth:`write_kv`.
         """
         x, k, v = self._keys_values(h)
+        if self.config.write_rule == "delta_output":
+            return self.delta_write_kv(state, k, v)
         theta, eta, alpha = self._gates_from_float_tokens(x)
         return self.write_kv(state, k, v, theta, eta, alpha)
 
     @at.typecheck
-    def decay_step(
-        self, state: MemoryState, h: at.Float[at.Array, "b n d"]
-    ) -> tuple[MemoryState, dict[str, at.Array]]:
+    def decay_step(self, state: MemoryState, h: at.Float[at.Array, "b n d"]) -> tuple[MemoryState, dict[str, at.Array]]:
         """Plan 8.4 "Dynamics-only" step: gates and surprise computed exactly as `write` would,
         but the gradient term is zeroed -- S_t = eta S_{t-1}, M_t = (1-alpha) M_{t-1} + S_t."""
+        if self.config.write_rule == "delta_output":
+            # h is intentionally unused: fixed-alpha output decay is observation-independent.
+            return self.analytic_decay(state, 1)
         x, k, v = self._keys_values(h)
         theta, eta, alpha = self._gates_from_float_tokens(x)
         return self.write_kv(state, k, v, theta, eta, alpha, zero_gradient=True)
@@ -479,6 +806,10 @@ class TitansMemory(nnx.Module):
         """Prediction error of the current memory on `h`, without writing (equals the `surprise`
         that `write` would report for the same state and input)."""
         _, k, v = self._keys_values(h)
+        if self.config.write_rule == "delta_output":
+            # Functional transition construction does not mutate ``state``; its aux evaluates
+            # the required post-decay/pre-commit residual exactly once, including guards.
+            return self.delta_write_kv(state, k, v)[1]["surprise"]
         return jax.vmap(lambda fw, k, v: jnp.mean(jnp.sum(jnp.square(self._forward(fw, k) - v), axis=-1)))(
             state.fast_weights, k, v
         )

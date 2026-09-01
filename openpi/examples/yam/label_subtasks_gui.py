@@ -22,8 +22,11 @@ import numpy as np
 import streamlit as st
 
 DATA_ROOT = pathlib.Path("/iris/u/kewalk/memory_project/data/bin_memory_banana")
-SUBTASKS = [  # TODO: replace placeholders. Hotkeys 1..9 map to this list in order.
-    "observe bins",
+SUBTASKS = [  # 0816-training vocabulary (hotkeys 1..5). First-round labels come from
+    # examples/yam/autolabel_banana0630_subtasks.py; originals in subtask_labels_3task_backup.json.
+    "open both lids",
+    "inspect both bins",
+    "close both lids and reset arms",
     "open left bin",
     "open right bin",
 ]

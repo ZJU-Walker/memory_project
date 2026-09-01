@@ -122,6 +122,75 @@ def letterbox_patch_valid(source_hw: tuple[int, int], *, target: int = 224, patc
     return tuple(valid)
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _clip_feature_cotangent(feature: at.Array, limit: float) -> at.Array:
+    """Identity forward; cap each example's feature cotangent in the backward pass.
+
+    The v3.5 write/read classifiers consume pooled features outside the memory core API, so
+    the core k/v guard cannot bound this direct path into the backbone. This local guard keeps
+    the forward feature and head gradients exact while bounding only the gradient entering the
+    feature producer.
+    """
+    return feature
+
+
+def _clip_feature_cotangent_fwd(feature: at.Array, limit: float):
+    del limit
+    return feature, None
+
+
+def _clip_feature_cotangent_bwd(limit: float, _residual, cotangent: at.Array):
+    cotangent32 = cotangent.astype(jnp.float32)
+    norm = jnp.linalg.norm(cotangent32, axis=-1)
+    scale = jnp.minimum(1.0, jnp.asarray(limit, jnp.float32) / (norm + 1e-12))
+    return ((cotangent32 * scale[..., None]).astype(cotangent.dtype),)
+
+
+_clip_feature_cotangent.defvjp(_clip_feature_cotangent_fwd, _clip_feature_cotangent_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4,))
+def _side_ce_with_per_term_feature_cap(feature, kernel, bias, label, limit):
+    """Cross-entropy whose *unweighted per-term* feature gradient is capped.
+
+    Downstream episode/cell/branch weighting multiplies the already-capped term. Kernel and
+    bias gradients remain the exact ordinary cross-entropy gradients.
+    """
+    logits = feature @ kernel + bias
+    ce = -jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), label[:, None], axis=-1)[:, 0]
+    return ce, logits
+
+
+def _side_ce_with_per_term_feature_cap_fwd(feature, kernel, bias, label, limit):
+    del limit
+    logits = feature @ kernel + bias
+    log_probability = jax.nn.log_softmax(logits, axis=-1)
+    probability = jnp.exp(log_probability)
+    ce = -jnp.take_along_axis(log_probability, label[:, None], axis=-1)[:, 0]
+    return (ce, logits), (feature, kernel, label, probability)
+
+
+def _side_ce_with_per_term_feature_cap_bwd(limit, residual, cotangents):
+    feature, kernel, label, probability = residual
+    ce_cotangent, logits_cotangent = cotangents
+    probability_error = probability - jax.nn.one_hot(label, probability.shape[-1], dtype=jnp.float32)
+    raw_feature_grad = probability_error @ kernel.T
+    raw_norm = jnp.linalg.norm(raw_feature_grad.astype(jnp.float32), axis=-1)
+    cap_scale = jnp.minimum(1.0, jnp.asarray(limit, jnp.float32) / (raw_norm + 1e-12))
+    capped_ce_feature_grad = raw_feature_grad * cap_scale[:, None]
+    total_logits_cotangent = logits_cotangent + ce_cotangent[:, None] * probability_error
+    feature_grad = logits_cotangent @ kernel.T + ce_cotangent[:, None] * capped_ce_feature_grad
+    kernel_grad = feature.T @ total_logits_cotangent
+    bias_grad = jnp.sum(total_logits_cotangent, axis=0)
+    return feature_grad, kernel_grad, bias_grad, None
+
+
+_side_ce_with_per_term_feature_cap.defvjp(
+    _side_ce_with_per_term_feature_cap_fwd,
+    _side_ce_with_per_term_feature_cap_bwd,
+)
+
+
 class MemoryQueryCompressor(nnx.Module):
     """Learned query bank that cross-attends to the 256 layer-8 top-camera slots.
 
@@ -177,9 +246,7 @@ class MemoryQueryCompressor(nnx.Module):
         self.output_proj = linear(rngs=rngs)
         if qk_norm:
             # exp(lambda) = sqrt(head_dim) at init; lambda is learned per head.
-            self.logit_scale = nnx.Param(
-                jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32)
-            )
+            self.logit_scale = nnx.Param(jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32))
 
     def _attention_logits(
         self,
@@ -303,9 +370,7 @@ class MemoryQueryConditioner(nnx.Module):
         if qk_norm:
             # v3.4 plan 5.5: cosine attention with a learned per-head temperature, exactly as
             # in MemoryQueryCompressor.
-            self.logit_scale = nnx.Param(
-                jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32)
-            )
+            self.logit_scale = nnx.Param(jnp.full((num_heads,), 0.5 * math.log(self.head_dim), dtype=jnp.float32))
 
     def __call__(
         self,
@@ -410,6 +475,7 @@ class Pi0(_model.BaseModel):
             self.memory_injection_mode = config.memory_injection_mode
             self.memory_injection_c = config.memory_injection_c
             self.memory_injection_tau = config.memory_injection_tau
+            self.memory_freeze_injection_gate = config.memory_freeze_injection_gate
             self.memory_conditioner_context = config.memory_conditioner_context
             self.memory_blind_tokens = config.memory_blind_tokens
             self.memory_reseed_ce = config.memory_reseed_ce
@@ -421,6 +487,14 @@ class Pi0(_model.BaseModel):
             self.memory_aux_query_space = config.memory_aux_query_space
             self.memory_aux_side_class_ids = tuple(config.memory_aux_side_class_ids)
             self.memory_ladder_probes = config.memory_ladder_probes
+            # v3.5 is entirely opt-in. Keeping these scalar attributes in Python rather than
+            # the NNX state means a legacy checkpoint's parameter tree is unchanged.
+            self.memory_v35_enabled = config.memory_v35_enabled
+            self.memory_write_side_loss_weight = config.memory_write_side_loss_weight
+            self.memory_read_side_loss_weight = config.memory_read_side_loss_weight
+            self.memory_side_feature_cotangent_clip = config.memory_side_feature_cotangent_clip
+            self.memory_num_side_cells = config.memory_num_side_cells
+            self.memory_time_consistent_augmentation = config.memory_time_consistent_augmentation
             # Static per-patch letterbox validity over the top camera's SigLIP grid (plan 5.5).
             # SigLIP So400m/14 at 224x224 -> patch 14, 16x16 grid = the 256 h8_top slots.
             self.top_patch_valid = (
@@ -431,7 +505,8 @@ class Pi0(_model.BaseModel):
             if config.memory_injection_mode == "tanh_rms":
                 # plan 5.6: memory_tokens = tanh(w) * retrieved * c / max(rms, tau); w zero-init
                 # preserves the exact-zero start of the injection.
-                self.memory_inject_w = nnx.Param(jnp.zeros((config.memory.d_value,), dtype=jnp.float32))
+                initial_w = jnp.arctanh(jnp.asarray(config.memory_injection_gate_init, dtype=jnp.float32))
+                self.memory_inject_w = nnx.Param(jnp.full((config.memory.d_value,), initial_w, dtype=jnp.float32))
             if config.memory_blind_tokens:
                 # Learned content-free slot embeddings added to the injected memory tokens.
                 # This is the plan-5.3 pre-registered register-token fallback, merged into the
@@ -441,11 +516,16 @@ class Pi0(_model.BaseModel):
                 # injection gate that overflows the global clip norm to inf and freezes ALL
                 # training. The slot embeddings carry no memory information (frame- and
                 # content-invariant); the content gate's exact-zero start is untouched.
-                # Unit-std init matches the ~unit RMS of embedded prompt tokens.
+                # Zero-init (v36): RMSNorm renormalizes ANY nonzero slot vector to unit RMS,
+                # so a nonzero init at any scale breaks the preregistered step-0 task-health
+                # transparency bound (measured 3.1x flow at scales 1.0 through 0.02; 1.02x at
+                # exact zero). The v3.4 zero-stream gradient explosion this init once guarded
+                # against does not resurface under v3.5's frozen injection gate and cotangent
+                # caps: a full-parameter backward through the exactly-zero stream on the real
+                # v36 step-0 checkpoint is finite at ordinary scale (global norm 33 vs 47
+                # baseline). The embeddings remain trainable and may grow during the pilot.
                 self.memory_slot_embedding = nnx.Param(
-                    jax.random.normal(
-                        rngs.params(), (config.memory_query_tokens, config.memory.d_value), dtype=jnp.float32
-                    )
+                    jnp.zeros((config.memory_query_tokens, config.memory.d_value), dtype=jnp.float32)
                 )
             if config.memory_state_mask_prob > 0:
                 # plan 5.2: learned null embedding substituted for state-digit tokens at the
@@ -471,6 +551,12 @@ class Pi0(_model.BaseModel):
                 # and updates are isolated in train.py.
                 self.ladder_writer_head = nnx.Linear(paligemma_config.width, 2, rngs=rngs)
                 self.ladder_read_head = nnx.Linear(config.memory.d_value, 2, rngs=rngs)
+            if config.memory_v35_enabled:
+                # These heads are live (features are not detached): L_write teaches the value
+                # projection/backbone and L_read teaches the production query/read path. The
+                # detached v3.4 ladder remains diagnostic-only.
+                self.memory_write_side_head = nnx.Linear(config.memory.d_value, 2, rngs=rngs)
+                self.memory_read_side_head = nnx.Linear(config.memory.d_value, 2, rngs=rngs)
             if config.memory_architecture == "v32_layer8_dual_query":
                 self.read_query_compressor = MemoryQueryCompressor(
                     num_queries=config.memory_query_tokens,
@@ -567,6 +653,58 @@ class Pi0(_model.BaseModel):
             return gate * normed
         return gate * retrieved
 
+    def _v35_oracle_injected_content(
+        self,
+        direction: at.Float[at.Array, "b d"],
+        target_rms: float | at.Float[at.Array, " b"],
+        *,
+        num_slots: int,
+    ) -> tuple[at.Float[at.Array, "b q d"], dict[str, at.Array]]:
+        """Pin a direct-carry/prototype direction at an explicit injected RMS in FP32.
+
+        This bypasses memory state and query retrieval by construction.  The caller owns the
+        condition identity: an episode's final-E ``v_bar`` is direct-carry; the frozen
+        requested-side prototype is the correct oracle; the other-side prototype is the donor
+        intervention.  All three use this same numerical path, preventing condition-specific
+        scale confounds. Invalid directions fail closed to zero and are surfaced in telemetry.
+        """
+        direction = jnp.asarray(direction)
+        if direction.ndim != 2 or direction.shape[1] != self.memory.config.d_value:
+            raise ValueError(
+                f"v35_oracle_direction must have shape [batch, {self.memory.config.d_value}], got {direction.shape}."
+            )
+        if not jnp.issubdtype(direction.dtype, jnp.floating):
+            raise TypeError(f"v35_oracle_direction must have floating dtype, got {direction.dtype}.")
+        batch_size, width = direction.shape
+        rms = jnp.asarray(target_rms)
+        if not jnp.issubdtype(rms.dtype, jnp.floating):
+            raise TypeError(f"v35_oracle_injected_rms must have floating dtype, got {rms.dtype}.")
+        if rms.ndim == 0:
+            rms = jnp.broadcast_to(rms, (batch_size,))
+        elif rms.shape != (batch_size,):
+            raise ValueError(
+                f"v35_oracle_injected_rms must be a float scalar or shape [batch] ({batch_size},), got {rms.shape}."
+            )
+
+        direction32 = direction.astype(jnp.float32)
+        rms32 = rms.astype(jnp.float32)
+        finite_direction = jnp.all(jnp.isfinite(direction32), axis=-1)
+        direction_safe = jnp.where(jnp.isfinite(direction32), direction32, jnp.zeros_like(direction32))
+        norm = jnp.linalg.norm(direction_safe, axis=-1)
+        valid = finite_direction & jnp.isfinite(rms32) & (rms32 > 0) & (norm >= jnp.asarray(1e-8, jnp.float32))
+        safe_rms = jnp.where(jnp.isfinite(rms32) & (rms32 > 0), rms32, jnp.zeros_like(rms32))
+        unit = direction_safe / jnp.maximum(norm[:, None], jnp.asarray(1e-8, jnp.float32))
+        vector = unit * (safe_rms * jnp.sqrt(jnp.asarray(width, dtype=jnp.float32)))[:, None]
+        vector = jnp.where(valid[:, None], vector, jnp.zeros_like(vector))
+        content = jnp.broadcast_to(vector[:, None, :], (batch_size, num_slots, width))
+        actual_rms = jnp.sqrt(jnp.mean(jnp.square(content), axis=(1, 2)))
+        return content.astype(jnp.float32), {
+            "v35_oracle_injection_active": jnp.ones((batch_size,), dtype=bool),
+            "v35_oracle_injection_valid": valid,
+            "v35_oracle_target_rms": safe_rms,
+            "v35_oracle_actual_rms": actual_rms.astype(jnp.float32),
+        }
+
     def _v32_top_patch_valid(self, top_token_count: int) -> at.Array | None:
         """The static letterbox validity mask as a device array, or None when not configured."""
         patch_valid = getattr(self, "top_patch_valid", None)
@@ -616,9 +754,7 @@ class Pi0(_model.BaseModel):
         batch, prefix_len = prefix_mask.shape
         num_img = prefix_len - self.max_token_len
         if token_state_mask.shape != (batch, self.max_token_len):
-            raise ValueError(
-                f"token_state_mask must be [batch, {self.max_token_len}]; got {token_state_mask.shape}."
-            )
+            raise ValueError(f"token_state_mask must be [batch, {self.max_token_len}]; got {token_state_mask.shape}.")
         replace = token_state_mask & segment_masked[:, None]
         full = jnp.concatenate([jnp.zeros((batch, num_img), dtype=bool), replace], axis=1)
         null = self.state_null_embedding.value.astype(prefix_tokens.dtype)
@@ -635,6 +771,8 @@ class Pi0(_model.BaseModel):
         zero_read: bool = False,
         gate_value: at.Array | None = None,
         state_token_mask: at.Array | None = None,
+        v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
+        v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
         """Run only blocks 0..memory_layer and materialize the dual-query interface.
 
@@ -647,6 +785,13 @@ class Pi0(_model.BaseModel):
 
         if self.memory_architecture != "v32_layer8_dual_query":
             raise ValueError("the split layer-8 prefix is only defined for v3.2.")
+        oracle_active = v35_oracle_direction is not None or v35_oracle_injected_rms is not None
+        if (v35_oracle_direction is None) != (v35_oracle_injected_rms is None):
+            raise ValueError("v35_oracle_direction and v35_oracle_injected_rms must be provided together.")
+        if oracle_active and not getattr(self, "memory_v35_enabled", False):
+            raise ValueError("oracle injection is available only for memory_v35_enabled models.")
+        if oracle_active and (zero_read or gate_value is not None):
+            raise ValueError("v3.5 oracle injection cannot be combined with zero_read or gate_value.")
         batch, prefix_len = prefix_mask.shape
         mem_len = self.memory_query_tokens
         capacity = prefix_len + mem_len + self.causal_token_len
@@ -697,7 +842,26 @@ class Pi0(_model.BaseModel):
         retrieved = self.memory.read(memory_state, read_queries)
         if zero_read:
             retrieved = jnp.zeros_like(retrieved)
-        memory_content = self._v32_inject_memory(retrieved, gate_value)
+        if oracle_active:
+            injected_content, oracle_aux = self._v35_oracle_injected_content(
+                v35_oracle_direction,
+                v35_oracle_injected_rms,
+                num_slots=mem_len,
+            )
+        else:
+            injected_content = self._v32_inject_memory(retrieved, gate_value).astype(jnp.float32)
+            oracle_aux = {
+                "v35_oracle_injection_active": jnp.zeros((batch,), dtype=bool),
+                "v35_oracle_injection_valid": jnp.zeros((batch,), dtype=bool),
+                "v35_oracle_target_rms": jnp.zeros((batch,), dtype=jnp.float32),
+                "v35_oracle_actual_rms": jnp.zeros((batch,), dtype=jnp.float32),
+            }
+        # Keep both sides of the sole mixed-precision boundary visible. Calibration and raw
+        # retrieval remain FP32; only the token entering the Transformer is cast.
+        injected_pre_cast_rms = jnp.sqrt(jnp.mean(jnp.square(injected_content), axis=(1, 2)))
+        injected_post_cast = injected_content.astype(prefix_tokens.dtype)
+        injected_post_cast_rms = jnp.sqrt(jnp.mean(jnp.square(injected_post_cast.astype(jnp.float32)), axis=(1, 2)))
+        memory_content = injected_content
         slot_embedding = getattr(self, "memory_slot_embedding", None)
         if slot_embedding is not None:
             # Content-free learned slot embeddings (see __init__): they survive zero_read on
@@ -717,6 +881,9 @@ class Pi0(_model.BaseModel):
             "write_queries": write_queries,
             "write_tokens": write_tokens,
             "retrieved": retrieved,
+            "injected_pre_cast_rms": injected_pre_cast_rms,
+            "injected_post_cast_rms": injected_post_cast_rms,
+            **oracle_aux,
             "prefix_mask": prefix_mask,
             "prefix_ar": prefix_ar,
             "capacity": jnp.asarray(capacity, dtype=jnp.int32),
@@ -749,6 +916,8 @@ class Pi0(_model.BaseModel):
         zero_read: bool = False,
         gate_value: at.Array | None = None,
         state_token_mask: at.Array | None = None,
+        v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
+        v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
     ) -> dict[str, at.Array | _gemma.KVCache]:
         """Run blocks 0..8, form q/z, inject 16 reads, then run blocks 9..17 once.
 
@@ -765,6 +934,8 @@ class Pi0(_model.BaseModel):
             zero_read=zero_read,
             gate_value=gate_value,
             state_token_mask=state_token_mask,
+            v35_oracle_direction=v35_oracle_direction,
+            v35_oracle_injected_rms=v35_oracle_injected_rms,
         )
         batch, prefix_len = prefix_mask.shape
         mem_len = self.memory_query_tokens
@@ -2036,6 +2207,302 @@ class Pi0(_model.BaseModel):
                 result[f"subtask_to_camera_{name}_mass"] = jnp.sum(subtask_rows[:, :, start : start + mem_len], axis=-1)
         return result
 
+    def v35_action_memory_attention_step(
+        self,
+        observation: _model.Observation,
+        memory_state: _memory.MemoryState,
+        *,
+        action_noise: at.Float[at.Array, "b ah ad"],
+        forced_subtask_tokens: at.Int[at.Array, "b cl"],
+        forced_subtask_mask: at.Bool[at.Array, "b cl"],
+        zero_read: bool = False,
+        v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
+        v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
+        layer: int | None = None,
+        head: int | None = None,
+    ) -> dict[str, at.Array]:
+        """Measure the actual action-expert attention paid to v3.5 memory tokens.
+
+        This is a read-only, one-flow-evaluation diagnostic.  It executes the production
+        v3.5 split prefix (including calibrated ``tanh_rms`` injection or the shared oracle
+        injection path), teacher-forces the frozen per-frame subtask, and evaluates the action
+        suffix at the first denoising point (``time=1``, so ``x_t=action_noise``).  No action is
+        integrated and no memory transition is applied.
+
+        The returned mass is averaged over heads and the ``action_horizon`` action-token rows
+        at the selected late transformer layer.  ``uniform_baseline`` is derived from the exact
+        layer-wise visibility mask for those same rows, not from a hard-coded token count.
+        Callers must enter :meth:`capture_attention`; without it this method fails closed.
+        """
+
+        if not getattr(self, "memory_v35_enabled", False):
+            raise ValueError("v35_action_memory_attention_step requires a v3.5 model.")
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("v3.5 action-memory attention requires the layer-8 dual-query architecture.")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+        expected_noise = (batch, self.action_horizon, self.action_dim)
+        if action_noise.shape != expected_noise:
+            raise ValueError(f"action_noise must have shape {expected_noise}; got {action_noise.shape}.")
+        expected_causal = (batch, self.causal_token_len)
+        if forced_subtask_tokens.shape != expected_causal or forced_subtask_mask.shape != expected_causal:
+            raise ValueError(
+                "forced subtask buffers must have shape "
+                f"{expected_causal}; got {forced_subtask_tokens.shape} and {forced_subtask_mask.shape}."
+            )
+
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        prefix_len = prefix_mask.shape[1]
+        num_img = prefix_len - self.max_token_len
+        mem_len = self.memory_query_tokens
+        prepared = self._v32_prepare_memory_prefix(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=num_img // len(preprocessed.images),
+            zero_read=zero_read,
+            state_token_mask=preprocessed.token_state_mask,
+            v35_oracle_direction=v35_oracle_direction,
+            v35_oracle_injected_rms=v35_oracle_injected_rms,
+        )
+        cache = prepared["cache"]
+        causal_tokens = forced_subtask_tokens.astype(preprocessed.tokenized_prompt.dtype)
+        causal_mask = forced_subtask_mask.astype(bool)
+        causal_emb = self.PaliGemma.llm(causal_tokens, method="embed")
+        causal_positions = prefix_len + mem_len + jnp.broadcast_to(
+            jnp.arange(self.causal_token_len), expected_causal
+        )
+        (_, _), cache = self.PaliGemma.llm(
+            [causal_emb, None],
+            mask=self._v32_causal_mask(prefix_mask, causal_mask),
+            positions=causal_positions,
+            kv_cache=cache,
+            cache_position=prefix_len + mem_len,
+        )
+
+        flow_time = jnp.ones((batch,), dtype=jnp.float32)
+        suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(
+            preprocessed, action_noise, flow_time
+        )
+        suffix_attention_mask = self._v32_suffix_mask(prefix_mask, causal_mask, suffix_mask, suffix_ar)
+        suffix_positions = (
+            prefix_len
+            + mem_len
+            + self.causal_token_len
+            + jnp.cumsum(suffix_mask, axis=-1)
+            - 1
+        )
+        suffix_pass = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=suffix_attention_mask,
+            positions=suffix_positions,
+            kv_cache=cache,
+            adarms_cond=[None, adarms_cond],
+            return_hidden_states=True,
+        )
+        if len(suffix_pass) != 4:
+            raise RuntimeError("v35_action_memory_attention_step requires the capture_attention() context")
+        attention = suffix_pass[3]
+        depth = attention.shape[0]
+        target_layer = depth - 1 if layer is None else layer
+        if not self.memory_layer < target_layer < depth:
+            raise ValueError(
+                f"action-memory attention layer must be a late layer in ({self.memory_layer}, {depth}); "
+                f"got {target_layer}."
+            )
+        num_heads = attention.shape[2]
+        if head is not None and not 0 <= head < num_heads:
+            raise ValueError(f"head {head} is outside the layer's {num_heads} heads")
+
+        rows = attention[target_layer, :, :, -self.action_horizon :, :]
+        rows = jnp.mean(rows, axis=1) if head is None else rows[:, head]
+        memory_slice = slice(prefix_len, prefix_len + mem_len)
+        per_action_mass = jnp.sum(rows[..., memory_slice], axis=-1)
+
+        visible = suffix_attention_mask[target_layer, :, -self.action_horizon :, :]
+        visible_count = jnp.sum(visible, axis=-1)
+        memory_visible = jnp.sum(visible[..., memory_slice], axis=-1)
+        uniform_per_action = memory_visible / jnp.maximum(visible_count, 1)
+        return {
+            "action_to_memory_mass": jnp.mean(per_action_mass, axis=-1),
+            "action_to_memory_mass_per_action": per_action_mass,
+            "uniform_baseline": jnp.mean(uniform_per_action, axis=-1),
+            "uniform_baseline_per_action": uniform_per_action,
+            "layer": jnp.asarray(target_layer, dtype=jnp.int32),
+            "head": jnp.asarray(-1 if head is None else head, dtype=jnp.int32),
+            "num_heads": jnp.asarray(num_heads, dtype=jnp.int32),
+            "memory_token_count": jnp.asarray(mem_len, dtype=jnp.int32),
+            "v35_injected_pre_cast_rms": prepared["injected_pre_cast_rms"],
+            "v35_injected_post_cast_rms": prepared["injected_post_cast_rms"],
+        }
+
+    def v35_paired_task_health_step(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        memory_state: _memory.MemoryState,
+        *,
+        action_noise: at.Float[at.Array, "b ah ad"],
+        flow_time: at.Float[at.Array, " b"],
+    ) -> dict[str, at.Array]:
+        """Evaluate paired source-path and enabled-v3.5 losses with frozen randomness.
+
+        Both branches use the same model tree, preprocessed observation, causal labels,
+        ground-truth actions, action noise, and flow timestep.  The source branch runs the
+        ordinary prefix followed directly by causal/action tokens; the enabled branch inserts
+        the production v3.5 memory interface and reads ``memory_state``.  Neither branch writes
+        memory, samples augmentation, draws a random number, or mutates parameters.
+
+        This diagnostic intentionally measures the no-RTC-delay flow objective.  The rung
+        protocol freezes that choice together with the frame/noise/time suite so every
+        checkpoint is paired against the identical reference.
+        """
+
+        if not getattr(self, "memory_v35_enabled", False):
+            raise ValueError("v35_paired_task_health_step requires a v3.5 model.")
+        if self.memory_architecture != "v32_layer8_dual_query":
+            raise ValueError("v3.5 paired task health requires the layer-8 dual-query architecture.")
+        preprocessed = _model.preprocess_observation(None, observation, train=False)
+        batch = preprocessed.state.shape[0]
+        expected_actions = (batch, self.action_horizon, self.action_dim)
+        if actions.shape != expected_actions or action_noise.shape != expected_actions:
+            raise ValueError(
+                f"actions and action_noise must both have shape {expected_actions}; "
+                f"got {actions.shape} and {action_noise.shape}."
+            )
+        if flow_time.shape != (batch,):
+            raise ValueError(f"flow_time must have shape ({batch},); got {flow_time.shape}.")
+        if preprocessed.tokenized_causal is None or preprocessed.tokenized_causal_mask is None:
+            raise ValueError("paired task health requires teacher-forced tokenized_causal labels.")
+        causal_tokens = preprocessed.tokenized_causal
+        causal_mask = preprocessed.tokenized_causal_mask.astype(bool)
+        if causal_tokens.shape != (batch, self.causal_token_len) or causal_mask.shape != causal_tokens.shape:
+            raise ValueError("paired task-health causal buffers have the wrong shape.")
+        causal_fast = (
+            jnp.zeros_like(causal_mask)
+            if preprocessed.causal_fast_mask is None
+            else preprocessed.causal_fast_mask.astype(bool)
+        )
+
+        prefix_tokens, prefix_mask, prefix_ar = self.embed_prefix(preprocessed)
+        prefix_len = prefix_mask.shape[1]
+        causal_len = self.causal_token_len
+        causal_emb = self.PaliGemma.llm(causal_tokens, method="embed")
+        x_t = flow_time[:, None, None] * action_noise + (1.0 - flow_time[:, None, None]) * actions
+        target_velocity = action_noise - actions
+
+        def losses_from_cache(
+            *,
+            cache: _gemma.KVCache,
+            final_prefix: at.Array,
+            causal_attention_mask: at.Array,
+            causal_offset: int,
+            suffix_attention_mask: at.Array,
+            suffix_offset: int,
+        ) -> tuple[at.Array, at.Array]:
+            causal_positions = causal_offset + jnp.broadcast_to(jnp.arange(causal_len), causal_tokens.shape)
+            (causal_out, _), causal_cache = self.PaliGemma.llm(
+                [causal_emb, None],
+                mask=causal_attention_mask,
+                positions=causal_positions,
+                kv_cache=cache,
+                cache_position=causal_offset,
+            )
+            ce_hidden = jnp.concatenate(
+                [self._v32_causal_seed(final_prefix, prefix_mask), causal_out[:, :-1]], axis=1
+            )
+            logits = self.PaliGemma.llm(ce_hidden, method="decode").astype(jnp.float32)
+            token_logp = jnp.take_along_axis(
+                jax.nn.log_softmax(logits, axis=-1), causal_tokens[..., None], axis=-1
+            )[..., 0]
+            ce = -jnp.sum(token_logp * causal_mask, axis=-1) / jnp.maximum(jnp.sum(causal_mask, axis=-1), 1)
+
+            suffix_tokens, suffix_mask, suffix_ar, adarms_cond = self.embed_suffix(
+                preprocessed, x_t, flow_time
+            )
+            suffix_positions = suffix_offset + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=suffix_attention_mask(suffix_mask, suffix_ar),
+                positions=suffix_positions,
+                kv_cache=jax.lax.stop_gradient(causal_cache),
+                adarms_cond=[None, adarms_cond],
+            )
+            velocity = self.action_out_proj(suffix_out[:, -self.action_horizon :]).astype(jnp.float32)
+            flow = jnp.mean(jnp.square(velocity - target_velocity.astype(jnp.float32)), axis=(1, 2))
+            return flow, ce
+
+        # Source path: all layers process the ordinary prefix; there is no memory-token block.
+        source_capacity = prefix_len + causal_len
+        source_cache = self._v32_empty_cache(batch, source_capacity, prefix_tokens.dtype)
+        source_prefix_mask = self._pad_attention_columns(make_attn_mask(prefix_mask, prefix_ar), source_capacity)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (source_prefix, _), source_cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=source_prefix_mask,
+            positions=prefix_positions,
+            kv_cache=source_cache,
+            cache_position=0,
+        )
+        source_causal_self = jnp.tril(jnp.ones((causal_len, causal_len), dtype=bool))[None]
+        source_causal_mask = jnp.concatenate(
+            [
+                einops.repeat(prefix_mask, "b p -> b c p", c=causal_len),
+                source_causal_self & causal_mask[:, None, :],
+            ],
+            axis=-1,
+        )
+
+        def source_suffix_mask(suffix_mask, suffix_ar):
+            visible = jnp.concatenate([prefix_mask, causal_mask & ~causal_fast], axis=1)
+            return jnp.concatenate(
+                [einops.repeat(visible, "b p -> b s p", s=suffix_mask.shape[1]), make_attn_mask(suffix_mask, suffix_ar)],
+                axis=-1,
+            )
+
+        source_flow, source_ce = losses_from_cache(
+            cache=source_cache,
+            final_prefix=source_prefix,
+            causal_attention_mask=source_causal_mask,
+            causal_offset=prefix_len,
+            suffix_attention_mask=source_suffix_mask,
+            suffix_offset=prefix_len + causal_len,
+        )
+
+        # Enabled path: the exact calibrated split-prefix/memory-token interface used by
+        # sequence training and deployment, but no post-read transition.
+        top_tokens = (prefix_len - self.max_token_len) // len(preprocessed.images)
+        prepared = self._v32_prepare_memory_prefix(
+            prefix_tokens,
+            prefix_mask,
+            prefix_ar,
+            memory_state,
+            top_token_count=top_tokens,
+            state_token_mask=preprocessed.token_state_mask,
+        )
+        mem_len = self.memory_query_tokens
+
+        def memory_suffix_mask(suffix_mask, suffix_ar):
+            return self._v32_suffix_mask(prefix_mask, causal_mask & ~causal_fast, suffix_mask, suffix_ar)
+
+        memory_flow, memory_ce = losses_from_cache(
+            cache=prepared["cache"],
+            final_prefix=prepared["final_prefix"],
+            causal_attention_mask=self._v32_causal_mask(prefix_mask, causal_mask),
+            causal_offset=prefix_len + mem_len,
+            suffix_attention_mask=memory_suffix_mask,
+            suffix_offset=prefix_len + mem_len + causal_len,
+        )
+        return {
+            "source_flow_loss": source_flow,
+            "source_subtask_ce": source_ce,
+            "memory_flow_loss": memory_flow,
+            "memory_subtask_ce": memory_ce,
+            "v35_injected_pre_cast_rms": prepared["injected_pre_cast_rms"],
+            "v35_injected_post_cast_rms": prepared["injected_post_cast_rms"],
+        }
+
     def prompt_attention_maps(
         self,
         observation: _model.Observation,
@@ -2270,20 +2737,15 @@ class Pi0(_model.BaseModel):
         context_valid_count = jnp.maximum(jnp.sum(context_mask, axis=1) * hidden_width, 1)
         return {
             "h8_all_rms": jnp.sqrt(jnp.mean(jnp.square(h8_all_f32), axis=(1, 2))),
-            "h8_valid_rms": jnp.sqrt(
-                jnp.sum(jnp.square(h8_all_f32) * valid, axis=(1, 2)) / h8_valid_count
-            ),
+            "h8_valid_rms": jnp.sqrt(jnp.sum(jnp.square(h8_all_f32) * valid, axis=(1, 2)) / h8_valid_count),
             "h8_valid_token_count": h8_valid_token_count,
             "h8_image_rms": jnp.sqrt(jnp.mean(jnp.square(h8_all_f32[:, :num_img]), axis=(1, 2))),
             "h8_context_valid_rms": jnp.sqrt(
-                jnp.sum(jnp.square(h8_all_f32[:, num_img:]) * context_valid, axis=(1, 2))
-                / context_valid_count
+                jnp.sum(jnp.square(h8_all_f32[:, num_img:]) * context_valid, axis=(1, 2)) / context_valid_count
             ),
             "h8_top_rms": jnp.sqrt(jnp.mean(jnp.square(h8_top.astype(jnp.float32)), axis=(1, 2))),
             "retrieved_rms": jnp.sqrt(jnp.mean(jnp.square(retrieved.astype(jnp.float32)), axis=(1, 2))),
-            "memory_token_rms": jnp.sqrt(
-                jnp.mean(jnp.square(memory_tokens.astype(jnp.float32)), axis=(1, 2))
-            ),
+            "memory_token_rms": jnp.sqrt(jnp.mean(jnp.square(memory_tokens.astype(jnp.float32)), axis=(1, 2))),
         }
 
     def v32_memory_interface_step(
@@ -2373,9 +2835,7 @@ class Pi0(_model.BaseModel):
             # direct readout of how much the instruction steers the writer.
             conditioned = {
                 "write_queries": prepared["write_queries"],
-                "write_attention_base": self.write_query_compressor.attention_probs(
-                    h8_top, source_valid=source_valid
-                ),
+                "write_attention_base": self.write_query_compressor.attention_probs(h8_top, source_valid=source_valid),
             }
         return {
             "read_attention": self.read_query_compressor.attention_probs(h8_top, source_valid=source_valid),
@@ -2423,9 +2883,7 @@ class Pi0(_model.BaseModel):
         causal_len = observation.tokenized_causal.shape[-1]
         mem_len = self.memory_query_tokens
         gate = (
-            None
-            if gate_override is None
-            else jnp.full((self.memory.config.d_value,), gate_override, dtype=jnp.float32)
+            None if gate_override is None else jnp.full((self.memory.config.d_value,), gate_override, dtype=jnp.float32)
         )
 
         def step_first(x):
@@ -2508,6 +2966,201 @@ class Pi0(_model.BaseModel):
             "step_valid": observation.seq_step_mask,
         }
 
+    @staticmethod
+    def _v35_inference_mask(
+        value: bool | at.Bool[at.Array, " b"] | None,
+        *,
+        batch_size: int,
+        name: str,
+    ) -> at.Bool[at.Array, " b"]:
+        """Normalize one runtime transition mask without accepting accidental broadcasting."""
+        if value is None:
+            return jnp.zeros((batch_size,), dtype=bool)
+        mask = jnp.asarray(value)
+        if mask.dtype != jnp.bool_:
+            raise TypeError(f"{name} must have bool dtype, got {mask.dtype}.")
+        if mask.ndim == 0:
+            return jnp.broadcast_to(mask, (batch_size,))
+        if mask.shape != (batch_size,):
+            raise ValueError(f"{name} must be a bool scalar or shape [batch] ({batch_size},), got {mask.shape}.")
+        return mask
+
+    def _v35_read_geometry(
+        self,
+        memory_state: _memory.MemoryState,
+        read_queries: at.Float[at.Array, "b q d"],
+        retrieved: at.Float[at.Array, "b q dv"],
+        anchor_key: at.Float[at.Array, "b dk"],
+        anchor_value: at.Float[at.Array, "b dv"],
+        delay_steps: int | at.Int[at.Array, " b"],
+    ) -> dict[str, at.Array]:
+        """FP32 D-query alignment against the final eligible-E pooled association.
+
+        ``anchor_value`` is the un-decayed normalized ``v_bar`` from the successful E commit;
+        this helper applies the exact fixed-alpha ``rho**delay_steps`` before comparing the
+        rank-one anchor prediction with the actual 16 raw reads. Negative/degenerate inputs
+        fail closed to zero-valued metrics with ``v35_geometry_valid=False``.
+        """
+        batch_size, num_queries, _ = read_queries.shape
+        anchor_key = jnp.asarray(anchor_key)
+        anchor_value = jnp.asarray(anchor_value)
+        if anchor_key.shape != (batch_size, self.memory.config.d_key):
+            raise ValueError(
+                f"v35_anchor_key must have shape [{batch_size}, {self.memory.config.d_key}], got {anchor_key.shape}."
+            )
+        if anchor_value.shape != (batch_size, self.memory.config.d_value):
+            raise ValueError(
+                "v35_anchor_value must have shape "
+                f"[{batch_size}, {self.memory.config.d_value}], got {anchor_value.shape}."
+            )
+        if not jnp.issubdtype(anchor_key.dtype, jnp.floating) or not jnp.issubdtype(anchor_value.dtype, jnp.floating):
+            raise TypeError("v35 anchor key/value must have floating dtype.")
+        delay = jnp.asarray(delay_steps)
+        if not jnp.issubdtype(delay.dtype, jnp.integer) or delay.dtype == jnp.bool_:
+            raise TypeError(f"v35_anchor_delay_steps must have integer dtype, got {delay.dtype}.")
+        if delay.ndim == 0:
+            delay = jnp.broadcast_to(delay, (batch_size,))
+        elif delay.shape != (batch_size,):
+            raise ValueError(
+                f"v35_anchor_delay_steps must be an integer scalar or shape [batch] ({batch_size},), got {delay.shape}."
+            )
+
+        query_keys = self.memory.project_q(read_queries.astype(jnp.float32))
+        h_query = self.memory.hidden_key(memory_state, query_keys).astype(jnp.float32)
+        h_anchor = self.memory.hidden_key(memory_state, anchor_key.astype(jnp.float32)[:, None, :])[:, 0].astype(
+            jnp.float32
+        )
+        retrieved32 = retrieved.astype(jnp.float32)
+        anchor_value32 = anchor_value.astype(jnp.float32)
+        h_anchor_norm_sq = jnp.sum(jnp.square(h_anchor), axis=-1)
+        h_query_norm = jnp.linalg.norm(h_query, axis=-1)
+        h_anchor_norm = jnp.sqrt(h_anchor_norm_sq)
+        dot = jnp.einsum("bqh,bh->bq", h_query, h_anchor, precision=jax.lax.Precision.HIGHEST)
+        cosine = dot / jnp.maximum(h_query_norm * h_anchor_norm[:, None], jnp.asarray(1e-12, jnp.float32))
+        beta = dot / jnp.maximum(h_anchor_norm_sq[:, None], jnp.asarray(1e-12, jnp.float32))
+
+        delay_valid = delay >= 0
+        safe_delay = jnp.maximum(delay, 0).astype(jnp.float32)
+        rho = jnp.asarray(1.0 - self.memory.config.alpha_step, dtype=jnp.float32)
+        retention = jnp.power(rho, safe_delay)
+        retained_value = retention[:, None] * anchor_value32
+        predicted = beta[..., None] * retained_value[:, None, :]
+        residual = retrieved32 - predicted
+        mean_read = jnp.mean(retrieved32, axis=1)
+        read_slot_norm = jnp.linalg.norm(retrieved32, axis=-1)
+        cancellation_ratio = jnp.linalg.norm(mean_read, axis=-1) / jnp.maximum(
+            jnp.mean(read_slot_norm, axis=-1), jnp.asarray(1e-12, jnp.float32)
+        )
+        beta_mean = jnp.mean(beta, axis=-1)
+        reference_sign = jnp.where(beta_mean >= 0, 1.0, -1.0)
+        sign_consistency = jnp.mean((beta * reference_sign[:, None] > 0).astype(jnp.float32), axis=-1)
+        mean_read_anchor_cosine = jnp.sum(mean_read * anchor_value32, axis=-1) / jnp.maximum(
+            jnp.linalg.norm(mean_read, axis=-1) * jnp.linalg.norm(anchor_value32, axis=-1),
+            jnp.asarray(1e-12, jnp.float32),
+        )
+        residual_rms = jnp.sqrt(jnp.mean(jnp.square(residual), axis=(1, 2)))
+        actual_rms = jnp.sqrt(jnp.mean(jnp.square(retrieved32), axis=(1, 2)))
+        relative_residual = residual_rms / jnp.maximum(actual_rms, jnp.asarray(1e-8, jnp.float32))
+
+        valid = (
+            delay_valid
+            & jnp.all(jnp.isfinite(anchor_key), axis=-1)
+            & jnp.all(jnp.isfinite(anchor_value32), axis=-1)
+            & (jnp.linalg.norm(anchor_key.astype(jnp.float32), axis=-1) >= jnp.asarray(1e-8, jnp.float32))
+            & (jnp.linalg.norm(anchor_value32, axis=-1) >= jnp.asarray(1e-8, jnp.float32))
+            & jnp.isfinite(h_anchor_norm_sq)
+            & (h_anchor_norm_sq >= jnp.asarray(self.memory.config.hidden_norm_sq_floor, jnp.float32))
+            & jnp.all(jnp.isfinite(h_query), axis=(1, 2))
+            & jnp.all(jnp.isfinite(retrieved32), axis=(1, 2))
+        )
+
+        def valid_scalar(value):
+            return jnp.where(valid, value.astype(jnp.float32), jnp.zeros_like(value, dtype=jnp.float32))
+
+        return {
+            "v35_geometry_valid": valid,
+            "v35_query_anchor_cosine": jnp.where(valid[:, None], cosine, jnp.zeros_like(cosine)),
+            "v35_query_anchor_beta": jnp.where(valid[:, None], beta, jnp.zeros_like(beta)),
+            "v35_query_anchor_cosine_mean": valid_scalar(jnp.mean(cosine, axis=-1)),
+            "v35_query_anchor_cosine_max": valid_scalar(jnp.max(cosine, axis=-1)),
+            "v35_query_low_alignment_fraction": valid_scalar(jnp.mean((cosine <= 0.1).astype(jnp.float32), axis=-1)),
+            "v35_query_beta_mean": valid_scalar(beta_mean),
+            "v35_query_beta_abs_mean": valid_scalar(jnp.mean(jnp.abs(beta), axis=-1)),
+            "v35_query_cancellation_ratio": valid_scalar(cancellation_ratio),
+            "v35_query_beta_sign_consistency": valid_scalar(sign_consistency),
+            "v35_mean_raw_read_anchor_cosine": valid_scalar(mean_read_anchor_cosine),
+            "v35_anchor_predicted_read_residual_rms": valid_scalar(residual_rms),
+            "v35_anchor_predicted_read_relative_residual": valid_scalar(relative_residual),
+            "v35_anchor_retention": valid_scalar(retention),
+            "v35_anchor_delay_steps": jnp.where(valid, delay, jnp.zeros_like(delay)),
+            "v35_anchor_hidden_norm_sq": valid_scalar(h_anchor_norm_sq),
+        }
+
+    def _v35_inference_transition(
+        self,
+        memory_state: _memory.MemoryState,
+        write_tokens: at.Float[at.Array, "b n d"],
+        *,
+        transition_valid: bool | at.Bool[at.Array, " b"] | None,
+        write_mask: bool | at.Bool[at.Array, " b"] | None,
+        write_mode: str,
+    ) -> tuple[_memory.MemoryState, dict[str, at.Array]]:
+        """Apply the v3.5 E-only inference transition, fail-closed per batch sample.
+
+        This is the runtime counterpart of the sequence scan's current-frame transition:
+
+        * valid + write mask + ``normal``: eligible-E delta commit (including one decay);
+        * valid without a normal write: one non-E decay;
+        * invalid, omitted masks, or ``frozen``: exact state no-op.
+
+        ``write_mask`` is intentionally not inferred from a predicted subtask or observation.
+        Only the trusted episode/phase controller that produced the training-side
+        ``seq_write_mask`` may assert it.  Consequently, the legacy default
+        ``write_mode='normal'`` is never sufficient to make v3.5 write.
+        """
+        if write_mode not in ("normal", "frozen", "dynamics_only"):
+            raise ValueError(f"unsupported write_mode: {write_mode!r}.")
+        batch_size = write_tokens.shape[0]
+        transition_valid_mask = self._v35_inference_mask(
+            transition_valid, batch_size=batch_size, name="v35_transition_valid"
+        )
+        write_eligible = self._v35_inference_mask(write_mask, batch_size=batch_size, name="v35_write_mask")
+
+        # Functional candidates are safe to evaluate for the whole batch.  The final tree
+        # selection below is authoritative: invalid samples select their original leaves
+        # exactly, including momentum and all hidden fast weights.
+        write_state, candidate_aux = self.memory.write(memory_state, write_tokens)
+        decay_state, _ = self.memory.decay_step(memory_state, write_tokens)
+        transition_applied = transition_valid_mask & (write_mode != "frozen")
+        commit_requested = transition_applied & write_eligible & (write_mode == "normal")
+
+        def select_state(write_leaf, decay_leaf, old_leaf):
+            shape = (batch_size,) + (1,) * (old_leaf.ndim - 1)
+            selected_transition = jnp.where(commit_requested.reshape(shape), write_leaf, decay_leaf)
+            return jnp.where(transition_applied.reshape(shape), selected_transition, old_leaf)
+
+        new_state = jax.tree.map(select_state, write_state, decay_state, memory_state)
+        candidate_commit = candidate_aux.get("commit_applied", jnp.ones((batch_size,), dtype=bool))
+        commit_applied = commit_requested & candidate_commit
+        decay_only = transition_applied & ~commit_applied
+        invalid_write_request = write_eligible & ~transition_valid_mask
+        aux = {
+            **candidate_aux,
+            # Override candidate-only core telemetry with the transition that was actually
+            # selected.  The explicit v35 fields make commit/decay/no-op mutually exclusive.
+            "commit_applied": commit_applied,
+            "write_occurred": commit_applied,
+            "v35_transition_valid": transition_valid_mask,
+            "v35_write_eligible": write_eligible,
+            "v35_transition_applied": transition_applied,
+            "v35_commit_requested": commit_requested,
+            "v35_commit_applied": commit_applied,
+            "v35_decay_only": decay_only,
+            "v35_noop": ~transition_applied,
+            "v35_invalid_write_request": invalid_write_request,
+        }
+        return new_state, aux
+
     def _sample_with_memory_v32(
         self,
         rng: at.KeyArrayLike,
@@ -2523,6 +3176,13 @@ class Pi0(_model.BaseModel):
         forced_subtask_mask: at.Bool[at.Array, "b cl"] | None,
         zero_read: bool,
         write_mode: str,
+        v35_transition_valid: bool | at.Bool[at.Array, " b"] | None,
+        v35_write_mask: bool | at.Bool[at.Array, " b"] | None,
+        v35_oracle_direction: at.Float[at.Array, "b d"] | None,
+        v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None,
+        v35_anchor_key: at.Float[at.Array, "b dk"] | None,
+        v35_anchor_value: at.Float[at.Array, "b dv"] | None,
+        v35_anchor_delay_steps: int | at.Int[at.Array, " b"] | None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """v3.2 inference: layer-8 dual-query read/write with 16 persistent memory tokens.
 
@@ -2530,6 +3190,11 @@ class Pi0(_model.BaseModel):
         "normal" commits the full Titans update, "frozen" returns the input state unchanged
         (M_t = M_{t-1}, S_t = S_{t-1} -- the old ``allow_write=False``), and "dynamics_only"
         applies S_t = eta S_{t-1}, M_t = (1-alpha) M_{t-1} + S_t with the gradient term zeroed.
+
+        In v3.5, ``v35_transition_valid`` and ``v35_write_mask`` additionally gate the current
+        sampled transition.  They mirror sequence-training's valid-step and ``seq_write_mask``
+        fields.  Both default to false (strict no-op), so an inference caller cannot silently
+        write an O/D frame merely by retaining the legacy ``write_mode='normal'`` default.
         """
 
         preprocessed = _model.preprocess_observation(None, observation, train=False)
@@ -2559,18 +3224,51 @@ class Pi0(_model.BaseModel):
             top_token_count=top_tokens,
             zero_read=zero_read,
             state_token_mask=preprocessed.token_state_mask,
+            v35_oracle_direction=v35_oracle_direction,
+            v35_oracle_injected_rms=v35_oracle_injected_rms,
         )
         kv_cache = prepared["cache"]
         final_prefix = prepared["final_prefix"]
         write_tokens = prepared["write_tokens"]
         retrieved = prepared["retrieved"]
+        anchor_inputs = (v35_anchor_key, v35_anchor_value, v35_anchor_delay_steps)
+        if any(value is not None for value in anchor_inputs) and not all(value is not None for value in anchor_inputs):
+            raise ValueError("v35_anchor_key, v35_anchor_value, and v35_anchor_delay_steps must be provided together.")
+        if all(value is not None for value in anchor_inputs):
+            if not getattr(self, "memory_v35_enabled", False):
+                raise ValueError("v3.5 anchor geometry is available only for memory_v35_enabled models.")
+            geometry_aux = self._v35_read_geometry(
+                memory_state,
+                prepared["read_queries"],
+                retrieved,
+                v35_anchor_key,
+                v35_anchor_value,
+                v35_anchor_delay_steps,
+            )
+        else:
+            geometry_aux = {}
 
         def finish(actions, tokens, token_mask, *, extra=None):
-            if write_mode == "dynamics_only":
-                candidate_state, write_aux = self.memory.decay_step(memory_state, write_tokens)
+            if getattr(self, "memory_v35_enabled", False):
+                new_state, write_aux = self._v35_inference_transition(
+                    memory_state,
+                    write_tokens,
+                    transition_valid=v35_transition_valid,
+                    write_mask=v35_write_mask,
+                    write_mode=write_mode,
+                )
             else:
-                candidate_state, write_aux = self.memory.write(memory_state, write_tokens)
-            new_state = memory_state if write_mode == "frozen" else candidate_state
+                # Preserve the v3.2-v3.4 transition path exactly.  In particular, their
+                # historical default remains one normal write per inference call.
+                if write_mode == "dynamics_only":
+                    candidate_state, write_aux = self.memory.decay_step(memory_state, write_tokens)
+                else:
+                    candidate_state, write_aux = self.memory.write(memory_state, write_tokens)
+                new_state = memory_state if write_mode == "frozen" else candidate_state
+                write_aux = {
+                    **write_aux,
+                    "write_occurred": jnp.full((batch,), write_mode == "normal", dtype=bool),
+                }
             aux = {
                 **write_aux,
                 "tokens": tokens,
@@ -2581,7 +3279,13 @@ class Pi0(_model.BaseModel):
                     jnp.mean(jnp.square(prepared["read_queries"].astype(jnp.float32)), axis=(1, 2))
                 ),
                 "write_token_norm": jnp.sqrt(jnp.mean(jnp.square(write_tokens.astype(jnp.float32)), axis=(1, 2))),
-                "write_occurred": jnp.full((batch,), write_mode == "normal", dtype=bool),
+                "v35_injected_pre_cast_rms": prepared["injected_pre_cast_rms"].astype(jnp.float32),
+                "v35_injected_post_cast_rms": prepared["injected_post_cast_rms"].astype(jnp.float32),
+                "v35_oracle_injection_active": prepared["v35_oracle_injection_active"],
+                "v35_oracle_injection_valid": prepared["v35_oracle_injection_valid"],
+                "v35_oracle_target_rms": prepared["v35_oracle_target_rms"],
+                "v35_oracle_actual_rms": prepared["v35_oracle_actual_rms"],
+                **geometry_aux,
             }
             if extra is not None:
                 aux.update(extra)
@@ -2732,6 +3436,13 @@ class Pi0(_model.BaseModel):
         zero_read: bool = False,
         allow_write: bool = True,
         write_mode: str | None = None,
+        v35_transition_valid: bool | at.Bool[at.Array, " b"] | None = None,
+        v35_write_mask: bool | at.Bool[at.Array, " b"] | None = None,
+        v35_oracle_direction: at.Float[at.Array, "b d"] | None = None,
+        v35_oracle_injected_rms: float | at.Float[at.Array, " b"] | None = None,
+        v35_anchor_key: at.Float[at.Array, "b dk"] | None = None,
+        v35_anchor_value: at.Float[at.Array, "b dv"] | None = None,
+        v35_anchor_delay_steps: int | at.Int[at.Array, " b"] | None = None,
     ) -> tuple[_model.Actions, _memory.MemoryState, dict[str, at.Array]]:
         """Memory-conditioned fused inference: one prefill + an incremental memory append.
 
@@ -2756,6 +3467,19 @@ class Pi0(_model.BaseModel):
         control: "normal" (full Titans update), "frozen" (state unchanged; equals
         ``allow_write=False``), "dynamics_only" (gradient term zeroed: S_t = eta S_{t-1},
         M_t = (1-alpha) M_{t-1} + S_t). When None, it is derived from ``allow_write``.
+
+        v3.5 additionally requires explicit per-sample transition masks.  Set
+        ``v35_transition_valid=True`` for a real sampled memory-clock transition, and set
+        ``v35_write_mask=True`` only for a manifest-eligible evidence (E) frame; valid O/D
+        frames pass a false write mask and therefore decay only.  Both masks default to false,
+        making a call with missing phase metadata an exact state no-op.  The masks mirror
+        sequence training's valid-step/``seq_write_mask`` contract and are ignored by v3.4.
+
+        Consumer diagnostics may provide ``v35_oracle_direction`` plus an exact target
+        ``v35_oracle_injected_rms``. This bypasses state/query retrieval and pins direct-carry,
+        correct-prototype, and opposite-donor directions through one shared FP32 path. Passing
+        the final successful-E pooled key/value and its non-write delay additionally reports
+        per-query hidden-key cosine/beta, cancellation, and anchor-predicted read residuals.
         """
         assert self.predict_with_memory, "the model was not built with predict_with_memory"
         assert max_decode_steps <= self.causal_token_len
@@ -2777,7 +3501,25 @@ class Pi0(_model.BaseModel):
                 forced_subtask_mask=forced_subtask_mask,
                 zero_read=zero_read,
                 write_mode=write_mode,
+                v35_transition_valid=v35_transition_valid,
+                v35_write_mask=v35_write_mask,
+                v35_oracle_direction=v35_oracle_direction,
+                v35_oracle_injected_rms=v35_oracle_injected_rms,
+                v35_anchor_key=v35_anchor_key,
+                v35_anchor_value=v35_anchor_value,
+                v35_anchor_delay_steps=v35_anchor_delay_steps,
             )
+        if any(
+            value is not None
+            for value in (
+                v35_oracle_direction,
+                v35_oracle_injected_rms,
+                v35_anchor_key,
+                v35_anchor_value,
+                v35_anchor_delay_steps,
+            )
+        ):
+            raise ValueError("v3.5 oracle/anchor diagnostics require the v3.2 dual-query architecture.")
         if write_mode == "dynamics_only":
             raise ValueError("write_mode='dynamics_only' is only implemented for the v3.2/v3.3/v3.4 interface.")
         # the legacy v3/v3.1 body below branches on allow_write; keep it consistent with an
@@ -3089,6 +3831,21 @@ class Pi0(_model.BaseModel):
             and observation.seq_evidence_mask is not None
             and observation.seq_waiting_mask is not None
         )
+        v35_on = getattr(self, "memory_v35_enabled", False)
+        if v35_on:
+            required = (
+                "seq_write_mask",
+                "seq_decision_mask",
+                "seq_read_state_valid",
+                "seq_read_credit_reachable",
+                "seq_decay_gap_before",
+                "seq_use_pressure_mask",
+                "seq_side_label",
+                "seq_memory_cell",
+            )
+            missing = [name for name in required if getattr(observation, name, None) is None]
+            if missing:
+                raise ValueError(f"v3.5 sequence training is missing required observation fields: {missing}.")
         mask_state = (
             getattr(self, "memory_state_mask_prob", 0.0) > 0
             and observation.seq_state_masked is not None
@@ -3128,10 +3885,17 @@ class Pi0(_model.BaseModel):
         if ladder_on:
             xs["evidence_mask"] = step_first(observation.seq_evidence_mask)
             xs["waiting_mask"] = step_first(observation.seq_waiting_mask)
+        if v35_on:
+            xs["write_mask"] = step_first(observation.seq_write_mask)
+            xs["decision_mask"] = step_first(observation.seq_decision_mask)
+            xs["read_state_valid"] = step_first(observation.seq_read_state_valid)
+            xs["read_credit_reachable"] = step_first(observation.seq_read_credit_reachable)
+            xs["decay_gap_before"] = step_first(observation.seq_decay_gap_before)
+            xs["use_pressure_mask"] = step_first(observation.seq_use_pressure_mask)
 
         # Per-sample (step-invariant) inputs are closed over rather than scanned.
         segment_masked = observation.seq_state_masked if mask_state else None
-        if ladder_on:
+        if ladder_on or v35_on:
             side_label = observation.seq_side_label
             side_ok = (side_label >= 0) & (side_label < 2)
             safe_side = jnp.clip(side_label, 0, 1)
@@ -3160,11 +3924,76 @@ class Pi0(_model.BaseModel):
                     jax.nn.log_softmax(aux_logits_from(self.memory.init_state(b)), axis=-1)
                 )
 
-        def step(state, x):
+        if v35_on:
+
+            def v35_side_outputs(head, feature, active):
+                feature32 = feature.astype(jnp.float32)
+                clip_limit = getattr(self, "memory_side_feature_cotangent_clip", None)
+                activef = active.astype(jnp.float32)
+                if clip_limit is None:
+                    head_logits = head(feature32).astype(jnp.float32)
+                    ce_value = -jnp.take_along_axis(
+                        jax.nn.log_softmax(head_logits, axis=-1), safe_side[:, None], axis=-1
+                    )[:, 0]
+                else:
+                    ce_value, head_logits = _side_ce_with_per_term_feature_cap(
+                        feature32,
+                        head.kernel.value.astype(jnp.float32),
+                        head.bias.value.astype(jnp.float32),
+                        safe_side,
+                        clip_limit,
+                    )
+
+                # This is exactly the unweighted per-term feature gradient that the custom VJP
+                # caps before episode/cell reduction and the 0.3 branch weight are applied.
+                probability_error = jax.nn.softmax(head_logits, axis=-1) - jax.nn.one_hot(
+                    safe_side, 2, dtype=jnp.float32
+                )
+                feature_grad = probability_error @ head.kernel.value.astype(jnp.float32).T
+                feature_grad_norm = jnp.linalg.norm(feature_grad, axis=-1)
+                would_bind = (
+                    jnp.zeros_like(activef)
+                    if clip_limit is None
+                    else (feature_grad_norm > clip_limit).astype(jnp.float32) * activef
+                )
+                return {
+                    "ce": ce_value * activef,
+                    "correct": (jnp.argmax(head_logits, axis=-1) == safe_side).astype(jnp.float32) * activef,
+                    "count": activef,
+                    "logits": head_logits,
+                    "feature_grad_norm": feature_grad_norm * activef,
+                    "feature_clip_would_bind": would_bind,
+                }
+
+        def step(carry, x):
+            if v35_on:
+                state, runtime_state_valid, runtime_credit_reachable = carry
+            else:
+                state = carry
+            boundary_active = x["boundary"] & x["step_valid"] if v35_on else x["boundary"]
             state = jax.tree.map(
-                lambda s: jnp.where(x["boundary"].reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s),
+                lambda s: jnp.where(boundary_active.reshape((b,) + (1,) * (s.ndim - 1)), jax.lax.stop_gradient(s), s),
                 state,
             )
+            if v35_on:
+                runtime_credit_reachable = jnp.where(
+                    boundary_active, jnp.zeros_like(runtime_credit_reachable), runtime_credit_reachable
+                )
+                # Sparse skip-O semantics: omitted write-free transitions happen before the
+                # current read. Invalid/padded gaps fail closed to an exact no-op and are
+                # surfaced below rather than silently changing memory state.
+                raw_gap = x["decay_gap_before"]
+                gap_value_valid = raw_gap >= 0
+                gap_apply = x["step_valid"] & gap_value_valid & (raw_gap > 0)
+                safe_gap = jnp.where(gap_apply, raw_gap, jnp.zeros_like(raw_gap))
+                gap_state, _gap_aux = self.memory.analytic_decay(state, safe_gap)
+                state = jax.tree.map(
+                    lambda decayed, original: jnp.where(
+                        gap_apply.reshape((b,) + (1,) * (decayed.ndim - 1)), decayed, original
+                    ),
+                    gap_state,
+                    state,
+                )
             obs_k = _model.Observation(
                 images=x["images"],
                 image_masks={k: jnp.ones(b, dtype=bool) for k in x["images"]},
@@ -3251,12 +4080,43 @@ class Pi0(_model.BaseModel):
             flow_tokens = jnp.mean(jnp.square(v_t - u_t), axis=-1)
             flow = jnp.mean(_rtc.renormalize_flow_loss(flow_tokens, rtc_loss_mask), axis=-1)
 
-            new_state, write_aux = self.memory.write(state, write_tokens)
             valid = x["step_valid"]
-            state = jax.tree.map(
-                lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
-            )
-            validf = valid.astype(jnp.float32)
+            if v35_on:
+                transition_valid = valid & gap_value_valid
+                write_requested = x["write_mask"] & transition_valid
+                # Both candidates start from the exact state that was read above. In delta
+                # mode decay_step is observation-independent and cheap; write computes the
+                # pooled association needed by L_write even for non-E rows before selection.
+                write_state, write_aux = self.memory.write(state, write_tokens)
+                decay_state, _ = self.memory.decay_step(state, write_tokens)
+
+                def select_transition(write_leaf, decay_leaf, old_leaf):
+                    shape = (b,) + (1,) * (write_leaf.ndim - 1)
+                    valid_leaf = transition_valid.reshape(shape)
+                    write_leaf_mask = write_requested.reshape(shape)
+                    transitioned = jnp.where(write_leaf_mask, write_leaf, decay_leaf)
+                    return jnp.where(valid_leaf, transitioned, old_leaf)
+
+                state = jax.tree.map(select_transition, write_state, decay_state, state)
+                commit_success = write_requested & write_aux["commit_applied"]
+                next_runtime_state_valid = runtime_state_valid | commit_success
+                next_runtime_credit_reachable = runtime_credit_reachable | commit_success
+
+                # D losses are legal only when both the sampler and the actual recurrent
+                # state agree that a successful E commit precedes this read. Reachability is
+                # deliberately telemetry-only and never masks L_read.
+                expected_state_valid = x["read_state_valid"]
+                effective_read_state_valid = expected_state_valid & runtime_state_valid
+                read_active = x["decision_mask"] & transition_valid & effective_read_state_valid & side_ok
+                write_active = write_requested & write_aux["commit_applied"] & side_ok
+                task_valid = transition_valid & ~(x["decision_mask"] & ~effective_read_state_valid)
+                validf = task_valid.astype(jnp.float32)
+            else:
+                new_state, write_aux = self.memory.write(state, write_tokens)
+                state = jax.tree.map(
+                    lambda n, o: jnp.where(valid.reshape((b,) + (1,) * (n.ndim - 1)), n, o), new_state, state
+                )
+                validf = valid.astype(jnp.float32)
             outputs = {
                 "ce": ce * validf,
                 "flow": flow * validf,
@@ -3278,11 +4138,67 @@ class Pi0(_model.BaseModel):
                     0.0,
                 ),
                 "write_clip_severe": jnp.where(
-                    valid,
+                    valid if not v35_on else write_requested,
                     jax.lax.stop_gradient((write_aux["clip_factor"] < 0.2).astype(jnp.float32)),
                     0.0,
                 ),
             }
+
+            if v35_on:
+                write_side = v35_side_outputs(
+                    self.memory_write_side_head,
+                    write_aux["pooled_value"],
+                    write_active,
+                )
+                # This is the production raw read: mean the 16 FP32 retrievals before tanh-rms
+                # pinning or the cast into the Transformer stream.
+                raw_read_feature = jnp.mean(prepared["retrieved"].astype(jnp.float32), axis=1)
+                read_side = v35_side_outputs(self.memory_read_side_head, raw_read_feature, read_active)
+                for prefix, values in (("v35_write", write_side), ("v35_read", read_side)):
+                    for name, value in values.items():
+                        outputs[f"{prefix}_{name}"] = value
+
+                decision_valid = x["decision_mask"] & transition_valid
+                outputs.update(
+                    {
+                        "v35_write_eligible": write_requested.astype(jnp.float32),
+                        "v35_commit_success": commit_success.astype(jnp.float32),
+                        "v35_commit_residual_ratio": jnp.where(
+                            commit_success,
+                            jax.lax.stop_gradient(write_aux["residual_ratio"]),
+                            0.0,
+                        ),
+                        "v35_commit_relative_residual": jnp.where(
+                            commit_success,
+                            jax.lax.stop_gradient(write_aux["relative_commit_residual"]),
+                            0.0,
+                        ),
+                        "v35_degenerate_write": (write_requested & ~write_aux["commit_applied"]).astype(jnp.float32),
+                        "v35_state_invalid_d": (decision_valid & ~effective_read_state_valid).astype(jnp.float32),
+                        "v35_state_valid_mismatch": (
+                            decision_valid & (expected_state_valid != runtime_state_valid)
+                        ).astype(jnp.float32),
+                        "v35_reachable": (read_active & runtime_credit_reachable & x["read_credit_reachable"]).astype(
+                            jnp.float32
+                        ),
+                        "v35_reachable_mismatch": (
+                            read_active & (runtime_credit_reachable != x["read_credit_reachable"])
+                        ).astype(jnp.float32),
+                        "v35_invalid_gap": (valid & ~gap_value_valid).astype(jnp.float32),
+                        "v35_padding_gap": ((~valid) & (raw_gap != 0)).astype(jnp.float32),
+                        "v35_illegal_write_decision_overlap": (
+                            transition_valid & x["write_mask"] & x["decision_mask"]
+                        ).astype(jnp.float32),
+                        "v35_use_pressure": (x["use_pressure_mask"] & read_active).astype(jnp.float32),
+                        "v35_raw_read_rms": jnp.sqrt(jnp.mean(jnp.square(raw_read_feature), axis=-1))
+                        * read_active.astype(jnp.float32),
+                        "v35_injected_pre_cast_rms": prepared["injected_pre_cast_rms"]
+                        * transition_valid.astype(jnp.float32),
+                        "v35_injected_post_cast_rms": prepared["injected_post_cast_rms"]
+                        * transition_valid.astype(jnp.float32),
+                        "v35_transition_valid": transition_valid.astype(jnp.float32),
+                    }
+                )
 
             if quiz:
                 probe_read = self.memory.read(state, read_queries)
@@ -3293,9 +4209,9 @@ class Pi0(_model.BaseModel):
                 probe_logp = jax.nn.log_softmax(probe_logits, axis=-1)
                 actf = x["probe_act"].astype(jnp.float32)
                 outputs["probe_ce"] = -jnp.take_along_axis(probe_logp, x["probe_label"][:, None], axis=-1)[:, 0] * actf
-                outputs["probe_correct"] = (
-                    jnp.argmax(probe_logits, axis=-1) == x["probe_label"]
-                ).astype(jnp.float32) * actf
+                outputs["probe_correct"] = (jnp.argmax(probe_logits, axis=-1) == x["probe_label"]).astype(
+                    jnp.float32
+                ) * actf
                 outputs["probe_act"] = actf
                 outputs["probe_vis"] = x["probe_vis"].astype(jnp.float32)
 
@@ -3328,9 +4244,7 @@ class Pi0(_model.BaseModel):
                 )
                 writer_logits = self.ladder_writer_head(jax.lax.stop_gradient(writer_feats)).astype(jnp.float32)
                 read_feats = jnp.mean(prepared["retrieved"].astype(jnp.float32), axis=1)
-                read_feats = read_feats * jax.lax.rsqrt(
-                    jnp.sum(jnp.square(read_feats), axis=-1, keepdims=True) + 1e-12
-                )
+                read_feats = read_feats * jax.lax.rsqrt(jnp.sum(jnp.square(read_feats), axis=-1, keepdims=True) + 1e-12)
                 read_logits = self.ladder_read_head(jax.lax.stop_gradient(read_feats)).astype(jnp.float32)
                 for name, head_logits, frame_mask in (
                     ("ladder_writer", writer_logits, x["evidence_mask"]),
@@ -3339,14 +4253,20 @@ class Pi0(_model.BaseModel):
                     logp = jax.nn.log_softmax(head_logits, axis=-1)
                     active = (frame_mask & valid & side_ok).astype(jnp.float32)
                     outputs[f"{name}_ce"] = -jnp.take_along_axis(logp, safe_side[:, None], axis=-1)[:, 0] * active
-                    outputs[f"{name}_correct"] = (
-                        jnp.argmax(head_logits, axis=-1) == safe_side
-                    ).astype(jnp.float32) * active
+                    outputs[f"{name}_correct"] = (jnp.argmax(head_logits, axis=-1) == safe_side).astype(
+                        jnp.float32
+                    ) * active
                     outputs[f"{name}_count"] = active
 
+            if v35_on:
+                return (state, next_runtime_state_valid, next_runtime_credit_reachable), outputs
             return state, outputs
 
-        _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), self.memory.init_state(b), xs)
+        initial_state = self.memory.init_state(b)
+        initial_carry = (
+            (initial_state, jnp.zeros((b,), dtype=bool), jnp.zeros((b,), dtype=bool)) if v35_on else initial_state
+        )
+        _, ys = jax.lax.scan(jax.checkpoint(step, prevent_cse=False), initial_carry, xs)
         write_valid_count = jnp.sum(ys["valid"], axis=0)
         n_valid = jnp.clip(write_valid_count, 1)
         losses = {
@@ -3395,6 +4315,57 @@ class Pi0(_model.BaseModel):
                 losses[f"{name}_ce_sum"] = jnp.sum(ys[f"{name}_ce"])
                 losses[f"{name}_correct"] = jnp.sum(ys[f"{name}_correct"])
                 losses[f"{name}_count"] = jnp.sum(ys[f"{name}_count"])
+        if v35_on:
+            num_cells = self.memory_num_side_cells
+            memory_cell = observation.seq_memory_cell
+            cell_ok = (memory_cell >= 0) & (memory_cell < num_cells)
+            safe_cell = jnp.clip(memory_cell, 0, num_cells - 1)
+            cell_onehot = jax.nn.one_hot(safe_cell, num_cells, dtype=jnp.float32)
+
+            for name in ("v35_write", "v35_read"):
+                frame_count = jnp.sum(ys[f"{name}_count"], axis=0)
+                episode_present = (frame_count > 0) & cell_ok
+                episode_presentf = episode_present.astype(jnp.float32)
+                episode_ce = jnp.sum(ys[f"{name}_ce"], axis=0) / jnp.maximum(frame_count, 1.0)
+                mean_logits = jnp.sum(ys[f"{name}_logits"] * ys[f"{name}_count"][..., None], axis=0) / jnp.maximum(
+                    frame_count[:, None], 1.0
+                )
+                episode_correct = (jnp.argmax(mean_logits, axis=-1) == safe_side).astype(jnp.float32) * episode_presentf
+                losses[f"{name}_ce_cell_sum"] = jnp.sum(cell_onehot * (episode_ce * episode_presentf)[:, None], axis=0)
+                losses[f"{name}_episode_count_cell"] = jnp.sum(cell_onehot * episode_presentf[:, None], axis=0)
+                losses[f"{name}_episode_correct_cell"] = jnp.sum(cell_onehot * episode_correct[:, None], axis=0)
+                losses[f"{name}_frame_count"] = jnp.sum(frame_count)
+                losses[f"{name}_feature_grad_norm_sum"] = jnp.sum(ys[f"{name}_feature_grad_norm"])
+                losses[f"{name}_feature_clip_bind_sum"] = jnp.sum(ys[f"{name}_feature_clip_would_bind"])
+
+            commit_count = jnp.sum(ys["v35_commit_success"])
+            read_count = jnp.sum(ys["v35_read_count"])
+            transition_count = jnp.sum(ys["v35_transition_valid"])
+            losses.update(
+                {
+                    "v35_write_eligible_count": jnp.sum(ys["v35_write_eligible"]),
+                    "v35_commit_success_count": commit_count,
+                    "v35_degenerate_write_count": jnp.sum(ys["v35_degenerate_write"]),
+                    "v35_commit_residual_ratio_sum": jnp.sum(ys["v35_commit_residual_ratio"]),
+                    "v35_commit_residual_ratio_max": jnp.max(ys["v35_commit_residual_ratio"]),
+                    "v35_commit_relative_residual_sum": jnp.sum(ys["v35_commit_relative_residual"]),
+                    "v35_commit_relative_residual_max": jnp.max(ys["v35_commit_relative_residual"]),
+                    "v35_state_invalid_d_count": jnp.sum(ys["v35_state_invalid_d"]),
+                    "v35_state_valid_mismatch_count": jnp.sum(ys["v35_state_valid_mismatch"]),
+                    "v35_reachable_count": jnp.sum(ys["v35_reachable"]),
+                    "v35_reachable_mismatch_count": jnp.sum(ys["v35_reachable_mismatch"]),
+                    "v35_read_state_valid_count": read_count,
+                    "v35_invalid_gap_count": jnp.sum(ys["v35_invalid_gap"]),
+                    "v35_padding_gap_count": jnp.sum(ys["v35_padding_gap"]),
+                    "v35_illegal_write_decision_overlap_count": jnp.sum(ys["v35_illegal_write_decision_overlap"]),
+                    "v35_use_pressure_count": jnp.sum(ys["v35_use_pressure"]),
+                    "v35_invalid_cell_count": jnp.sum(~cell_ok),
+                    "v35_raw_read_rms_sum": jnp.sum(ys["v35_raw_read_rms"]),
+                    "v35_injected_pre_cast_rms_sum": jnp.sum(ys["v35_injected_pre_cast_rms"]),
+                    "v35_injected_post_cast_rms_sum": jnp.sum(ys["v35_injected_post_cast_rms"]),
+                    "v35_transition_count": transition_count,
+                }
+            )
         return losses
 
     def _compute_sequence_loss(
@@ -3614,15 +4585,19 @@ class Pi0(_model.BaseModel):
         return losses
 
     def _augment_sequence_images(self, rng: at.KeyArrayLike, images: dict[str, at.Array]) -> dict[str, at.Array]:
-        """Train-time image augmentation for sequence samples: the [b, T] axes are folded and
-        every frame is augmented independently (same transform set as preprocess_observation)."""
+        """Train-time sequence augmentation using the single-frame camera policies.
+
+        Legacy configurations sample every frame independently. v3.5 samples once per
+        sample/camera and reuses those parameters across time so augmentation cannot create a
+        synthetic temporal cue or jitter the evidence-to-decision trajectory.
+        """
         out = {}
         for key, image in images.items():
             b, t = image.shape[:2]
-            flat = image.reshape(b * t, *image.shape[2:]) / 2.0 + 0.5
+            image01 = image / 2.0 + 0.5
             transforms = []
             if "wrist" not in key:
-                height, width = flat.shape[1:3]
+                height, width = image.shape[2:4]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
                     augmax.Resize(width, height),
@@ -3630,6 +4605,20 @@ class Pi0(_model.BaseModel):
                 ]
             transforms += [augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)]
             rng, sub_rng = jax.random.split(rng)
-            flat = jax.vmap(augmax.Chain(*transforms))(jax.random.split(sub_rng, b * t), flat)
-            out[key] = (flat * 2.0 - 1.0).reshape(image.shape)
+            transform = augmax.Chain(*transforms)
+            if getattr(self, "memory_time_consistent_augmentation", False):
+                sample_rngs = jax.random.split(sub_rng, b)
+
+                def augment_sample(sample_rng, sequence, transform=transform):
+                    # A transform is a pure function of (key, image). Broadcasting one key
+                    # over this vmap reuses exactly the same sampled transform over T.
+                    return jax.vmap(lambda frame: transform(sample_rng, frame))(sequence)
+
+                augmented = jax.vmap(augment_sample)(sample_rngs, image01)
+            else:
+                # Preserve the exact legacy random-key geometry when v3.5 is disabled.
+                flat = image01.reshape(b * t, *image.shape[2:])
+                flat = jax.vmap(transform)(jax.random.split(sub_rng, b * t), flat)
+                augmented = flat.reshape(image.shape)
+            out[key] = (augmented * 2.0 - 1.0).astype(image.dtype)
         return out

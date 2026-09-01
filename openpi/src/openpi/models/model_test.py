@@ -92,3 +92,51 @@ def test_model_restore():
 
     actions = model.sample_actions(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_load_reinserts_structural_none_bias_leaves_dropped_by_checkpoint_restore():
+    import dataclasses
+
+    class _NoBiasModel(_model.BaseModel):
+        def __init__(self, rngs: nnx.Rngs):
+            super().__init__(action_dim=1, action_horizon=1, max_token_len=1)
+            self.proj = nnx.Linear(2, 2, use_bias=False, rngs=rngs)
+
+        def compute_loss(self, rng, observation, actions, *, train=False):  # pragma: no cover
+            raise NotImplementedError
+
+        def sample_actions(self, rng, observation):  # pragma: no cover
+            raise NotImplementedError
+
+    @dataclasses.dataclass(frozen=True)
+    class _NoBiasConfig(_model.BaseModelConfig):
+        @property
+        def model_type(self) -> _model.ModelType:
+            return _model.ModelType.PI0
+
+        def create(self, rng) -> _model.BaseModel:
+            return _NoBiasModel(nnx.Rngs(rng))
+
+        def inputs_spec(self, *, batch_size: int = 1):  # pragma: no cover
+            raise NotImplementedError
+
+    config = _NoBiasConfig(action_dim=1, action_horizon=1, max_token_len=1)
+    params = nnx.state(config.create(jax.random.key(0))).to_pure_dict()
+    assert params["proj"]["bias"] is None
+
+    def drop_none_leaves(tree):
+        return {
+            key: drop_none_leaves(value) if isinstance(value, dict) else value
+            for key, value in tree.items()
+            if value is not None
+        }
+
+    restored = drop_none_leaves(params)
+    assert "bias" not in restored["proj"]
+
+    model = config.load(restored)
+    assert model.proj.bias.value is None
+
+    missing_kernel = {"proj": {"bias": None}}
+    with pytest.raises(ValueError, match="different structure"):
+        config.load(missing_kernel, remove_extra_params=False)

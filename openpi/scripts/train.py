@@ -1,9 +1,13 @@
 import dataclasses
 import functools
+import hashlib
+import json
 import logging
 import os
+import pathlib
 import platform
 import re
+import tempfile
 from typing import Any
 
 import etils.epath as epath
@@ -12,6 +16,7 @@ from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
+from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -21,13 +26,63 @@ import wandb
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.shared.project_paths as project_paths
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
+import openpi.training.v35_authorization as _v35_authorization
 import openpi.training.weight_loaders as _weight_loaders
+
+_V35_CHECKPOINT_STEPS_BY_TARGET: dict[int, tuple[int, ...]] = {
+    1_000: (250, 500, 1_000),
+    2_500: (250, 500, 1_000, 2_500),
+    10_000: (250, 500, 1_000, 2_500, 5_000, 10_000),
+}
+_V35_CHECKPOINT_PROVENANCE_FILENAMES = {
+    "calibration": "v35_calibration_artifact.json",
+    "episode_manifest": "v35_episode_manifest.json",
+    "norm_provenance": "v35_norm_stats_provenance.json",
+    "graft_manifest": "v35_initialization_graft_manifest.json",
+    "initialization_identity": "v35_initialization_manifest.json",
+}
+_V35_PILOT_AUTHORIZATION_FILENAME = _v35_authorization.PILOT_AUTHORIZATION_FILENAME
+_V35_CONTINUATION_AUTHORIZATION_FILENAME = _v35_authorization.CONTINUATION_AUTHORIZATION_FILENAME
+_V35_VALIDATED_STORAGE_SEALS: set[tuple[str, str, tuple[tuple[str, int, int], ...]]] = set()
+_V35_RUNTIME_GUARD_NAMES = (
+    "write_eligible_count_mismatch",
+    "commit_count_mismatch",
+    "write_feature_term_count_mismatch",
+    "read_state_valid_count_mismatch",
+    "read_feature_term_count_mismatch",
+    "transition_count_mismatch",
+    "write_episode_cell_count_mismatch",
+    "read_episode_cell_count_mismatch",
+    "degenerate_write",
+    "state_invalid_decision",
+    "state_valid_mismatch",
+    "credit_reachable_mismatch",
+    "invalid_decay_gap",
+    "nonzero_padding_gap",
+    "write_decision_overlap",
+    "invalid_memory_cell",
+    "invalid_side_label",
+    "semantic_control_on_padding",
+)
+
+
+def _configure_v35_runtime_environment(config: _config.TrainConfig) -> None:
+    """Fail closed unless every v3.5 runtime path belongs to this project copy."""
+
+    if not getattr(config.model, "memory_v35_enabled", False):
+        return
+    try:
+        project_paths.configure_v35_runtime_environment()
+        project_paths.validate_executing_openpi_checkout()
+    except project_paths.ProjectRootError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def init_logging():
@@ -49,7 +104,14 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+def init_wandb(
+    config: _config.TrainConfig,
+    *,
+    resuming: bool,
+    log_code: bool = False,
+    enabled: bool = True,
+    allow_new_run_from_bootstrap_zero: bool = False,
+):
     if not enabled:
         wandb.init(mode="disabled")
         return
@@ -57,16 +119,24 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+    wandb_id_path = ckpt_dir / "wandb_id.txt"
+    if resuming and wandb_id_path.is_file():
+        run_id = wandb_id_path.read_text().strip()
+        if not run_id:
+            raise ValueError(f"W&B run ID is empty: {wandb_id_path}")
         wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
+    elif not resuming or allow_new_run_from_bootstrap_zero:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        with wandb_id_path.open("x", encoding="utf-8") as stream:
+            stream.write(str(wandb.run.id))
+            stream.flush()
+            os.fsync(stream.fileno())
+    else:
+        raise FileNotFoundError(f"Resuming checkpoint has no W&B run ID: {wandb_id_path}")
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -81,6 +151,895 @@ def _log_training_identity(config: _config.TrainConfig) -> None:
         config.exp_name,
         getattr(memory_config, "eta_scale", None),
     )
+    if getattr(config.model, "memory_v35_enabled", False):
+        logging.info(
+            "v3.5 semantic_training_config_sha256=%s",
+            _v35_authorization.semantic_training_config_sha256(config),
+        )
+
+
+def _validate_v35_training_ready(config: _config.TrainConfig) -> None:
+    """Refuse a v3.5 optimizer run whose fresh-base/calibration contract is incomplete."""
+    model_config = config.model
+    if not getattr(model_config, "memory_v35_enabled", False):
+        return
+    if not getattr(model_config, "memory_v35_calibrated", False):
+        raise ValueError(
+            "v3.5 training is locked until train-only injection calibration is frozen; set "
+            "memory_v35_calibrated=True, memory_v35_calibration_id, memory_injection_c, and "
+            "memory_injection_tau from the calibration artifact."
+        )
+    official_base = "gs://openpi-assets/checkpoints/pi05_base/params"
+    if not isinstance(config.weight_loader, _weight_loaders.AuditedPartialCheckpointWeightLoader) or (
+        config.weight_loader.params_path != official_base
+    ):
+        raise ValueError(f"v3.5 must use audited shared-parameter initialization from {official_base!r}.")
+    if config.ema_decay is not None:
+        raise ValueError("v3.5 uses raw parameters as primary and requires ema_decay=None.")
+    if not getattr(model_config, "memory_freeze_injection_gate", False):
+        raise ValueError("v3.5 requires the calibrated injection gate to remain frozen.")
+    if not getattr(config.data.base_config, "memory_v35_frozen_population", False):
+        raise ValueError("v3.5 training requires the frozen 70-episode Gate-A population lock.")
+    if config.num_workers != 0:
+        raise ValueError("v3.5 exact continuation requires num_workers=0 so no batch can be prefetched.")
+    if not config.data.base_config.memory_sequence_buckets:
+        raise ValueError("v3.5 exact continuation requires the stateful sequence-bucket sampler.")
+    _load_and_validate_v35_calibration_artifact(config)
+
+
+def _weight_loader_for_run(config: _config.TrainConfig) -> _weight_loaders.WeightLoader:
+    """Bind the audited initialization manifest to this launch's checkpoint directory."""
+    loader = config.weight_loader
+    if isinstance(loader, _weight_loaders.AuditedPartialCheckpointWeightLoader):
+        manifest_path = loader.manifest_output_path
+        if manifest_path is None:
+            manifest_path = str(config.checkpoint_dir / "initialization_graft_manifest.json")
+            loader = dataclasses.replace(loader, manifest_output_path=manifest_path)
+    return loader
+
+
+def _cast_frozen_params(config: _config.TrainConfig, params: nnx.State) -> nnx.State:
+    """Cast ordinary frozen leaves to BF16 while keeping the v3.5 gate exactly FP32."""
+    cast_filter = config.freeze_filter
+    if getattr(config.model, "memory_v35_enabled", False):
+        cast_filter = nnx.All(cast_filter, nnx.Not(MEMORY_INJECT_GATE_FILTER))
+    return nnx_utils.state_map(params, cast_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+
+
+def _validate_v35_initialized_gate(config: _config.TrainConfig, params: nnx.State) -> None:
+    """Fail closed unless the initialized v3.5 injection gate matches calibration exactly."""
+    if not getattr(config.model, "memory_v35_enabled", False):
+        return
+    gate_leaves = params.filter(MEMORY_INJECT_GATE_FILTER).flat_state()
+    if len(gate_leaves) != 1:
+        raise ValueError(f"v3.5 expected exactly one memory_inject_w leaf, found {len(gate_leaves)}.")
+    gate_w = np.asarray(jax.device_get(next(iter(gate_leaves.values())).value))
+    if gate_w.dtype != np.float32:
+        raise ValueError(f"v3.5 memory_inject_w must remain float32, got {gate_w.dtype}.")
+    expected = np.float32(getattr(config.model, "memory_injection_gate_init", 0.5))
+    effective = np.tanh(gate_w.astype(np.float32)).astype(np.float32)
+    if not np.all(np.isfinite(effective)) or not np.allclose(effective, expected, rtol=0.0, atol=1e-6):
+        raise ValueError(
+            "v3.5 memory_inject_w does not match the frozen calibrated gate: "
+            f"expected tanh(w)={expected}, observed range=[{effective.min()}, {effective.max()}]."
+        )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def _calibration_canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _sha256_bytes(contents: bytes) -> str:
+    return hashlib.sha256(contents).hexdigest()
+
+
+def _v35_norm_artifact_paths(config: _config.TrainConfig) -> tuple[pathlib.Path, pathlib.Path]:
+    data_factory = config.data
+    asset_id = data_factory.assets.asset_id or data_factory.repo_id
+    assets_dir = pathlib.Path(data_factory.assets.assets_dir or config.assets_dirs)
+    norm_dir = assets_dir / asset_id
+    return norm_dir / "norm_stats.json", norm_dir / "norm_stats_provenance.json"
+
+
+def _load_self_hashed_json(
+    path: pathlib.Path,
+    *,
+    hash_key: str,
+    description: str,
+) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {description} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must be a JSON object: {path}")
+    recorded_hash = value.get(hash_key)
+    unsigned = {key: item for key, item in value.items() if key != hash_key}
+    actual_hash = _sha256_bytes(_canonical_json(unsigned).encode("utf-8"))
+    if recorded_hash != actual_hash:
+        raise ValueError(f"{description} self-hash is invalid: {path}")
+    return value
+
+
+def _stream_file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_v35_train_storage_seal(
+    config: _config.TrainConfig,
+    provenance: dict[str, Any],
+    *,
+    selected_episode_indices: list[int],
+) -> str | None:
+    """Recompute the train-only storage seal without opening held-out episode media."""
+    if not getattr(config.data.base_config, "memory_v35_frozen_population", False):
+        return None
+    storage = provenance.get("train_storage")
+    if not isinstance(storage, dict):
+        raise ValueError("v3.5 production norm provenance requires a train_storage seal.")
+    if "root" in storage:
+        raise ValueError("v3.5 train_storage must not embed an absolute machine-local root.")
+    if storage.get("root_contract") != "memory_project-relative-v1":
+        raise ValueError("v3.5 train_storage requires the memory-project-relative-v1 root contract.")
+    root_value = storage.get("root_relative")
+    if not isinstance(root_value, str) or not root_value:
+        raise ValueError("v3.5 train_storage.root_relative must be a project-relative dataset directory.")
+    root = project_paths.project_path(root_value)
+    configured_root = pathlib.Path(config.data.base_config.lerobot_dataset_root).expanduser().resolve()
+    if root != configured_root or root != project_paths.project_path(project_paths.V35_DATASET_DIR):
+        raise ValueError(
+            "v3.5 train_storage root does not match the registered project-local dataset: "
+            f"recorded={root}, configured={configured_root}."
+        )
+    if not root.is_dir():
+        raise ValueError(f"v3.5 train_storage dataset directory is missing: {root}.")
+    if storage.get("selected_episode_indices") != selected_episode_indices:
+        raise ValueError("v3.5 train_storage episode selection does not match the frozen train split.")
+    if storage.get("scope") != "selected train episode parquet, optional videos, plus structural meta files":
+        raise ValueError("v3.5 train_storage has the wrong portable storage scope.")
+
+    selected = set(selected_episode_indices)
+    episode_pattern = re.compile(r"episode_(\d{6})\.(?:parquet|mp4)$")
+    files: list[pathlib.Path] = []
+    data_seen: set[int] = set()
+    video_seen: set[int] = set()
+    storage_directories = ["data"]
+    if (root / "videos").is_dir():
+        storage_directories.append("videos")
+    for directory_name in storage_directories:
+        directory = root / directory_name
+        if not directory.is_dir():
+            raise ValueError(f"v3.5 dataset is missing required {directory_name}/ storage under {root}.")
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            match = episode_pattern.search(path.name)
+            if match is None:
+                raise ValueError(f"v3.5 dataset has an unrecognized episode storage filename: {path}.")
+            episode_index = int(match.group(1))
+            if episode_index not in selected:
+                # Deliberately do not open held-out parquet/video content.
+                continue
+            files.append(path)
+            (data_seen if directory_name == "data" else video_seen).add(episode_index)
+    missing_data = sorted(selected - data_seen)
+    missing_video = sorted(selected - video_seen) if "videos" in storage_directories else []
+    if missing_data or missing_video:
+        raise ValueError(
+            "v3.5 train-only storage seal cannot find every selected episode: "
+            f"missing_data={missing_data}, missing_video={missing_video}."
+        )
+    meta = root / "meta"
+    if not meta.is_dir():
+        raise ValueError(f"v3.5 dataset is missing structural meta/ storage under {root}.")
+    files.extend(
+        path for path in meta.rglob("*") if path.is_file() and "v35_training_bundle" not in path.relative_to(meta).parts
+    )
+
+    ordered_paths = sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
+    recorded_records = storage.get("files")
+    if not isinstance(recorded_records, list):
+        raise ValueError("v3.5 train_storage.files must be a file-record list.")
+    aggregate = _sha256_bytes(_canonical_json(recorded_records).encode("utf-8"))
+    if storage.get("sha256") != aggregate:
+        raise ValueError("v3.5 train_storage aggregate SHA256 is invalid.")
+    stat_signature = tuple(
+        (
+            path.relative_to(root).as_posix(),
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in ordered_paths
+    )
+    recorded_paths_and_sizes = [
+        (record.get("path"), record.get("size")) if isinstance(record, dict) else (None, None)
+        for record in recorded_records
+    ]
+    if recorded_paths_and_sizes != [(path, size) for path, size, _ in stat_signature]:
+        raise ValueError("v3.5 train_storage file list/size/SHA256 no longer matches the dataset.")
+    cache_key = (str(root), aggregate, stat_signature)
+    if cache_key in _V35_VALIDATED_STORAGE_SEALS:
+        return aggregate
+    actual_records = [
+        {"path": relative, "size": size, "sha256": _stream_file_sha256(root / relative)}
+        for relative, size, _ in stat_signature
+    ]
+    if recorded_records != actual_records:
+        raise ValueError("v3.5 train_storage file list/size/SHA256 no longer matches the dataset.")
+    _V35_VALIDATED_STORAGE_SEALS.add(cache_key)
+    return aggregate
+
+
+def _v35_recorded_train_storage_sha256(config: _config.TrainConfig) -> str | None:
+    _, provenance_path = _v35_norm_artifact_paths(config)
+    try:
+        provenance = json.loads(provenance_path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read v3.5 norm provenance {provenance_path}: {exc}") from exc
+    storage = provenance.get("train_storage") if isinstance(provenance, dict) else None
+    return storage.get("sha256") if isinstance(storage, dict) else None
+
+
+def _load_and_validate_v35_calibration_artifact(config: _config.TrainConfig) -> dict[str, Any]:
+    """Authenticate the train-only calibration and prove that the launch uses its values."""
+    model_config = config.model
+    artifact_path_value = getattr(model_config, "memory_v35_calibration_path", None)
+    if not artifact_path_value:
+        raise ValueError("v3.5 requires a calibration artifact path.")
+    artifact_path = pathlib.Path(artifact_path_value)
+    if not artifact_path.is_file():
+        raise ValueError(f"v3.5 calibration artifact does not exist: {artifact_path}")
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read v3.5 calibration artifact {artifact_path}: {exc}") from exc
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("payload"), dict):
+        raise ValueError("v3.5 calibration artifact must contain a payload object.")
+    payload = artifact["payload"]
+    digest = hashlib.sha256(_calibration_canonical_json(payload).encode("utf-8")).hexdigest()
+    expected_id = f"sha256:{digest}"
+    if artifact.get("artifact_sha256") != digest or artifact.get("calibration_id") != expected_id:
+        raise ValueError("v3.5 calibration artifact payload hash/ID is invalid.")
+    if getattr(model_config, "memory_v35_calibration_id", None) != expected_id:
+        raise ValueError("v3.5 config calibration ID does not match its artifact.")
+    if payload.get("schema_version") != "openpi.v35.injection-calibration.v1" or payload.get("status") != "pass":
+        raise ValueError("v3.5 calibration artifact has the wrong schema or is not passing.")
+
+    data_config = getattr(config.data, "base_config", None)
+    if data_config is None:
+        raise ValueError("v3.5 requires an explicit base data config for manifest verification.")
+    manifest_sha256 = getattr(data_config, "memory_episode_manifest_sha256", None)
+    if (
+        not isinstance(manifest_sha256, str)
+        or len(manifest_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in manifest_sha256)
+    ):
+        raise ValueError("v3.5 requires the frozen episode manifest SHA256 in its data config.")
+    manifest_path = pathlib.Path(data_config.memory_episode_manifest_path)
+    if not manifest_path.is_file():
+        raise ValueError(f"v3.5 episode manifest does not exist: {manifest_path}")
+    manifest_bytes = manifest_path.read_bytes()
+    if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
+        raise ValueError("v3.5 episode manifest bytes do not match the configured SHA256.")
+    try:
+        manifest = json.loads(manifest_bytes)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"v3.5 episode manifest is invalid JSON: {exc}") from exc
+    episodes = manifest.get("episodes") if isinstance(manifest, dict) else None
+    if not isinstance(episodes, list):
+        raise ValueError("v3.5 episode manifest must contain an episodes list.")
+    train_ids = {
+        str(record.get("stable_id", "")).strip()
+        for record in episodes
+        if isinstance(record, dict) and bool(record.get("include", True)) and record.get("split") == "train"
+    }
+    population = payload.get("population", {})
+    artifact_ids = population.get("stable_ids")
+    if (
+        population.get("split") != "train"
+        or population.get("episode_count") != 54
+        or not isinstance(artifact_ids, list)
+        or len(artifact_ids) != 54
+        or len(set(artifact_ids)) != 54
+        or set(artifact_ids) != train_ids
+    ):
+        raise ValueError("v3.5 calibration membership is not exactly the frozen 54-episode training split.")
+    provenance = payload.get("provenance", {})
+    if provenance.get("split_sha256") != manifest_sha256:
+        raise ValueError("v3.5 calibration split hash does not match the frozen episode manifest.")
+    membership = [{"split": "train", "stable_id": stable_id} for stable_id in artifact_ids]
+    membership_sha256 = hashlib.sha256(_calibration_canonical_json(membership).encode("utf-8")).hexdigest()
+    if provenance.get("observed_membership_sha256") != membership_sha256:
+        raise ValueError("v3.5 calibration membership hash is invalid.")
+
+    dataset_protocol_sha256 = _validate_v35_norm_stats_provenance(
+        config,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+    )
+    if provenance.get("dataset_sha256") != dataset_protocol_sha256:
+        raise ValueError("v3.5 calibration dataset hash does not match train-only norm provenance.")
+
+    parameters = payload.get("parameters", {})
+    if (
+        # The calibration artifact records the FP32 runtime alpha (the memory core computes
+        # decay in float32); compare in that exact precision rather than float64.
+        np.float32(parameters.get("alpha_step", float("nan"))) != np.float32(model_config.memory.alpha_step)
+        or float(parameters.get("memory_injection_c", float("nan"))) != float(model_config.memory_injection_c)
+        or float(parameters.get("memory_injection_tau", float("nan"))) != float(model_config.memory_injection_tau)
+    ):
+        raise ValueError("v3.5 c/tau/alpha config does not exactly match the calibration artifact.")
+    gate = payload.get("gate", {})
+    if (
+        gate.get("target_effective_tanh_gate") != 0.5
+        or gate.get("open_channel_count") != model_config.memory.d_value
+        or not payload.get("gates", {}).get("passes", False)
+        or not payload.get("gates", {}).get("all_episodes_train", False)
+        or not payload.get("gates", {}).get("fixed_effective_gate_is_0_5", False)
+    ):
+        raise ValueError("v3.5 calibration gate/population invariants are not passing.")
+    return artifact
+
+
+def _validate_v35_norm_stats_provenance(
+    config: _config.TrainConfig,
+    *,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> str:
+    """Reject stale/all-episode normalization assets before constructing the data loader."""
+    data_factory = config.data
+    data_config = data_factory.base_config
+    norm_path, provenance_path = _v35_norm_artifact_paths(config)
+    norm_dir = norm_path.parent
+    if not provenance_path.is_file() or not norm_path.is_file():
+        raise ValueError(f"v3.5 requires committed train-only norm stats and provenance in {norm_dir}.")
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read v3.5 norm provenance {provenance_path}: {exc}") from exc
+    episodes = manifest["episodes"]
+    converted_records = [
+        record
+        for record in episodes
+        if isinstance(record, dict) and record.get("episode_index", record.get("lerobot_episode_index")) is not None
+    ]
+    train_records = sorted(
+        (
+            record
+            for record in converted_records
+            if bool(record.get("include", True)) and record.get("split") == "train"
+        ),
+        key=lambda record: int(record.get("episode_index", record.get("lerobot_episode_index"))),
+    )
+    expected_indices = [
+        int(record.get("episode_index", record.get("lerobot_episode_index"))) for record in train_records
+    ]
+    expected_ids = [str(record["stable_id"]).strip() for record in train_records]
+    manifest_info = provenance.get("manifest", {})
+    selection = provenance.get("selection", {})
+    computation = provenance.get("computation", {})
+    norm_info = provenance.get("norm_stats", {})
+    frame_counts = selection.get("selected_episode_frame_counts")
+    expected_manifest_relative = project_paths.project_relative_path(
+        data_config.memory_episode_manifest_path
+    ).as_posix()
+    if (
+        provenance.get("schema_version") != 2
+        or provenance.get("status") != "complete"
+        or provenance.get("repo_id") != data_factory.repo_id
+        or manifest_info.get("sha256") != manifest_sha256
+        or manifest_info.get("path_relative") != expected_manifest_relative
+        or "path" in manifest_info
+        or manifest_info.get("active_split") != "train"
+        or manifest_info.get("split_seed") != data_config.memory_manifest_split_seed
+        or selection.get("dataset_num_episodes") != len(converted_records)
+        or selection.get("selected_num_episodes") != len(expected_ids)
+        or selection.get("selected_episode_indices") != expected_indices
+        or selection.get("selected_stable_ids") != expected_ids
+        or not isinstance(frame_counts, list)
+        or len(frame_counts) != len(expected_ids)
+        or any(not isinstance(count, int) or count <= 0 for count in frame_counts)
+        or selection.get("selected_num_frames") != sum(frame_counts)
+        or not isinstance(selection.get("dataset_episode_frame_protocol_sha256"), str)
+        or len(selection.get("dataset_episode_frame_protocol_sha256")) != 64
+        or any(char not in "0123456789abcdef" for char in selection.get("dataset_episode_frame_protocol_sha256", ""))
+        or computation.get("protocol") != "raw-train-rows-delta-action-horizon-v1"
+        or computation.get("processed_base_rows") != sum(frame_counts)
+        or computation.get("drop_last_rows") != 0
+        or norm_info.get("file") != "norm_stats.json"
+    ):
+        raise ValueError("v3.5 norm provenance does not exactly describe the frozen train-only split.")
+    expected_batches = (sum(frame_counts) + computation.get("requested_batch_size", 0) - 1) // max(
+        computation.get("requested_batch_size", 0), 1
+    )
+    if computation.get("num_batches_including_partial_final_batch") != expected_batches:
+        raise ValueError("v3.5 norm provenance has an inconsistent processed batch count.")
+    if hashlib.sha256(norm_path.read_bytes()).hexdigest() != norm_info.get("sha256"):
+        raise ValueError("v3.5 norm_stats.json bytes do not match their provenance SHA256.")
+    _validate_v35_train_storage_seal(
+        config,
+        provenance,
+        selected_episode_indices=expected_indices,
+    )
+    return selection["dataset_episode_frame_protocol_sha256"]
+
+
+def _write_json_once(path: pathlib.Path, payload: dict[str, Any]) -> None:
+    # The initialization identity is an immutable-stage artifact: consumers
+    # (v35_prepare_pilot's _load_immutable_json) accept only canonical compact sorted
+    # JSON with exactly one trailing newline, so the producer must emit those bytes.
+    serialized = _canonical_json(payload) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text(encoding="utf-8") == serialized:
+            return
+        raise FileExistsError(f"refusing to overwrite a different initialization identity: {path}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _write_v35_initialization_identity(config: _config.TrainConfig, params: nnx.State) -> pathlib.Path | None:
+    """Bind official source provenance and the actual post-cast step-0 tree to this run."""
+    if not getattr(config.model, "memory_v35_enabled", False):
+        return None
+    checkpoint_dir = pathlib.Path(config.checkpoint_dir)
+    graft_path = checkpoint_dir / "initialization_graft_manifest.json"
+    if not graft_path.is_file():
+        raise FileNotFoundError(f"v3.5 audited loader did not produce its graft manifest: {graft_path}")
+    graft = _load_self_hashed_json(
+        graft_path,
+        hash_key="manifest_sha256",
+        description="v3.5 graft manifest",
+    )
+    recorded_graft_hash = graft["manifest_sha256"]
+
+    gate_leaf = next(iter(params.filter(MEMORY_INJECT_GATE_FILTER).flat_state().values()))
+    raw_gate = np.asarray(jax.device_get(gate_leaf.value), dtype=np.float32)
+    effective_gate = np.tanh(raw_gate)
+    actual_step0_hash = _weight_loaders.parameter_tree_sha256(params.to_pure_dict())
+    calibration = _load_and_validate_v35_calibration_artifact(config)
+    calibration_payload = calibration["payload"]
+    if calibration_payload["provenance"].get("source_sha256") != actual_step0_hash:
+        raise ValueError("v3.5 calibration was not produced from this exact fresh step-0 parameter tree.")
+    raw_gate_hash = hashlib.sha256(raw_gate.tobytes(order="C")).hexdigest()
+    if calibration_payload["gate"].get("raw_w_sha256") != raw_gate_hash:
+        raise ValueError("v3.5 calibration raw gate hash does not match initialized memory_inject_w.")
+    semantic_config_sha256 = _v35_authorization.semantic_training_config_sha256(config)
+    run_id_sha256 = _v35_authorization.run_id_sha256(
+        config_name=config.name,
+        experiment_name=config.exp_name,
+        initialization_seed=config.seed,
+        initialization_parameter_tree_sha256=actual_step0_hash,
+        calibration_artifact_id=calibration["calibration_id"],
+        semantic_config_sha256=semantic_config_sha256,
+    )
+
+    calibration_path = pathlib.Path(config.model.memory_v35_calibration_path)
+    episode_manifest_path = pathlib.Path(config.data.base_config.memory_episode_manifest_path)
+    norm_stats_path, norm_provenance_path = _v35_norm_artifact_paths(config)
+    payload: dict[str, Any] = {
+        "format_version": 2,
+        "config_name": config.name,
+        "experiment_name": config.exp_name,
+        "official_source_uri": config.weight_loader.params_path,
+        "initialization_seed": config.seed,
+        "graft_manifest_file": graft_path.name,
+        "graft_manifest_sha256": recorded_graft_hash,
+        "source_tree_sha256": graft["tree_hashes"]["source_sha256"],
+        "target_schema_sha256": graft["tree_hashes"]["target_schema_sha256"],
+        "actual_step0_parameter_tree_sha256": actual_step0_hash,
+        "calibration_id": calibration["calibration_id"],
+        "run_id_sha256": run_id_sha256,
+        "semantic_training_config_sha256": semantic_config_sha256,
+        "step0_checkpoint": 0,
+        "memory_inject_w_dtype": str(np.asarray(jax.device_get(gate_leaf.value)).dtype),
+        "memory_inject_w_sha256": raw_gate_hash,
+        "effective_gate_min": float(np.min(effective_gate)),
+        "effective_gate_max": float(np.max(effective_gate)),
+        "memory_calibration": {
+            # Record the FP32 runtime alpha so plain-equality checks against the
+            # calibration artifact's fp32-recorded value hold exactly.
+            "alpha_step": float(np.float32(config.model.memory.alpha_step)),
+            "memory_injection_c": float(config.model.memory_injection_c),
+            "memory_injection_tau": float(config.model.memory_injection_tau),
+        },
+        "artifact_hashes": {
+            "calibration_artifact_sha256": _sha256_bytes(calibration_path.read_bytes()),
+            "episode_manifest_sha256": _sha256_bytes(episode_manifest_path.read_bytes()),
+            "norm_stats_provenance_sha256": _sha256_bytes(norm_provenance_path.read_bytes()),
+            "norm_stats_sha256": _sha256_bytes(norm_stats_path.read_bytes()),
+            "train_storage_sha256": _v35_recorded_train_storage_sha256(config),
+            "initialization_graft_manifest_file_sha256": _sha256_bytes(graft_path.read_bytes()),
+            "initialization_graft_manifest_self_sha256": recorded_graft_hash,
+        },
+        "checkpoint_protocol": {
+            "allowed_continuation_targets": sorted(_V35_CHECKPOINT_STEPS_BY_TARGET),
+            "checkpoint_steps_by_target": {
+                str(target): list(steps) for target, steps in _V35_CHECKPOINT_STEPS_BY_TARGET.items()
+            },
+            "keep_period": 250,
+            "step_labels": "completed_optimizer_updates",
+        },
+    }
+    payload["identity_sha256"] = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+    identity_path = checkpoint_dir / "initialization_manifest.json"
+    _write_json_once(identity_path, payload)
+    return identity_path
+
+
+def _validate_v35_checkpoint_protocol(
+    config: _config.TrainConfig,
+    *,
+    resuming: bool,
+    latest_step: int | None = None,
+) -> None:
+    """Enforce the preregistered pilot/extension/full-budget rung schedule."""
+    if not getattr(config.model, "memory_v35_enabled", False):
+        return
+    target = config.num_train_steps
+    expected_steps = _V35_CHECKPOINT_STEPS_BY_TARGET.get(target)
+    if expected_steps is None:
+        raise ValueError(
+            "v3.5 num_train_steps must be one of the frozen continuation targets "
+            f"{tuple(_V35_CHECKPOINT_STEPS_BY_TARGET)}; got {target}."
+        )
+    if not config.checkpoint_by_completed_updates or tuple(config.checkpoint_steps) != expected_steps:
+        raise ValueError(
+            f"v3.5 target {target} requires exact completed-update checkpoint_steps={expected_steps}; "
+            f"got {tuple(config.checkpoint_steps)}."
+        )
+    if config.keep_period != 250:
+        raise ValueError("v3.5 requires keep_period=250 so every frozen rung remains retained.")
+    if not resuming:
+        if target != 1_000:
+            raise ValueError("a fresh v3.5 run must execute the frozen 1,000-update pilot first.")
+        return
+    if latest_step is None:
+        raise ValueError("v3.5 resume validation requires the latest checkpoint step.")
+    allowed_resume_sources = {
+        # A live checkpoint's own metadata cannot authorize its mutable params/optimizer.
+        # Resume only externally sealed source rungs named by the launch authorization.
+        1_000: (0,),
+        2_500: (1_000,),
+        10_000: (1_000, 2_500),
+    }[target]
+    if latest_step not in allowed_resume_sources:
+        raise ValueError(
+            f"v3.5 target {target} may resume only from authorization-linked source rungs "
+            f"{allowed_resume_sources}; latest checkpoint is {latest_step}. Intermediate crash resumes "
+            "require separately sealed external rung/hash evidence."
+        )
+
+
+def _v35_provenance_source_paths(
+    config: _config.TrainConfig,
+    identity_path: pathlib.Path,
+) -> dict[str, pathlib.Path]:
+    _, norm_provenance_path = _v35_norm_artifact_paths(config)
+    sources = {
+        _V35_CHECKPOINT_PROVENANCE_FILENAMES["calibration"]: pathlib.Path(config.model.memory_v35_calibration_path),
+        _V35_CHECKPOINT_PROVENANCE_FILENAMES["episode_manifest"]: pathlib.Path(
+            config.data.base_config.memory_episode_manifest_path
+        ),
+        _V35_CHECKPOINT_PROVENANCE_FILENAMES["norm_provenance"]: norm_provenance_path,
+        _V35_CHECKPOINT_PROVENANCE_FILENAMES["graft_manifest"]: pathlib.Path(config.checkpoint_dir)
+        / "initialization_graft_manifest.json",
+        _V35_CHECKPOINT_PROVENANCE_FILENAMES["initialization_identity"]: identity_path,
+    }
+    if config.v35_pilot_authorization_path is not None:
+        sources[_V35_PILOT_AUTHORIZATION_FILENAME] = project_paths.project_path(config.v35_pilot_authorization_path)
+    return sources
+
+
+def _validate_v35_root_identity(
+    config: _config.TrainConfig,
+    identity_path: pathlib.Path,
+) -> dict[str, Any]:
+    """Authenticate the immutable root identity against this launch and its current artifacts."""
+    if not identity_path.is_file():
+        raise FileNotFoundError(f"v3.5 initialization identity is missing: {identity_path}")
+    identity = _load_self_hashed_json(
+        identity_path,
+        hash_key="identity_sha256",
+        description="v3.5 initialization identity",
+    )
+    expected_protocol = {
+        "allowed_continuation_targets": sorted(_V35_CHECKPOINT_STEPS_BY_TARGET),
+        "checkpoint_steps_by_target": {
+            str(target): list(steps) for target, steps in _V35_CHECKPOINT_STEPS_BY_TARGET.items()
+        },
+        "keep_period": 250,
+        "step_labels": "completed_optimizer_updates",
+    }
+    expected_memory_calibration = {
+        "alpha_step": float(np.float32(config.model.memory.alpha_step)),
+        "memory_injection_c": float(config.model.memory_injection_c),
+        "memory_injection_tau": float(config.model.memory_injection_tau),
+    }
+    expected_semantic_config_sha256 = _v35_authorization.semantic_training_config_sha256(config)
+    calibration = _load_and_validate_v35_calibration_artifact(config)
+    graft_path = pathlib.Path(config.checkpoint_dir) / "initialization_graft_manifest.json"
+    graft = _load_self_hashed_json(
+        graft_path,
+        hash_key="manifest_sha256",
+        description="v3.5 graft manifest",
+    )
+    calibration_path = pathlib.Path(config.model.memory_v35_calibration_path)
+    episode_manifest_path = pathlib.Path(config.data.base_config.memory_episode_manifest_path)
+    norm_stats_path, norm_provenance_path = _v35_norm_artifact_paths(config)
+    expected_artifact_hashes = {
+        "calibration_artifact_sha256": _sha256_bytes(calibration_path.read_bytes()),
+        "episode_manifest_sha256": _sha256_bytes(episode_manifest_path.read_bytes()),
+        "norm_stats_provenance_sha256": _sha256_bytes(norm_provenance_path.read_bytes()),
+        "norm_stats_sha256": _sha256_bytes(norm_stats_path.read_bytes()),
+        "train_storage_sha256": _v35_recorded_train_storage_sha256(config),
+        "initialization_graft_manifest_file_sha256": _sha256_bytes(graft_path.read_bytes()),
+        "initialization_graft_manifest_self_sha256": graft["manifest_sha256"],
+    }
+    expected_run_id_sha256 = _v35_authorization.run_id_sha256(
+        config_name=config.name,
+        experiment_name=config.exp_name,
+        initialization_seed=config.seed,
+        initialization_parameter_tree_sha256=identity.get("actual_step0_parameter_tree_sha256"),
+        calibration_artifact_id=calibration["calibration_id"],
+        semantic_config_sha256=expected_semantic_config_sha256,
+    )
+    if (
+        identity.get("format_version") != 2
+        or identity.get("config_name") != config.name
+        or identity.get("experiment_name") != config.exp_name
+        or identity.get("official_source_uri") != config.weight_loader.params_path
+        or identity.get("initialization_seed") != config.seed
+        or identity.get("calibration_id") != calibration["calibration_id"]
+        or identity.get("run_id_sha256") != expected_run_id_sha256
+        or identity.get("semantic_training_config_sha256") != expected_semantic_config_sha256
+        or identity.get("memory_calibration") != expected_memory_calibration
+        or identity.get("artifact_hashes") != expected_artifact_hashes
+        or identity.get("checkpoint_protocol") != expected_protocol
+    ):
+        raise ValueError("v3.5 root initialization identity does not match the current config/artifacts.")
+    return identity
+
+
+def _snapshot_v35_checkpoint_provenance(
+    config: _config.TrainConfig,
+    identity_path: pathlib.Path,
+) -> dict[str, bytes]:
+    """Return the authenticated immutable byte payload copied into every checkpoint."""
+    _validate_v35_root_identity(config, identity_path)
+    sources = _v35_provenance_source_paths(config, identity_path)
+    try:
+        return {name: path.read_bytes() for name, path in sources.items()}
+    except OSError as exc:
+        raise ValueError(f"cannot snapshot v3.5 checkpoint provenance: {exc}") from exc
+
+
+def _validate_v35_resume_checkpoint_assets(
+    config: _config.TrainConfig,
+    *,
+    checkpoint_step: int,
+    identity_path: pathlib.Path,
+) -> dict[str, bytes]:
+    """Require the latest checkpoint to embed byte-identical launch provenance."""
+    expected = _snapshot_v35_checkpoint_provenance(config, identity_path)
+    # Checkpoint 0 is finalized before Gate A/B/C can consume it and before their reducer can
+    # issue the pilot authorization.  The authorization is therefore authenticated externally
+    # when training resumes from 0, then included in the returned snapshot so checkpoint 250+
+    # embeds it.  Every other rung must already contain it byte-for-byte.
+    embedded_expected = dict(expected)
+    if checkpoint_step == 0:
+        embedded_expected.pop(_V35_PILOT_AUTHORIZATION_FILENAME, None)
+    assets_dir = pathlib.Path(config.checkpoint_dir) / str(checkpoint_step) / "assets"
+    if checkpoint_step == 0:
+        optional_pilot = assets_dir / _V35_PILOT_AUTHORIZATION_FILENAME
+        external_pilot = expected.get(_V35_PILOT_AUTHORIZATION_FILENAME)
+        if optional_pilot.is_file() and (
+            external_pilot is None or optional_pilot.read_bytes() != external_pilot
+        ):
+            raise ValueError("v3.5 checkpoint 0 embeds a pilot authorization different from the validated external one.")
+    for name, expected_bytes in embedded_expected.items():
+        embedded_path = assets_dir / name
+        if not embedded_path.is_file():
+            raise FileNotFoundError(f"v3.5 checkpoint {checkpoint_step} is missing embedded provenance asset {name}.")
+        if embedded_path.read_bytes() != expected_bytes:
+            raise ValueError(
+                f"v3.5 checkpoint {checkpoint_step} provenance asset {name} is not byte-identical "
+                "to the authenticated run root."
+            )
+    return expected
+
+
+def _step_labels_and_save_decision(
+    config: _config.TrainConfig, *, loop_step: int, start_step: int
+) -> tuple[int, bool, int]:
+    """Return metric label, save decision, and checkpoint label for one completed update."""
+    completed_step = loop_step + 1
+    if config.checkpoint_by_completed_updates:
+        should_save = (
+            completed_step in config.checkpoint_steps
+            if config.checkpoint_steps
+            else completed_step % config.save_interval == 0 or completed_step == config.num_train_steps
+        )
+        return completed_step, should_save, completed_step
+    should_save = (loop_step % config.save_interval == 0 and loop_step > start_step) or (
+        loop_step == config.num_train_steps - 1
+    )
+    return loop_step, should_save, loop_step
+
+
+_V35_CUMULATIVE_TELEMETRY_SCHEMA_VERSION = 1
+_V35_CUMULATIVE_COUNT_KEYS = (
+    "accepted_update_count",
+    "finite_accepted_update_count",
+    "pre_shared_severe_clip_count",
+    "pre_shared_update_count",
+    "write_feature_cap_bind_numerator",
+    "write_feature_cap_bind_denominator",
+    "read_feature_cap_bind_numerator",
+    "read_feature_cap_bind_denominator",
+)
+
+
+def _new_v35_cumulative_telemetry() -> dict[str, int | float]:
+    return {
+        "schema_version": _V35_CUMULATIVE_TELEMETRY_SCHEMA_VERSION,
+        **dict.fromkeys(_V35_CUMULATIVE_COUNT_KEYS, 0),
+        "pre_shared_grad_norm_max": 0.0,
+    }
+
+
+def _validate_v35_cumulative_telemetry(telemetry: dict[str, Any], *, completed_updates: int) -> dict[str, int | float]:
+    expected_keys = {
+        "schema_version",
+        *_V35_CUMULATIVE_COUNT_KEYS,
+        "pre_shared_grad_norm_max",
+    }
+    if not isinstance(telemetry, dict) or set(telemetry) != expected_keys:
+        raise ValueError("v3.5 cumulative telemetry has an invalid schema.")
+    if telemetry["schema_version"] != _V35_CUMULATIVE_TELEMETRY_SCHEMA_VERSION:
+        raise ValueError("v3.5 cumulative telemetry has an unsupported schema version.")
+    for key in _V35_CUMULATIVE_COUNT_KEYS:
+        value = telemetry[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"v3.5 cumulative telemetry {key} must be a nonnegative integer.")
+    grad_norm_max = telemetry["pre_shared_grad_norm_max"]
+    if not isinstance(grad_norm_max, int | float) or not np.isfinite(grad_norm_max) or grad_norm_max < 0:
+        raise ValueError("v3.5 cumulative pre_shared_grad_norm_max must be finite and nonnegative.")
+    for numerator, denominator in (
+        ("pre_shared_severe_clip_count", "pre_shared_update_count"),
+        ("write_feature_cap_bind_numerator", "write_feature_cap_bind_denominator"),
+        ("read_feature_cap_bind_numerator", "read_feature_cap_bind_denominator"),
+    ):
+        if telemetry[numerator] > telemetry[denominator]:
+            raise ValueError(f"v3.5 cumulative telemetry {numerator} exceeds {denominator}.")
+    for key in ("accepted_update_count", "finite_accepted_update_count", "pre_shared_update_count"):
+        if telemetry[key] != completed_updates:
+            raise ValueError(
+                f"v3.5 cumulative telemetry {key}={telemetry[key]} does not match "
+                f"completed updates {completed_updates}."
+            )
+    return telemetry
+
+
+def _restore_and_validate_v35_authorized_source_checkpoint(
+    config: _config.TrainConfig,
+    *,
+    checkpoint_manager: Any,
+    checkpoint_step: int,
+    state_shape: training_utils.TrainState,
+    data_loader: _data_loader.DataLoader,
+    source_authorization: _v35_authorization.AuthorizationRecord,
+) -> tuple[training_utils.TrainState, dict[str, Any], str]:
+    """Restore and externally authenticate every mutable component of a v3.5 source rung."""
+
+    train_state = _checkpoints.restore_state(
+        checkpoint_manager,
+        state_shape,
+        data_loader,
+        step=checkpoint_step,
+    )
+    jax.block_until_ready(train_state)
+    if int(train_state.step) != checkpoint_step:
+        raise ValueError(
+            "v3.5 restored optimizer-update count does not match its checkpoint label: "
+            f"state.step={int(train_state.step)}, checkpoint={checkpoint_step}."
+        )
+    cumulative_telemetry = _checkpoints.restore_v35_runtime_state(
+        config.checkpoint_dir,
+        checkpoint_step,
+        data_loader,
+    )
+    _validate_v35_cumulative_telemetry(cumulative_telemetry, completed_updates=checkpoint_step)
+    _validate_v35_initialized_gate(config, train_state.params)
+
+    step_dir = pathlib.Path(config.checkpoint_dir) / str(checkpoint_step)
+    assets_dir = step_dir / "assets"
+    parameter_tree_sha256 = _weight_loaders.parameter_tree_sha256(train_state.params.to_pure_dict())
+    try:
+        runtime_hashes = {
+            "runtime_identity_sha256": _sha256_bytes(
+                (assets_dir / _checkpoints.V35_RUNTIME_IDENTITY_FILENAME).read_bytes()
+            ),
+            "cumulative_telemetry_sha256": _sha256_bytes(
+                (assets_dir / _checkpoints.V35_CUMULATIVE_TELEMETRY_FILENAME).read_bytes()
+            ),
+            "data_iterator_state_sha256": _sha256_bytes(
+                (assets_dir / _checkpoints.V35_DATA_ITERATOR_STATE_FILENAME).read_bytes()
+            ),
+        }
+    except OSError as exc:
+        raise ValueError(f"cannot hash restored v3.5 runtime assets: {exc}") from exc
+    optimizer_state_sha256 = _checkpoints.v35_checkpoint_component_tree_sha256(step_dir / "train_state")
+    _v35_authorization.validate_live_source_checkpoint_binding(
+        source_authorization,
+        completed_updates=checkpoint_step,
+        parameter_tree_sha256=parameter_tree_sha256,
+        optimizer_state_sha256=optimizer_state_sha256,
+        **runtime_hashes,
+    )
+    return train_state, cumulative_telemetry, parameter_tree_sha256
+
+
+def _v35_integer_metric(info: dict[str, at.Array], key: str) -> int:
+    if key not in info:
+        raise ValueError(f"accepted v3.5 update is missing cumulative telemetry metric {key}.")
+    value = float(np.sum(np.asarray(jax.device_get(info[key]), dtype=np.float64)))
+    rounded = round(value)
+    if not np.isfinite(value) or value < 0 or not np.isclose(value, rounded, rtol=0.0, atol=1e-5):
+        raise ValueError(f"accepted v3.5 update has invalid count metric {key}={value}.")
+    return int(rounded)
+
+
+def _accumulate_v35_cumulative_telemetry(
+    telemetry: dict[str, int | float],
+    info: dict[str, at.Array],
+    *,
+    completed_updates: int,
+) -> None:
+    """Commit host Gate-D counters only after checkify accepted the optimizer update."""
+    update_count = _v35_integer_metric(info, "diagnostic/v35_pre_shared_clip_update_count")
+    if update_count != 1:
+        raise ValueError(f"each accepted v3.5 optimizer update must report update_count=1, got {update_count}.")
+    severe = _v35_integer_metric(info, "diagnostic/v35_pre_shared_clip_severe_count")
+    write_bind = _v35_integer_metric(info, "diagnostic/v35_write_feature_clip_bind_sum")
+    write_terms = _v35_integer_metric(info, "diagnostic/v35_write_feature_term_count")
+    read_bind = _v35_integer_metric(info, "diagnostic/v35_read_feature_clip_bind_sum")
+    read_terms = _v35_integer_metric(info, "diagnostic/v35_read_feature_term_count")
+    grad_norm_max = float(
+        np.max(np.asarray(jax.device_get(info["diagnostic/v35_pre_shared_clip_grad_norm_max"]), dtype=np.float64))
+    )
+    if not np.isfinite(grad_norm_max) or grad_norm_max < 0:
+        raise ValueError("accepted v3.5 update has non-finite pre-shared gradient norm telemetry.")
+
+    telemetry["accepted_update_count"] += 1
+    # The update reaches this point only after the checkified finite/runtime guard accepted it.
+    telemetry["finite_accepted_update_count"] += 1
+    telemetry["pre_shared_severe_clip_count"] += severe
+    telemetry["pre_shared_update_count"] += update_count
+    telemetry["write_feature_cap_bind_numerator"] += write_bind
+    telemetry["write_feature_cap_bind_denominator"] += write_terms
+    telemetry["read_feature_cap_bind_numerator"] += read_bind
+    telemetry["read_feature_cap_bind_denominator"] += read_terms
+    telemetry["pre_shared_grad_norm_max"] = max(float(telemetry["pre_shared_grad_norm_max"]), grad_norm_max)
+    _validate_v35_cumulative_telemetry(telemetry, completed_updates=completed_updates)
 
 
 _PER_POSITION_METRIC_SUFFIX = re.compile(r"_p\d+$")
@@ -117,6 +1076,177 @@ def _aux_macro_ce(class_ce_sum: at.Array, class_count: at.Array) -> at.Array:
     present = class_count > 0
     per_class = jnp.where(present, class_ce_sum / jnp.maximum(class_count, 1.0), 0.0)
     return jnp.sum(per_class) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+
+
+def _v35_cell_macro_ce(cell_ce_sum: at.Array, cell_episode_count: at.Array) -> at.Array:
+    """Episode-first, then equal-present-cell macro CE for v3.5 side supervision."""
+    present = cell_episode_count > 0
+    per_cell = jnp.where(present, cell_ce_sum / jnp.maximum(cell_episode_count, 1.0), 0.0)
+    return jnp.sum(per_cell) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+
+
+def _v35_loss_info(chunked_loss: dict[str, at.Array]) -> dict[str, at.Array]:
+    """Keep v3.5 numerators and denominators explicit for exact logging-window pooling."""
+    info = {}
+    for branch in ("write", "read"):
+        prefix = f"v35_{branch}"
+        info[f"diagnostic/{prefix}_episode_correct"] = chunked_loss[f"{prefix}_episode_correct_cell"]
+        info[f"diagnostic/{prefix}_episode_count"] = chunked_loss[f"{prefix}_episode_count_cell"]
+        info[f"diagnostic/{prefix}_feature_grad_norm_sum"] = chunked_loss[f"{prefix}_feature_grad_norm_sum"]
+        info[f"diagnostic/{prefix}_feature_clip_bind_sum"] = chunked_loss[f"{prefix}_feature_clip_bind_sum"]
+        info[f"diagnostic/{prefix}_feature_term_count"] = chunked_loss[f"{prefix}_frame_count"]
+    for key in (
+        "v35_write_eligible_count",
+        "v35_commit_success_count",
+        "v35_degenerate_write_count",
+        "v35_commit_residual_ratio_sum",
+        "v35_commit_residual_ratio_max",
+        "v35_commit_relative_residual_sum",
+        "v35_commit_relative_residual_max",
+        "v35_state_invalid_d_count",
+        "v35_state_valid_mismatch_count",
+        "v35_reachable_count",
+        "v35_reachable_mismatch_count",
+        "v35_read_state_valid_count",
+        "v35_invalid_gap_count",
+        "v35_padding_gap_count",
+        "v35_illegal_write_decision_overlap_count",
+        "v35_use_pressure_count",
+        "v35_invalid_cell_count",
+        "v35_raw_read_rms_sum",
+        "v35_injected_pre_cast_rms_sum",
+        "v35_injected_post_cast_rms_sum",
+        "v35_transition_count",
+    ):
+        info[f"diagnostic/{key}"] = chunked_loss[key]
+    return info
+
+
+def _v35_runtime_guard_vector(
+    config: _config.TrainConfig,
+    observation: _model.Observation,
+    loss_info: dict[str, at.Array],
+) -> at.Array:
+    """Return one fail-closed bit for every v3.5 runtime accounting invariant.
+
+    The sampler supplies the objective denominators, while the recurrent model reports what
+    actually committed and read.  A degenerate association, malformed gap, invalid side/cell,
+    or recurrent-state disagreement can otherwise silently reduce the implemented denominator
+    and let an invalid optimizer update look healthy.  Counts are therefore reconciled on the
+    complete effective batch (including every gradient-accumulation microbatch).
+    """
+    required_fields = (
+        "seq_step_mask",
+        "seq_write_mask",
+        "seq_decision_mask",
+        "seq_read_state_valid",
+        "seq_read_credit_reachable",
+        "seq_decay_gap_before",
+        "seq_use_pressure_mask",
+        "seq_memory_cell",
+        "seq_side_label",
+    )
+    missing = [name for name in required_fields if getattr(observation, name) is None]
+    if missing:
+        raise ValueError(f"v3.5 runtime guard requires observation fields: {missing}.")
+
+    step = observation.seq_step_mask
+    write = observation.seq_write_mask
+    decision = observation.seq_decision_mask
+    state_valid = observation.seq_read_state_valid
+    credit_reachable = observation.seq_read_credit_reachable
+    gap = observation.seq_decay_gap_before
+    use_pressure = observation.seq_use_pressure_mask
+    cell = observation.seq_memory_cell
+    side = observation.seq_side_label
+
+    if write.shape != step.shape or decision.shape != step.shape or state_valid.shape != step.shape:
+        raise ValueError("v3.5 runtime masks must have identical [..., T] shapes.")
+    if credit_reachable.shape != step.shape or gap.shape != step.shape or use_pressure.shape != step.shape:
+        raise ValueError("v3.5 runtime reachability/gap/use-pressure fields must match seq_step_mask.")
+    if cell.shape != step.shape[:-1] or side.shape != step.shape[:-1]:
+        raise ValueError("v3.5 cell and side fields must have the sample-leading shape of seq_step_mask.")
+
+    def count(mask: at.Array) -> at.Array:
+        return jnp.sum(mask.astype(jnp.float32))
+
+    expected_write_frames = count(write & step)
+    expected_read_frames = count(decision & state_valid & step)
+    expected_transitions = count(step)
+    write_episode = jnp.any(write & step, axis=-1)
+    read_episode = jnp.any(decision & state_valid & step, axis=-1)
+
+    num_cells = config.model.memory_num_side_cells
+    safe_cell = jnp.clip(cell, 0, num_cells - 1)
+    cell_onehot = jax.nn.one_hot(safe_cell, num_cells, dtype=jnp.float32)
+    sample_axes = tuple(range(cell_onehot.ndim - 1))
+
+    def episode_count_by_cell(present: at.Array) -> at.Array:
+        return jnp.sum(cell_onehot * present[..., None].astype(jnp.float32), axis=sample_axes)
+
+    expected_write_episodes = episode_count_by_cell(write_episode)
+    expected_read_episodes = episode_count_by_cell(read_episode)
+
+    def metric(name: str) -> at.Array:
+        key = f"diagnostic/{name}"
+        if key not in loss_info:
+            raise ValueError(f"v3.5 runtime guard is missing model metric {key!r}.")
+        return loss_info[key]
+
+    telemetry_nonzero = (
+        "v35_degenerate_write_count",
+        "v35_state_invalid_d_count",
+        "v35_state_valid_mismatch_count",
+        "v35_reachable_mismatch_count",
+        "v35_invalid_gap_count",
+        "v35_padding_gap_count",
+        "v35_illegal_write_decision_overlap_count",
+        "v35_invalid_cell_count",
+    )
+    telemetry_violations = [metric(name) != 0 for name in telemetry_nonzero]
+
+    invalid_side = count((side < 0) | (side >= 2)) != 0
+    semantic_control_on_padding = count((write | decision | use_pressure) & ~step) != 0
+    violations = (
+        metric("v35_write_eligible_count") != expected_write_frames,
+        metric("v35_commit_success_count") != expected_write_frames,
+        metric("v35_write_feature_term_count") != expected_write_frames,
+        metric("v35_read_state_valid_count") != expected_read_frames,
+        metric("v35_read_feature_term_count") != expected_read_frames,
+        metric("v35_transition_count") != expected_transitions,
+        jnp.any(metric("v35_write_episode_count") != expected_write_episodes),
+        jnp.any(metric("v35_read_episode_count") != expected_read_episodes),
+        *telemetry_violations,
+        invalid_side,
+        semantic_control_on_padding,
+    )
+    if len(violations) != len(_V35_RUNTIME_GUARD_NAMES):
+        raise AssertionError("v3.5 runtime guard names and predicates are out of sync.")
+    return jnp.stack([jnp.asarray(value, dtype=bool) for value in violations])
+
+
+def _check_v35_runtime_guard(violations: at.Array) -> None:
+    """Emit named checkify assertions for a runtime-guard predicate vector."""
+    if violations.shape != (len(_V35_RUNTIME_GUARD_NAMES),):
+        raise ValueError(
+            "v3.5 runtime guard vector has the wrong shape: "
+            f"expected {(len(_V35_RUNTIME_GUARD_NAMES),)}, found {violations.shape}."
+        )
+    for index, name in enumerate(_V35_RUNTIME_GUARD_NAMES):
+        checkify.check(~violations[index], f"v3.5 runtime invariant failed: {name}")
+
+
+def _checked_v35_train_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Functionalized per-update v3.5 guard used only by the official training loop."""
+    new_state, info = train_step(config, rng, state, batch)
+    info = dict(info)
+    _check_v35_runtime_guard(info.pop("_v35_runtime_guard"))
+    return new_state, info
 
 
 def _aux_group_metrics(chunked_loss: dict[str, at.Array], side_class_ids: tuple[int, ...]) -> dict[str, at.Array]:
@@ -162,6 +1292,7 @@ LADDER_PROBE_FILTER = nnx_utils.PathRegex(r".*ladder_(writer|read)_head.*")
 # memory_gate, memory_aux_*, memory_slot_embedding, state_null_embedding). Used by the
 # optional `memory_grad_clip` group pre-clip in train_step.
 MEMORY_PATH_FILTER = nnx_utils.PathRegex(r".*(memory|query_compressor|query_conditioner|state_null_embedding).*")
+MEMORY_INJECT_GATE_FILTER = nnx_utils.PathRegex(r".*memory_inject_w.*")
 
 
 def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
@@ -183,9 +1314,7 @@ def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
         count = np.sum(jax.device_get(stacked_infos[write_count_key]), axis=0)
         grad_sum = np.sum(jax.device_get(stacked_infos["diagnostic/write_inner_grad_sum"]), axis=0)
         clip_count = np.sum(jax.device_get(stacked_infos["diagnostic/write_inner_clip_count"]), axis=0)
-        severe_count = np.sum(
-            jax.device_get(stacked_infos["diagnostic/write_inner_severe_clip_count"]), axis=0
-        )
+        severe_count = np.sum(jax.device_get(stacked_infos["diagnostic/write_inner_severe_clip_count"]), axis=0)
         reduced.update(
             {
                 "diagnostic/write_inner_grad_norm": grad_sum / np.maximum(count, 1),
@@ -238,6 +1367,79 @@ def _reduce_infos(infos: list[dict[str, at.Array]]) -> dict[str, np.ndarray]:
         reduced.pop("diagnostic/probe_active_grid")
         reduced["diagnostic/probe_accuracy_by_step"] = correct_grid / np.maximum(active_grid, 1)
 
+    if "diagnostic/v35_write_eligible_count" in reduced:
+
+        def total(key):
+            return np.sum(jax.device_get(stacked_infos[key]), axis=0)
+
+        eligible = total("diagnostic/v35_write_eligible_count")
+        committed = total("diagnostic/v35_commit_success_count")
+        read_count = total("diagnostic/v35_read_state_valid_count")
+        transition_count = total("diagnostic/v35_transition_count")
+        reduced.update(
+            {
+                "diagnostic/v35_commit_success_fraction": committed / np.maximum(eligible, 1),
+                "diagnostic/v35_degenerate_write_fraction": total("diagnostic/v35_degenerate_write_count")
+                / np.maximum(eligible, 1),
+                "diagnostic/v35_commit_residual_ratio": total("diagnostic/v35_commit_residual_ratio_sum")
+                / np.maximum(committed, 1),
+                "diagnostic/v35_commit_relative_residual": total("diagnostic/v35_commit_relative_residual_sum")
+                / np.maximum(committed, 1),
+                "diagnostic/v35_reachable_fraction": total("diagnostic/v35_reachable_count")
+                / np.maximum(read_count, 1),
+                "diagnostic/v35_raw_read_rms": total("diagnostic/v35_raw_read_rms_sum") / np.maximum(read_count, 1),
+                "diagnostic/v35_injected_pre_cast_rms": total("diagnostic/v35_injected_pre_cast_rms_sum")
+                / np.maximum(transition_count, 1),
+                "diagnostic/v35_injected_post_cast_rms": total("diagnostic/v35_injected_post_cast_rms_sum")
+                / np.maximum(transition_count, 1),
+                "diagnostic/v35_commit_residual_ratio_max": np.max(
+                    jax.device_get(stacked_infos["diagnostic/v35_commit_residual_ratio_max"]), axis=0
+                ),
+                "diagnostic/v35_commit_relative_residual_max": np.max(
+                    jax.device_get(stacked_infos["diagnostic/v35_commit_relative_residual_max"]), axis=0
+                ),
+            }
+        )
+        for branch in ("write", "read"):
+            term_count = total(f"diagnostic/v35_{branch}_feature_term_count")
+            reduced[f"diagnostic/v35_{branch}_feature_grad_norm"] = total(
+                f"diagnostic/v35_{branch}_feature_grad_norm_sum"
+            ) / np.maximum(term_count, 1)
+            reduced[f"diagnostic/v35_{branch}_feature_clip_bind_fraction"] = total(
+                f"diagnostic/v35_{branch}_feature_clip_bind_sum"
+            ) / np.maximum(term_count, 1)
+        for key in (
+            "diagnostic/v35_commit_residual_ratio_sum",
+            "diagnostic/v35_commit_relative_residual_sum",
+            "diagnostic/v35_raw_read_rms_sum",
+            "diagnostic/v35_injected_pre_cast_rms_sum",
+            "diagnostic/v35_injected_post_cast_rms_sum",
+            "diagnostic/v35_write_feature_grad_norm_sum",
+            "diagnostic/v35_write_feature_clip_bind_sum",
+            "diagnostic/v35_write_feature_term_count",
+            "diagnostic/v35_read_feature_grad_norm_sum",
+            "diagnostic/v35_read_feature_clip_bind_sum",
+            "diagnostic/v35_read_feature_term_count",
+        ):
+            reduced.pop(key)
+
+    severe_key = "diagnostic/v35_pre_shared_clip_severe_count"
+    if severe_key in reduced:
+        severe_count = np.sum(jax.device_get(stacked_infos[severe_key]), axis=0)
+        update_count = np.sum(jax.device_get(stacked_infos["diagnostic/v35_pre_shared_clip_update_count"]), axis=0)
+        grad_norm_sum = np.sum(jax.device_get(stacked_infos["diagnostic/v35_pre_shared_clip_grad_norm_sum"]), axis=0)
+        grad_norm_max = np.max(jax.device_get(stacked_infos["diagnostic/v35_pre_shared_clip_grad_norm_max"]), axis=0)
+        reduced.update(
+            {
+                severe_key: severe_count,
+                "diagnostic/v35_pre_shared_clip_update_count": update_count,
+                "diagnostic/v35_pre_shared_clip_severe_fraction": severe_count / np.maximum(update_count, 1),
+                "diagnostic/v35_pre_shared_clip_grad_norm": grad_norm_sum / np.maximum(update_count, 1),
+                "diagnostic/v35_pre_shared_clip_grad_norm_max": grad_norm_max,
+            }
+        )
+        reduced.pop("diagnostic/v35_pre_shared_clip_grad_norm_sum")
+
     # v3.4 aux/ladder accuracies: any (X_correct, X_count) pair becomes a window-exact ratio.
     for key in [k for k in reduced if k.endswith("_count") and k.replace("_count", "_correct") in reduced]:
         correct_key = key.replace("_count", "_correct")
@@ -268,8 +1470,9 @@ def init_train_state(
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
-        # Convert frozen params to bfloat16.
-        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        # Convert ordinary frozen params to bfloat16. The calibrated v3.5 injection gate is a
+        # numerical control parameter and must remain exactly float32.
+        params = _cast_frozen_params(config, params)
 
         return training_utils.TrainState(
             step=0,
@@ -287,7 +1490,7 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    partial_params = _load_weights_and_validate(_weight_loader_for_run(config), train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
@@ -366,6 +1569,20 @@ def train_step(
                     aux_margin = chunked_loss["aux_margin_sum"] / jnp.maximum(chunked_loss["aux_margin_count"], 1.0)
                     loss += model.memory_aux_margin_weight * aux_margin
                     info["aux_margin"] = aux_margin
+            if "v35_write_ce_cell_sum" in chunked_loss:
+                write_side_loss = _v35_cell_macro_ce(
+                    chunked_loss["v35_write_ce_cell_sum"],
+                    chunked_loss["v35_write_episode_count_cell"],
+                )
+                read_side_loss = _v35_cell_macro_ce(
+                    chunked_loss["v35_read_ce_cell_sum"],
+                    chunked_loss["v35_read_episode_count_cell"],
+                )
+                loss += model.memory_write_side_loss_weight * write_side_loss
+                loss += model.memory_read_side_loss_weight * read_side_loss
+                info["v35_write_side_loss"] = write_side_loss
+                info["v35_read_side_loss"] = read_side_loss
+                info.update(_v35_loss_info(chunked_loss))
             if "ladder_writer_ce_sum" in chunked_loss:
                 # Section 6 online rungs: features are stop-gradient'ed inside the model, so
                 # this term reaches ONLY the ladder heads -- whose grads train_step removes
@@ -433,6 +1650,36 @@ def train_step(
                     (observation.seq_waiting_mask & observation.seq_step_mask & side_ok[..., None]).astype(jnp.float32)
                 ),
             }
+        v35_cell_count_global = None
+        if getattr(config.model, "memory_v35_enabled", False):
+            if (
+                observation.seq_memory_cell is None
+                or observation.seq_side_label is None
+                or observation.seq_write_mask is None
+                or observation.seq_decision_mask is None
+                or observation.seq_read_state_valid is None
+            ):
+                raise ValueError("v3.5 accumulation requires cell, side, write, decision, and state-valid fields.")
+            num_cells = config.model.memory_num_side_cells
+            cell = observation.seq_memory_cell
+            cell_ok = (cell >= 0) & (cell < num_cells)
+            safe_cell = jnp.clip(cell, 0, num_cells - 1)
+            cell_onehot = jax.nn.one_hot(safe_cell, num_cells, dtype=jnp.float32)
+            side_ok = (observation.seq_side_label >= 0) & (observation.seq_side_label < 2)
+            write_episode = jnp.any(observation.seq_write_mask & observation.seq_step_mask, axis=-1)
+            read_episode = jnp.any(
+                observation.seq_decision_mask & observation.seq_read_state_valid & observation.seq_step_mask,
+                axis=-1,
+            )
+
+            def episode_count_by_cell(present):
+                weight = (present & side_ok & cell_ok).astype(jnp.float32)
+                return jnp.sum(cell_onehot * weight[..., None], axis=(0, 1))
+
+            v35_cell_count_global = {
+                "write": episode_count_by_cell(write_episode),
+                "read": episode_count_by_cell(read_episode),
+            }
 
         def microbatch_loss_fn(model, rng, micro_observation, micro_actions):
             chunked_loss = model.compute_loss(rng, micro_observation, micro_actions, train=True)
@@ -489,6 +1736,27 @@ def train_step(
                     aux_margin = chunked_loss["aux_margin_sum"] / jnp.maximum(aux_margin_count_global, 1.0)
                     loss += model.memory_aux_margin_weight * aux_margin
                     info["aux_margin"] = aux_margin
+            if "v35_write_ce_cell_sum" in chunked_loss:
+                if v35_cell_count_global is None:
+                    raise ValueError("v3.5 losses require global effective-batch cell counts.")
+
+                def v35_micro_contribution(branch):
+                    global_count = v35_cell_count_global[branch]
+                    present = global_count > 0
+                    per_cell = jnp.where(
+                        present,
+                        chunked_loss[f"v35_{branch}_ce_cell_sum"] / jnp.maximum(global_count, 1.0),
+                        0.0,
+                    )
+                    return jnp.sum(per_cell) / jnp.maximum(jnp.sum(present.astype(jnp.float32)), 1.0)
+
+                write_side_loss = v35_micro_contribution("write")
+                read_side_loss = v35_micro_contribution("read")
+                loss += model.memory_write_side_loss_weight * write_side_loss
+                loss += model.memory_read_side_loss_weight * read_side_loss
+                info["v35_write_side_loss"] = write_side_loss
+                info["v35_read_side_loss"] = read_side_loss
+                info.update(_v35_loss_info(chunked_loss))
             if "ladder_writer_ce_sum" in chunked_loss:
                 if ladder_count_global is None:
                     raise ValueError("ladder probe losses require the seq_side/evidence/waiting fields.")
@@ -530,13 +1798,14 @@ def train_step(
                 actions[microbatch_index],
             )
             accumulated_info = jax.tree.map(jnp.add, accumulated_info, micro_info)
-            write_max_key = "diagnostic/write_inner_grad_max"
-            if write_max_key in accumulated_info:
-                # Every other info leaf is additive across microbatches. The write max is the
-                # sole max-reduced leaf and must not be summed by the generic tree reduction.
-                accumulated_info[write_max_key] = jnp.maximum(
-                    carry[1][write_max_key], micro_info[write_max_key]
-                )
+            for max_key in (
+                "diagnostic/write_inner_grad_max",
+                "diagnostic/v35_commit_residual_ratio_max",
+                "diagnostic/v35_commit_relative_residual_max",
+            ):
+                if max_key in accumulated_info:
+                    # Max-reduced leaves must not be summed by the generic tree reduction.
+                    accumulated_info[max_key] = jnp.maximum(carry[1][max_key], micro_info[max_key])
             return (
                 accumulated_loss + micro_loss,
                 accumulated_info,
@@ -549,6 +1818,11 @@ def train_step(
             accumulate_microbatch,
             (loss, loss_info, grads),
         )
+    if getattr(config.model, "memory_v35_enabled", False):
+        # This private vector is consumed by the checkified official training wrapper and is
+        # removed before logging.  Computing it from the full effective batch makes the same
+        # contract exact with or without gradient accumulation.
+        loss_info["_v35_runtime_guard"] = _v35_runtime_guard_vector(config, observation, loss_info)
     diagnostic_only_probe = (
         getattr(config.model, "predict_with_memory", False) and getattr(config.model, "memory_probe_weight", 0) == 0
     )
@@ -559,6 +1833,18 @@ def train_step(
         probe_filter = nnx_utils.PathRegex(r".*probe_head.*")
         grads = nnx_utils.state_map(
             grads, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
+
+    # v3.5 calibration freezes the effective tanh injection gate at 0.5. Enforce this here in
+    # addition to the recipe's freeze_filter so a custom launch cannot mutate it through Adam
+    # weight decay or restored optimizer moments.
+    frozen_injection_gate = getattr(config.model, "memory_freeze_injection_gate", False)
+    if frozen_injection_gate:
+        injection_gate_filter = nnx_utils.PathRegex(r".*memory_inject_w.*")
+        grads = nnx_utils.state_map(
+            grads,
+            injection_gate_filter,
+            lambda variable: variable.replace(jnp.zeros_like(variable.value)),
         )
 
     # v3.4 Section 6: the probe ladder gets an ISOLATED optimizer. The ladder-head grads are
@@ -590,11 +1876,36 @@ def train_step(
         )
         loss_info["memory_grad_norm"] = memory_norm
 
+    # Gate-D stability is defined on every optimizer update, after branch-local feature and
+    # memory-group caps but before AdamW's shared global clip. Sampling this norm only on log
+    # steps cannot establish the preregistered <=1% severe-update rate.
+    v35_pre_shared_grad_norm = None
+    if getattr(config.model, "memory_v35_enabled", False):
+        shared_clip_threshold = getattr(config.optimizer, "clip_gradient_norm", None)
+        if shared_clip_threshold is None or shared_clip_threshold <= 0:
+            raise ValueError("v3.5 requires an optimizer with a positive shared clip_gradient_norm.")
+        v35_pre_shared_grad_norm = optax.global_norm(grads)
+        severe = (v35_pre_shared_grad_norm > 10.0 * shared_clip_threshold).astype(jnp.float32)
+        loss_info.update(
+            {
+                "diagnostic/v35_pre_shared_clip_grad_norm_sum": v35_pre_shared_grad_norm,
+                "diagnostic/v35_pre_shared_clip_grad_norm_max": v35_pre_shared_grad_norm,
+                "diagnostic/v35_pre_shared_clip_severe_count": severe,
+                "diagnostic/v35_pre_shared_clip_update_count": jnp.asarray(1.0, jnp.float32),
+            }
+        )
+
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     if diagnostic_only_probe:
         updates = nnx_utils.state_map(
             updates, probe_filter, lambda variable: variable.replace(jnp.zeros_like(variable.value))
+        )
+    if frozen_injection_gate:
+        updates = nnx_utils.state_map(
+            updates,
+            injection_gate_filter,
+            lambda variable: variable.replace(jnp.zeros_like(variable.value)),
         )
     if ladder_isolated:
         # Erase the weight-decay-only AdamW update on the ladder leaves, then apply the SGD.
@@ -603,7 +1914,9 @@ def train_step(
         )
     new_params = optax.apply_updates(params, updates)
     if ladder_isolated:
-        ladder_new = jax.tree.map(lambda p, g: p - config.probe_lr * g, params.filter(LADDER_PROBE_FILTER), ladder_grads)
+        ladder_new = jax.tree.map(
+            lambda p, g: p - config.probe_lr * g, params.filter(LADDER_PROBE_FILTER), ladder_grads
+        )
         new_params = nnx.State.merge(new_params.filter(nnx.Not(LADDER_PROBE_FILTER)), ladder_new)
 
     # Update the model in place and return the new full state.
@@ -623,6 +1936,11 @@ def train_step(
                 ema_params.filter(nnx.Not(probe_filter)),
                 state.ema_params.filter(probe_filter),
             )
+        if frozen_injection_gate:
+            ema_params = nnx.State.merge(
+                ema_params.filter(nnx.Not(injection_gate_filter)),
+                state.ema_params.filter(injection_gate_filter),
+            )
         new_state = dataclasses.replace(
             new_state,
             ema_params=ema_params,
@@ -641,7 +1959,8 @@ def train_step(
                 lambda _, x: x.value.ndim > 1,
             ),
         )
-        return optax.global_norm(grads), optax.global_norm(kernel_params)
+        grad_norm = v35_pre_shared_grad_norm if v35_pre_shared_grad_norm is not None else optax.global_norm(grads)
+        return grad_norm, optax.global_norm(kernel_params)
 
     grad_norm, param_norm = jax.lax.cond(
         expensive_norm_active,
@@ -661,8 +1980,20 @@ def train_step(
 
 def main(config: _config.TrainConfig):
     init_logging()
+    _configure_v35_runtime_environment(config)
     logging.info(f"Running on: {platform.node()}")
     _log_training_identity(config)
+
+    _validate_v35_training_ready(config)
+    v35_enabled = getattr(config.model, "memory_v35_enabled", False)
+    v35_pilot_authorization: _v35_authorization.AuthorizationRecord | None = None
+    if v35_enabled:
+        v35_pilot_authorization = _v35_authorization.load_and_validate_pilot_authorization(config)
+        if not config.resume:
+            raise ValueError(
+                "v3.5 optimizer training must --resume the finalized completed-update-0 checkpoint; "
+                "create it with scripts/v35_step0_bootstrap.py after train-54 calibration."
+            )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -678,7 +2009,10 @@ def main(config: _config.TrainConfig):
     # live on Iris.  Allow launchers to choose the cache location without mutating HOME.
     jax_cache_dir = os.environ.get("OPENPI_JAX_CACHE_DIR")
     if jax_cache_dir is None:
-        jax_cache_dir = str(epath.Path("~/.cache/jax").expanduser())
+        if v35_enabled:
+            jax_cache_dir = str(project_paths.project_path(project_paths.JAX_CACHE_DIR))
+        else:
+            jax_cache_dir = str(epath.Path("~/.cache/jax").expanduser())
     jax.config.update("jax_compilation_cache_dir", jax_cache_dir)
 
     rng = jax.random.key(config.seed)
@@ -698,14 +2032,148 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        allow_step_zero_resume=v35_enabled,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    v35_identity_path = pathlib.Path(config.checkpoint_dir) / "initialization_manifest.json"
+    v35_provenance_assets: dict[str, bytes] | None = None
+    v35_continuation_authorization: _v35_authorization.AuthorizationRecord | None = None
+    v35_source_authorization: _v35_authorization.AuthorizationRecord | None = None
+    v35_embedded_continuation_bytes: bytes | None = None
+    if v35_enabled:
+        latest_step = int(checkpoint_manager.latest_step()) if resuming else None
+        _validate_v35_checkpoint_protocol(config, resuming=resuming, latest_step=latest_step)
+        if resuming:
+            v35_provenance_assets = _validate_v35_resume_checkpoint_assets(
+                config,
+                checkpoint_step=latest_step,
+                identity_path=v35_identity_path,
+            )
+            if config.num_train_steps > 1_000:
+                if v35_pilot_authorization is None:
+                    raise AssertionError("v3.5 continuation is missing its validated pilot authorization")
+                v35_continuation_authorization = _v35_authorization.load_and_validate_continuation_authorization(
+                    config,
+                    pilot_authorization=v35_pilot_authorization,
+                    latest_checkpoint_step=latest_step,
+                )
+                embedded_continuation_path = (
+                    pathlib.Path(config.checkpoint_dir)
+                    / str(latest_step)
+                    / "assets"
+                    / _V35_CONTINUATION_AUTHORIZATION_FILENAME
+                )
+                if embedded_continuation_path.is_file():
+                    v35_embedded_continuation_bytes = embedded_continuation_path.read_bytes()
+                v35_provenance_assets[_V35_CONTINUATION_AUTHORIZATION_FILENAME] = (
+                    v35_continuation_authorization.path.read_bytes()
+                )
+            v35_source_authorization = (
+                v35_pilot_authorization
+                if latest_step == 0
+                else v35_continuation_authorization
+            )
+            if v35_source_authorization is None:
+                raise ValueError(
+                    "v3.5 resume source is not linked by the configured authorization; intermediate "
+                    "checkpoints require separately sealed external rung/hash evidence"
+                )
+    init_wandb(
+        config,
+        resuming=resuming,
+        enabled=config.wandb_enabled,
+        allow_new_run_from_bootstrap_zero=v35_enabled and resuming and latest_step == 0,
+    )
 
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
+
+    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    jax.block_until_ready(train_state)
+    n_params = sum(x.size for x in jax.tree.leaves(train_state.params))
+    logging.info(f"Initialized train state: {n_params / 1e9:.2f}B params")
+
+    v35_cumulative_telemetry = _new_v35_cumulative_telemetry() if v35_enabled else None
+    v35_restored_parameter_tree_sha256: str | None = None
+    if resuming:
+        if v35_enabled:
+            if v35_source_authorization is None:
+                raise AssertionError("v3.5 resume is missing its source authorization")
+            train_state, v35_cumulative_telemetry, v35_restored_parameter_tree_sha256 = (
+                _restore_and_validate_v35_authorized_source_checkpoint(
+                    config,
+                    checkpoint_manager=checkpoint_manager,
+                    checkpoint_step=latest_step,
+                    state_shape=train_state,
+                    data_loader=data_loader,
+                    source_authorization=v35_source_authorization,
+                )
+            )
+        else:
+            train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    _validate_v35_initialized_gate(config, train_state.params)
+
+    initialization_manifest_path = None
+    if v35_enabled:
+        initialization_manifest_path = (
+            v35_identity_path if resuming else _write_v35_initialization_identity(config, train_state.params)
+        )
+        if initialization_manifest_path is None or not initialization_manifest_path.is_file():
+            raise FileNotFoundError("v3.5 initialization identity is missing.")
+        if not resuming:
+            v35_provenance_assets = _snapshot_v35_checkpoint_provenance(
+                config,
+                initialization_manifest_path,
+            )
+        initialization_identity = _validate_v35_root_identity(config, initialization_manifest_path)
+        if v35_pilot_authorization is None:
+            raise AssertionError("v3.5 run is missing its validated pilot authorization")
+        actual_step0_parameter_tree_sha256 = (
+            v35_restored_parameter_tree_sha256
+            if resuming and latest_step == 0
+            else _weight_loaders.parameter_tree_sha256(train_state.params.to_pure_dict())
+            if not resuming
+            else None
+        )
+        _v35_authorization.validate_pilot_run_binding(
+            config,
+            v35_pilot_authorization,
+            initialization_identity=initialization_identity,
+            actual_parameter_tree_sha256=actual_step0_parameter_tree_sha256,
+        )
+        if v35_continuation_authorization is not None:
+            if v35_restored_parameter_tree_sha256 is None:
+                raise AssertionError("v3.5 continuation is missing its restored parameter identity")
+            _v35_authorization.validate_continuation_checkpoint_binding(
+                v35_continuation_authorization,
+                latest_checkpoint_step=latest_step,
+                actual_parameter_tree_sha256=v35_restored_parameter_tree_sha256,
+                embedded_authorization_bytes=v35_embedded_continuation_bytes,
+            )
+
+    # Revision-5 checkpoint labels are completed-update counts. A fresh step-0 snapshot is the
+    # immutable source/task-health reference; rung 250 therefore means exactly 250 optimizer
+    # updates, not the legacy off-by-one convention (loop index 250 after 251 updates).
+    start_step = int(train_state.step)
+    if config.checkpoint_by_completed_updates and not resuming and start_step == 0:
+        v35_runtime_kwargs = {}
+        if v35_enabled:
+            if v35_cumulative_telemetry is None:
+                raise AssertionError("v3.5 step-0 checkpoint requires cumulative telemetry.")
+            v35_runtime_kwargs["v35_cumulative_telemetry"] = v35_cumulative_telemetry
+        _checkpoints.save_state(
+            checkpoint_manager,
+            train_state,
+            data_loader,
+            0,
+            provenance_assets=v35_provenance_assets,
+            **v35_runtime_kwargs,
+        )
+
+    # v3.5 restores sampler and transform RNG before this iterator is constructed. With
+    # num_workers=0, `next` consumes exactly one visible batch and no future batch is prefetched.
     data_iter = iter(data_loader)
     batch = next(data_iter)
     batch_mb = sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(batch)) / 1e6
@@ -732,22 +2200,29 @@ def main(config: _config.TrainConfig):
         ]
         wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    n_params = sum(x.size for x in jax.tree.leaves(train_state.params))
-    logging.info(f"Initialized train state: {n_params / 1e9:.2f}B params")
+    v35_runtime_guard = getattr(config.model, "memory_v35_enabled", False)
+    if v35_runtime_guard:
+        # `checkify` carries device-side assertion state out of the compiled update.  The host
+        # throws before accepting/donating the candidate state, so an invalid update can never
+        # be logged or checkpointed.  Legacy recipes retain their original compiled signature.
+        checked_step = checkify.checkify(
+            functools.partial(_checked_v35_train_step, config),
+            errors=checkify.user_checks,
+        )
+        ptrain_step = jax.jit(
+            checked_step,
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(None, (train_state_sharding, replicated_sharding)),
+            donate_argnums=(1,),
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
 
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
-
-    start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -758,9 +2233,25 @@ def main(config: _config.TrainConfig):
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            if v35_runtime_guard:
+                runtime_error, candidate = ptrain_step(train_rng, train_state, batch)
+                runtime_error.throw()
+                train_state, info = candidate
+            else:
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+        metric_step, should_save, checkpoint_step = _step_labels_and_save_decision(
+            config, loop_step=step, start_step=start_step
+        )
+        if v35_runtime_guard:
+            if v35_cumulative_telemetry is None:
+                raise AssertionError("v3.5 accepted update is missing its cumulative telemetry ledger.")
+            _accumulate_v35_cumulative_telemetry(
+                v35_cumulative_telemetry,
+                info,
+                completed_updates=metric_step,
+            )
         infos.append(info)
-        if step % config.log_interval == 0:
+        if metric_step % config.log_interval == 0:
             reduced = _reduce_infos(infos)
             reduced_info = {}
             for k, v in reduced.items():
@@ -768,16 +2259,34 @@ def main(config: _config.TrainConfig):
                     reduced_info.update({f"{k}_p{i}": float(x) for i, x in enumerate(v)})
                 else:
                     reduced_info[f"{k}"] = float(v)
-            info_str = ", ".join(
-                f"{k}={v:.4f}" for k, v in reduced_info.items() if not _is_per_position_metric(k)
-            )
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if not _is_per_position_metric(k))
+            label = "Completed update" if config.checkpoint_by_completed_updates else "Step"
+            pbar.write(f"{label} {metric_step}: {info_str}")
+            wandb.log(reduced_info, step=metric_step)
             infos = []
-        batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        # Save v3.5 at the accepted-update boundary before drawing another batch. Since the
+        # loader has no workers/prefetch, its snapshotted RNG points exactly to the next batch.
+        if should_save and v35_runtime_guard:
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                checkpoint_step,
+                provenance_assets=v35_provenance_assets,
+                v35_cumulative_telemetry=v35_cumulative_telemetry,
+            )
+        if not v35_runtime_guard or metric_step < config.num_train_steps:
+            batch = next(data_iter)
+        if should_save and not v35_runtime_guard:
+            # Preserve legacy ordering, which historically fetched the next batch before save.
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                checkpoint_step,
+                provenance_assets=v35_provenance_assets,
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
