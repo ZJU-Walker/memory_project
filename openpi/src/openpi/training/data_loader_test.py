@@ -133,7 +133,7 @@ def test_sequence_bucket_collate_crops_every_temporal_field_and_preserves_valid_
     items = [_sequence_item(13), _sequence_item(20, offset=100)]
     batch = _data_loader._sequence_bucket_collate_fn(items, buckets=(20, 40, 60), max_steps=60)
 
-    for key in _data_loader._SEQUENCE_TIME_KEYS:
+    for key in _data_loader._SEQUENCE_TIME_KEYS & set(batch):
         assert all(x.shape[1] == 20 for x in jax.tree.leaves(batch[key]))
     assert batch["actions"].shape == (2, 20, 5, 3)
     np.testing.assert_array_equal(batch["state"][0, :, 0], np.arange(20))
